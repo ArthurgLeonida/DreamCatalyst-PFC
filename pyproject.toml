@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dream_catalyst_ns"
+version = "0.1.0"
+description = "DreamCatalyst-style 3D scene editing via Nerfstudio (SDS + InstructPix2Pix)"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+license = { text = "MIT" }
+
+# NOTE: PyTorch+CUDA and nerfstudio must be installed BEFORE this package
+# (they require special index URLs that pip can't resolve from pyproject.toml).
+# See README.md "Installation" for the full setup.
+# Only extra pip-installable dependencies are listed here.
+dependencies = [
+    "diffusers>=0.25.0",
+    "transformers>=4.36.0",
+    "accelerate>=0.25.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["dream_catalyst_ns*"]
+
+# ── Register the custom method with Nerfstudio's CLI ──────────────────────────
+[project.entry-points.'nerfstudio.method_configs']
+dream-catalyst = "dream_catalyst_ns.dream_config:DreamCatalyst"

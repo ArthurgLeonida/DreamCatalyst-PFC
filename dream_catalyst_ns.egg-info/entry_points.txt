@@ -1,0 +1,2 @@
+[nerfstudio.method_configs]
+dream-catalyst = dream_catalyst_ns.dream_config:DreamCatalyst
