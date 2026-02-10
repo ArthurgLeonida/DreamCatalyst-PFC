@@ -17,3 +17,6 @@ build/
 eggs/
 .mypy_cache/
 .pytest_cache/
+
+# Other files
+*.pdf
