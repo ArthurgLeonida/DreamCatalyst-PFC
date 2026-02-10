@@ -1,1 +1,18 @@
-data/
+# Data
+/data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+*.egg-info/
+dist/
+build/
+eggs/
+.mypy_cache/
+.pytest_cache/
