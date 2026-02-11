@@ -2,6 +2,10 @@
 
 A clean reimplementation of **DreamCatalyst** (ICLR 2025) on top of Nerfstudio, focusing on **3D Gaussian Splatting** (Splatfacto) as the scene representation. The original DreamCatalyst already uses Nerfstudio — this project rebuilds it cleanly with modern dependencies and a GS-first approach, with a path toward a custom architecture.
 
+> **Citation**: This project is based on the methodology from:
+> 
+> Jiwook Kim, Seonho Lee, Jaeyo Shin, Jiho Choi, Hyunjung Shim. *"DreamCatalyst: Fast and High-Quality 3D Editing via Controlling Editability and Identity Preservation"*. ICLR 2025. [arXiv:2407.11394](https://arxiv.org/abs/2407.11394)
+
 ## Project Structure
 
 ```
@@ -53,7 +57,7 @@ python -c "import torch; print('CUDA:', torch.cuda.is_available())"
 pip install nerfstudio
 ```
 
-### 1d. Install FFmpeg (system binary)
+### 1d. Install FFmpeg 8.0.1 (system binary)
 
 FFmpeg is required by `ns-process-data` for image metadata extraction.
 
@@ -61,7 +65,7 @@ FFmpeg is required by `ns-process-data` for image metadata extraction.
 2. Extract to a permanent location (e.g. `C:\ffmpeg\`)
 3. Add the `bin\` folder to your **PATH** environment variable:
    - Win + S → "Environment Variables" → User variables → Path → New →
-     `C:\ffmpeg\ffmpeg-X.X-essentials_build\bin`
+     `C:\ffmpeg\ffmpeg-8.0.1-essentials_build\bin`
 4. Restart your terminal and verify:
 
 ```powershell
@@ -191,4 +195,22 @@ ns-train dream-catalyst --data data/chair
 | gsplat     | 1.4.0                                                    |
 | diffusers  | 0.36.0                                                   |
 | COLMAP     | 3.9.1 (system binary)                                    |
-| FFmpeg     | system binary                                            |
+| FFmpeg     | 8.0.1 (system binary)                                    |
+
+---
+
+## Citation
+
+This project reimplements the methodology from:
+
+```bibtex
+@misc{kim2024dreamcatalyst,
+      title={DreamCatalyst: Fast and High-Quality 3D Editing via Controlling Editability and Identity Preservation}, 
+      author={Jiwook Kim and Seonho Lee and Jaeyo Shin and Jiho Choi and Hyunjung Shim},
+      year={2024},
+      eprint={2407.11394},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2407.11394}
+}
+```
