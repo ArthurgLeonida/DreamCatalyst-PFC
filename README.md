@@ -222,7 +222,7 @@ tensorboard --logdir outputs/
 ### Files overview
 
 | File | Purpose |
-|------|---------||
+|------|---------|
 | `setup.sh` | One-shot environment setup (conda + pip + verify) |
 | `train.sh` | Training launcher (`train.sh <scene> [iters] [method]`) |
 | `scripts/process_data.sh` | COLMAP data processing wrapper |
