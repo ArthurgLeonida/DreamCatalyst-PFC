@@ -128,7 +128,7 @@ data/chair/images/
 **From a folder of images (COLMAP):**
 
 ```powershell
-ns-process-data images --data data/chair/images --output-dir data/chair
+ns-process-data images --data data/chair/images --output-dir data/chair_processed
 ```
 
 This will:
@@ -142,7 +142,7 @@ This will:
 **From a video:**
 
 ```powershell
-ns-process-data video --data data/chair/video.mp4 --output-dir data/chair
+ns-process-data video --data data/chair/video.mp4 --output-dir data/chair_processed
 ```
 
 ### 2c. Verify the processed dataset
@@ -172,6 +172,12 @@ Test that the data is correct before using the custom pipeline:
 ns-train splatfacto --data data/chair --max-num-iterations 500
 ```
 
+In case of GPU memory issues, try downscaling:
+
+```powershell
+ns-train splatfacto --max-num-iterations 500 nerfstudio-data --data data/chair_processed --downscale-factor 4
+```
+
 If cameras and images load without errors, the data is good.
 
 ### 3b. Run with DreamCatalyst pipeline
@@ -182,12 +188,55 @@ ns-train dream-catalyst --data data/chair
 
 ---
 
+## 4. Linux / HPC Quick Start (H100)
+
+If you're deploying to a Linux server with a GPU (e.g. H100 cluster), the setup is much simpler:
+
+```bash
+# 1. Clone the repo
+git clone https://github.com/ArthurgLeonida/DreamCatalyst-PFC.git
+cd DreamCatalyst-PFC
+
+# 2. Run the setup script (creates conda env, installs everything)
+chmod +x setup.sh
+./setup.sh            # creates env '3d_edit' by default
+# ./setup.sh my_env   # or use a custom name
+
+# 3. Activate the environment
+conda activate 3d_edit
+
+# 4. Upload & process your data
+# scp your images into data/chair/images/
+bash scripts/process_data.sh chair
+
+# 5. Test with vanilla Splatfacto (500 iters)
+bash train.sh chair
+
+# 6. Full training with DreamCatalyst
+bash train.sh chair 30000 dream
+
+# 7. View results
+tensorboard --logdir outputs/
+```
+
+### Files overview
+
+| File | Purpose |
+|------|---------||
+| `setup.sh` | One-shot environment setup (conda + pip + verify) |
+| `train.sh` | Training launcher (`train.sh <scene> [iters] [method]`) |
+| `scripts/process_data.sh` | COLMAP data processing wrapper |
+| `requirements.txt` | All pip dependencies (install PyTorch separately first) |
+| `train.bat` | Windows training launcher (with MSVC workarounds) |
+
+---
+
 ## Environment
 
 | Component  | Version / Notes                                          |
 |------------|----------------------------------------------------------|
-| OS         | Windows 11                                               |
-| GPU        | NVIDIA RTX 3050 (8 GB VRAM) / H100 (university cluster)  |
+| OS         | Windows 11 / Linux (HPC)                                 |
+| GPU        | NVIDIA RTX 3050 6 GB (local) / H100 80 GB (cluster)      |
 | Python     | 3.10                                                     |
 | PyTorch    | 2.1.2+cu118                                              |
 | CUDA       | 11.8 (via PyTorch wheels)                                |

@@ -1,0 +1,34 @@
+# ==============================================================================
+# DreamCatalyst-NS — Python requirements
+# ==============================================================================
+# Install PyTorch FIRST (it needs a special index URL):
+#
+#   pip install torch==2.1.2+cu118 torchvision==0.16.2+cu118 \
+#       --index-url https://download.pytorch.org/whl/cu118
+#
+# Then install everything else:
+#
+#   pip install -r requirements.txt
+#   pip install -e .
+# ==============================================================================
+
+# ── Core framework ───────────────────────────────────────────────────────────
+nerfstudio==1.1.5
+
+# ── Gaussian Splatting backend ───────────────────────────────────────────────
+gsplat==1.4.0
+
+# ── Diffusion / SDS guidance ────────────────────────────────────────────────
+diffusers>=0.36.0
+transformers>=4.36.0
+accelerate>=0.25.0
+
+# ── Numerical / utility ─────────────────────────────────────────────────────
+numpy<2
+Pillow
+imageio
+imageio-ffmpeg
+open3d
+
+# ── Logging / visualisation ─────────────────────────────────────────────────
+tensorboard
