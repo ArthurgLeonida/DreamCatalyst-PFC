@@ -10,12 +10,16 @@ readme = "README.md"
 requires-python = ">=3.10,<3.11"
 license = { text = "MIT" }
 
-# NOTE: PyTorch+CUDA and nerfstudio must be installed BEFORE this package
-# (they require special index URLs that pip can't resolve from pyproject.toml).
-# See README.md "Installation" for the full setup.
-# Only extra pip-installable dependencies are listed here.
+# NOTE: The following must be installed BEFORE this package (they require
+# special index URLs or system-level setup that pip cannot resolve here):
+#   - PyTorch 2.1.2+cu118   (see README.md §1)
+#   - nerfstudio 1.1.5      (pip install nerfstudio)
+#   - COLMAP 3.9.1           (system binary – see README.md §2b)
+#   - FFmpeg                 (system binary – see README.md §2a)
+#
+# Only extra pip-installable dependencies are listed below.
 dependencies = [
-    "diffusers>=0.25.0",
+    "diffusers>=0.36.0",
     "transformers>=4.36.0",
     "accelerate>=0.25.0",
 ]

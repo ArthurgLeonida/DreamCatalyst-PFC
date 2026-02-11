@@ -5,58 +5,94 @@ A clean reimplementation of **DreamCatalyst** (ICLR 2025) on top of Nerfstudio, 
 ## Project Structure
 
 ```
-PFC_3D_Edit/
+DreamCatalyst-PFC/
 ├── pyproject.toml                       # Package config + Nerfstudio entry-point
 ├── README.md
-├── data/                                # Your datasets go here
+├── data/                                # Your datasets go here (git-ignored)
 │   └── chair/
-│       └── images/                      # Raw photos of the chair
-│           ├── frame_00001.jpg
-│           ├── frame_00002.jpg
-│           └── ...
+│       ├── images/                      # Raw + COLMAP-copied images
+│       ├── images_2/                    # 2× downscaled
+│       ├── images_4/                    # 4× downscaled
+│       ├── images_8/                    # 8× downscaled
+│       ├── colmap/                      # COLMAP sparse reconstruction
+│       ├── transforms.json              # Camera poses (Nerfstudio format)
+│       └── sparse_pc.ply               # Sparse point cloud
 └── dream_catalyst_ns/                   # Python package
     ├── __init__.py
     ├── dream_config.py                  # MethodSpecification (registers with ns-train)
-    └── dream_pipeline.py                # Custom Pipeline (skeleton)
+    └── dream_pipeline.py                # Custom Pipeline
 ```
 
 ---
 
 ## 1. Installation
 
-### Prerequisites (one-time, on the machine with the RTX 3050)
+### 1a. Create conda environment
 
 ```powershell
-# 1. Create a fresh conda environment with Python 3.10
 conda create -n 3d_edit python=3.10 -y
 conda activate 3d_edit
+```
 
-# 2. Install PyTorch with CUDA 11.8 (works with RTX 3050)
-#    See https://pytorch.org/get-started/locally/ for other CUDA versions.
+### 1b. Install PyTorch with CUDA 11.8
+
+```powershell
 pip install torch==2.1.2+cu118 torchvision==0.16.2+cu118 --index-url https://download.pytorch.org/whl/cu118
+```
 
-# 3. Verify CUDA works
+Verify:
+
+```powershell
 python -c "import torch; print('CUDA:', torch.cuda.is_available())"
 # Should print: CUDA: True
+```
 
-# 4. Install Nerfstudio
+### 1c. Install Nerfstudio
+
+```powershell
 pip install nerfstudio
 ```
 
-> **No GPU on this machine?** Steps 1-3 still work — PyTorch installs fine,
-> it just won't detect a GPU. You can write/edit code here and run training
-> later on the laptop with the RTX 3050.
+### 1d. Install FFmpeg (system binary)
 
-### Install this project
+FFmpeg is required by `ns-process-data` for image metadata extraction.
+
+1. Download from <https://www.gyan.dev/ffmpeg/builds/> — get **`ffmpeg-release-essentials.zip`**
+2. Extract to a permanent location (e.g. `C:\ffmpeg\`)
+3. Add the `bin\` folder to your **PATH** environment variable:
+   - Win + S → "Environment Variables" → User variables → Path → New →
+     `C:\ffmpeg\ffmpeg-X.X-essentials_build\bin`
+4. Restart your terminal and verify:
+
+```powershell
+ffmpeg -version
+```
+
+### 1e. Install COLMAP 3.9.1 (system binary)
+
+> ⚠️ **COLMAP ≥ 3.13 is NOT compatible** with Nerfstudio 1.1.5
+> (the `--SiftExtraction.use_gpu` flag was removed). Use **COLMAP 3.9.1**.
+
+1. Download **COLMAP 3.9.1** (CUDA) from [GitHub Releases](https://github.com/colmap/colmap/releases/tag/3.9.1) — get `COLMAP-3.9.1-windows-cuda.zip`
+2. Extract to a permanent location (e.g. `C:\colmap\`)
+3. Add the folder to your **PATH** (same process as FFmpeg above)
+4. Restart your terminal and verify:
+
+```powershell
+colmap help
+# Should show: COLMAP 3.9.1
+```
+
+### 1f. Install this project
 
 ```powershell
 conda activate 3d_edit
-cd E:\Documentos_HD\Estudo\UFSC\9FASE\PFC\PFC_3D_Edit
+cd <path-to-this-repo>
 
-# Install the package in editable mode
+# Install in editable mode
 pip install -e .
 
-# Re-generate CLI tab-completion (optional but nice)
+# Re-generate CLI tab-completion (optional)
 ns-install-cli
 ```
 
@@ -64,11 +100,11 @@ After this, `ns-train --help` should list **`dream-catalyst`** as an available m
 
 ---
 
-## 2. Data Processing (Chair Dataset)
+## 2. Data Processing
 
 ### 2a. Place your images
 
-Put your photos in a folder. The recommended layout is:
+Put your photos in a folder:
 
 ```
 data/chair/images/
@@ -77,98 +113,82 @@ data/chair/images/
 ├── ...
 ```
 
-### 2b. Install COLMAP
+**Tips for good captures:**
+- **50–100 images** is a good range for a single object
+- Walk around the object; ensure significant overlap between views
+- Capture from multiple heights (eye level, low angle, slightly above)
+- Good, even lighting; avoid motion blur
+
+### 2b. Run `ns-process-data`
+
+**From a folder of images (COLMAP):**
 
 ```powershell
-conda install -c conda-forge colmap
-# Verify:
-colmap -h
-```
-
-### 2c. Run `ns-process-data`
-
-**Option A – From a folder of images (COLMAP):**
-
-```powershell
-ns-process-data images --data data/chair/images --output-dir data/chair_processed
+ns-process-data images --data data/chair/images --output-dir data/chair
 ```
 
 This will:
 1. Run COLMAP feature extraction + matching + sparse reconstruction
-2. Generate `data/chair_processed/transforms.json` with camera poses
-3. Copy/symlink images into `data/chair_processed/images/`
+2. Generate `data/chair/transforms.json` with camera poses
+3. Create downscaled image copies (`images_2/`, `images_4/`, `images_8/`)
+4. Generate `sparse_pc.ply` (initial point cloud for Splatfacto)
 
-**Option B – From a Polycam export (.zip):**
+> ⏱️ COLMAP can take 30–60 minutes depending on image count and resolution.
 
-If you captured with Polycam on an iPhone with LiDAR:
-
-```powershell
-ns-process-data polycam --data data/chair/polycam_export.zip --output-dir data/chair_processed
-```
-
-**Option C – From a video:**
+**From a video:**
 
 ```powershell
-ns-process-data video --data data/chair/video.mp4 --output-dir data/chair_processed
+ns-process-data video --data data/chair/video.mp4 --output-dir data/chair
 ```
 
-### Tips for better results
-- **50-100 images** is a good range for a single object
-- Ensure significant overlap between views (walk around the object)
-- Good, even lighting; avoid motion blur
-- COLMAP can be slow – be patient on the first run
+### 2c. Verify the processed dataset
+
+After processing, run this quick check:
+
+```powershell
+python -c "import json; d=json.load(open('data/chair/transforms.json')); print('Frames:', len(d['frames'])); print('Resolution: %dx%d' % (d['w'], d['h']))"
+```
+
+Also confirm these files/folders exist:
+- `data/chair/transforms.json`
+- `data/chair/sparse_pc.ply`
+- `data/chair/images_2/`, `images_4/`, `images_8/`
+
+You should see a frame count close to your original image count.
 
 ---
 
 ## 3. Training
 
-### 3a. Verify the base Splatfacto model works
+### 3a. Verify with vanilla Splatfacto
 
-Test that your processed data is correct with vanilla Gaussian Splatting:
+Test that the data is correct before using the custom pipeline:
 
 ```powershell
-ns-train splatfacto --data data/chair_processed
+ns-train splatfacto --data data/chair --max-num-iterations 500
 ```
+
+If cameras and images load without errors, the data is good.
 
 ### 3b. Run with DreamCatalyst pipeline
 
 ```powershell
-ns-train dream-catalyst --data data/chair_processed
+ns-train dream-catalyst --data data/chair
 ```
-
-You should see `[DreamCatalyst] Pipeline initialised – custom code is running!` in the console, and every 100 steps: `[DreamCatalyst] Training step ...`.
-
----
-
-## 4. Next Steps (Implementing the real logic)
-
-1. **Load InstructPix2Pix** in `DreamCatalystPipeline.__init__`:
-   ```python
-   from diffusers import StableDiffusionInstructPix2PixPipeline
-   self.ip2p = StableDiffusionInstructPix2PixPipeline.from_pretrained(
-       "timbrooks/instruct-pix2pix", torch_dtype=torch.float16,
-       safety_checker=None,
-   ).to("cuda")
-   self.ip2p.set_progress_bar_config(disable=True)
-   ```
-
-2. **Render full images** — Splatfacto already does this! `model_outputs["rgb"]` is a full image.
-
-3. **Compute SDS loss** in `get_train_loss_dict` using the rendered Gaussian Splat image + the diffusion model.
-
-4. **Add the DreamCatalyst modifications**: creative catalyst sampling, optimised noise schedules, etc.
-
-5. **Future**: Design a custom architecture with your professor — the pipeline is ready to be extended.
 
 ---
 
 ## Environment
 
-| Component | Version |
-|-----------|---------|
-| OS        | Windows 11 |
-| GPU       | RTX 3050 (8 GB VRAM) |
-| Python    | 3.10 |
-| PyTorch   | 2.1.2+cu118 |
-| CUDA      | 11.8 (via PyTorch) |
-| Nerfstudio| latest (pip) |
+| Component  | Version / Notes                                          |
+|------------|----------------------------------------------------------|
+| OS         | Windows 11                                               |
+| GPU        | NVIDIA RTX 3050 (8 GB VRAM) / H100 (university cluster)  |
+| Python     | 3.10                                                     |
+| PyTorch    | 2.1.2+cu118                                              |
+| CUDA       | 11.8 (via PyTorch wheels)                                |
+| Nerfstudio | 1.1.5                                                    |
+| gsplat     | 1.4.0                                                    |
+| diffusers  | 0.36.0                                                   |
+| COLMAP     | 3.9.1 (system binary)                                    |
+| FFmpeg     | system binary                                            |
