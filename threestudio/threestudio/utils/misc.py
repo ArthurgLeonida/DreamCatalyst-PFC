@@ -3,7 +3,10 @@ import math
 import os
 import re
 
-import tinycudann as tcnn
+try:
+    import tinycudann as tcnn
+except ImportError:
+    tcnn = None
 import torch
 from packaging import version
 
@@ -104,7 +107,8 @@ def C(value: Any, epoch: int, global_step: int, interpolation="linear") -> float
 def cleanup():
     gc.collect()
     torch.cuda.empty_cache()
-    tcnn.free_temporary_memory()
+    if tcnn is not None:
+        tcnn.free_temporary_memory()
 
 
 def finish_with_cleanup(func: Callable):
