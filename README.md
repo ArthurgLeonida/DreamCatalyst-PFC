@@ -287,6 +287,10 @@ bash train.sh chair 30000 dream  # 30k iters, dream-catalyst
 tensorboard --logdir outputs/
 ```
 
+### 3d. Export
+
+ns-export gaussian-splat --load-config outputs/chair/[METHOD]/[DATE]/config.yml --output-dir exports/
+
 ---
 
 ## Environment
@@ -301,7 +305,7 @@ tensorboard --logdir outputs/
 | Nerfstudio   | 1.1.5 (upstream, cloned by setup.sh)                     |
 | threestudio  | latest (upstream, cloned by setup.sh)                    |
 | gsplat       | 1.4.0                                                    |
-| diffusers    | ≥ 0.27.0, < 0.31.0                                      |
+| diffusers    | ≥ 0.27.0, < 0.31.0                                       |
 | COLMAP       | ≤ 3.9.1 (system binary)                                  |
 | FFmpeg       | any recent version (system binary)                       |
 
