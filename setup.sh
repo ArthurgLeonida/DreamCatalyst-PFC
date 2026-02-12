@@ -51,6 +51,9 @@ python -c "import torch; assert torch.cuda.is_available(), 'CUDA not available!'
 
 # ── 3. Install local nerfstudio (from embedded folder) ──────────────────────
 echo "[3/6] Installing local nerfstudio (editable)..."
+# Clear stale bytecode caches so editable installs pick up latest source
+find ./nerfstudio -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+find ./threestudio -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 pip install -e ./nerfstudio
 
 # ── 4. Install local threestudio (from embedded folder) ─────────────────────
