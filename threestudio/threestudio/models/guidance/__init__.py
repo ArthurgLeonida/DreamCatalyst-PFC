@@ -1,5 +1,1 @@
-from . import (
-    instructpix2pix_guidance,
-    stable_diffusion_guidance,
-    stable_diffusion_sdi_guidance,
-)
+# Submodule imports are handled by threestudio/__init__.py to avoid circular imports.

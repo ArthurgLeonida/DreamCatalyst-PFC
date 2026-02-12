@@ -1,4 +1,1 @@
-from . import (
-    base,
-    stable_diffusion_prompt_processor,
-)
+# Submodule imports are handled by threestudio/__init__.py to avoid circular imports.
