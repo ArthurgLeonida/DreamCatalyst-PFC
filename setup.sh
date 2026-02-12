@@ -90,10 +90,10 @@ fi
 
 # Check threestudio guidance modules
 python -c "
-from threestudio.models.guidance.stable_diffusion_guidance import StableDiffusionGuidance
-from threestudio.models.guidance.instructpix2pix_guidance import InstructPix2PixGuidance
-print('  ✓ threestudio guidance modules importable')
-" || echo "  ⚠ WARNING: threestudio guidance imports failed (see error above)"
+import threestudio
+threestudio.ensure_loaded()
+print('  ✓ threestudio modules loaded (%d registered)' % len(threestudio.__modules__))
+" || echo "  ⚠ WARNING: threestudio module loading failed (see error above)"
 
 echo ""
 echo "============================================"
