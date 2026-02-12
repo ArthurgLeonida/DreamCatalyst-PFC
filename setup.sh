@@ -68,14 +68,14 @@ echo "[6/6] Verifying installation..."
 python -c "
 import numpy as np
 import torch
-import nerfstudio
+from importlib.metadata import version as pkg_version
 import gsplat
 import diffusers
 print(f'  ✓ NumPy        {np.__version__}')
 print(f'  ✓ PyTorch      {torch.__version__}')
 print(f'  ✓ CUDA         {torch.version.cuda}')
 print(f'  ✓ GPU          {torch.cuda.get_device_name(0)}')
-print(f'  ✓ Nerfstudio   {nerfstudio.__version__}')
+print(f'  ✓ Nerfstudio   {pkg_version(\"nerfstudio\")}')
 print(f'  ✓ gsplat       {gsplat.__version__}')
 print(f'  ✓ diffusers    {diffusers.__version__}')
 "
