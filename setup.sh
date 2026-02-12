@@ -108,7 +108,7 @@ fi
 # Check threestudio
 python -c "
 import threestudio
-print('  ✓ threestudio %s (%d modules registered)' % (threestudio.__version__, len(threestudio.__modules__)))
+print('  ✓ threestudio loaded (%d modules registered)' % len(threestudio.__modules__))
 " || echo "  ⚠ WARNING: threestudio import failed"
 
 echo ""
