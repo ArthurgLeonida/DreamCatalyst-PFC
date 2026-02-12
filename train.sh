@@ -22,12 +22,21 @@ if [ "${METHOD}" = "dream" ] || [ "${METHOD}" = "dream-catalyst" ]; then
     METHOD="dream-catalyst"
 fi
 
+# ── Auto-select least-busy GPU ──────────────────────────────────────────────
+echo "[train.sh] Selecting best available GPU..."
+eval "$(python scripts/pick_gpu.py 2>&1 | tail -1 | sed -n 's/.*CUDA_VISIBLE_DEVICES=\([0-9]*\)/export CUDA_VISIBLE_DEVICES=\1/p')"
+if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    # Fallback: run the script directly to set env (works if only 1 GPU)
+    export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+fi
+
 echo "============================================"
 echo " Training: ${METHOD}"
 echo " Scene:    ${SCENE}"
 echo " Data:     ${DATA_DIR}"
 echo " Iters:    ${MAX_ITERS}"
-echo " GPU:      $(nvidia-smi --query-gpu=name --format=csv,noheader,nounits | head -1)"
+echo " GPU idx:  ${CUDA_VISIBLE_DEVICES}"
+echo " GPU name: $(nvidia-smi -i "${CUDA_VISIBLE_DEVICES}" --query-gpu=name --format=csv,noheader,nounits 2>/dev/null || echo 'unknown')"
 echo "============================================"
 
 if [ ! -f "${DATA_DIR}/transforms.json" ]; then

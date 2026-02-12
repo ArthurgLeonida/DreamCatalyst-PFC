@@ -16,7 +16,8 @@ DreamCatalyst-PFC/
 ├── setup.sh                             # One-shot Linux/HPC setup
 ├── train.sh                             # Training launcher
 ├── scripts/
-│   └── process_data.sh                  # COLMAP data processing wrapper
+│   ├── process_data.sh                  # COLMAP data processing wrapper
+│   └── pick_gpu.py                      # Auto-select least-busy GPU
 │
 ├── dream_catalyst_ns/                   # ── Custom package ──
 │   ├── __init__.py
@@ -139,6 +140,107 @@ ns-train --help | grep dream-catalyst
 
 - **COLMAP** — `apt install colmap` or `module load colmap` (version ≤ 3.9.1 for NS 1.1.5)
 - **FFmpeg** — `apt install ffmpeg`
+
+---
+
+## 1.5. H100 / JupyterLab Setup (HPC cluster)
+
+If your HPC environment gives you a **JupyterLab** web interface (instead of raw SSH), follow these steps.
+
+### Step 1 — Open a Terminal inside JupyterLab
+
+In JupyterLab, click **File → New → Terminal** (or the "Terminal" tile on the launcher page). This gives you a normal Linux shell.
+
+### Step 2 — Clone the repo
+
+```bash
+cd ~                               # or wherever your HPC home/workspace is
+git clone https://github.com/ArthurgLeonida/DreamCatalyst-PFC.git
+cd DreamCatalyst-PFC
+```
+
+### Step 3 — Run the one-shot setup
+
+```bash
+chmod +x setup.sh
+./setup.sh                         # creates conda env '3d_edit', installs everything
+```
+
+> **Tip:** If `conda` is not found, your cluster may require `module load anaconda` or `module load miniconda` first. Ask your sysadmin.
+
+### Step 4 — Activate the environment
+
+```bash
+conda activate 3d_edit
+```
+
+> **JupyterLab terminal caveat:** If `conda activate` fails with "shell not initialized", run:
+> ```bash
+> eval "$(conda shell.bash hook)"
+> conda activate 3d_edit
+> ```
+
+### Step 5 — Check GPU availability
+
+```bash
+nvidia-smi                         # should show H100(s)
+python scripts/pick_gpu.py         # auto-selects the least-busy GPU
+```
+
+### Step 6 — Upload / process data
+
+**Option A — Upload via JupyterLab file browser:**
+1. In the left sidebar, navigate to `DreamCatalyst-PFC/data/`
+2. Create a folder `chair/images/`
+3. Drag-and-drop your images into it
+
+**Option B — Copy from cluster filesystem:**
+```bash
+mkdir -p data/chair/images
+cp /path/to/your/images/*.jpg data/chair/images/
+```
+
+Then process:
+```bash
+bash scripts/process_data.sh chair
+```
+
+### Step 7 — Train!
+
+```bash
+bash train.sh chair 500              # quick test (500 iters)
+bash train.sh chair 30000            # full training
+bash train.sh chair 30000 dream      # DreamCatalyst method
+```
+
+`train.sh` auto-selects the best GPU via `scripts/pick_gpu.py`.
+
+### Step 8 — Monitor with TensorBoard
+
+```bash
+tensorboard --logdir outputs/ --port 6006 --bind_all &
+```
+
+Then in JupyterLab, open a new browser tab at `http://<your-cluster-host>:6006`
+(or use your cluster's port-forwarding instructions).
+
+### Using a Jupyter Notebook instead of Terminal
+
+If you prefer running commands from a notebook cell, create a new `.ipynb` and prefix commands with `!`:
+
+```python
+# Cell 1 — Setup (run once)
+!cd ~/DreamCatalyst-PFC && ./setup.sh
+
+# Cell 2 — Activate env & train
+import os, subprocess
+
+# Select GPU
+exec(open("scripts/pick_gpu.py").read())   # sets CUDA_VISIBLE_DEVICES
+
+# Run training
+!cd ~/DreamCatalyst-PFC && conda run -n 3d_edit bash train.sh chair 500
+```
 
 ---
 
