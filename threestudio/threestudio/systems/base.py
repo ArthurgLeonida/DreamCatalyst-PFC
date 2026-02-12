@@ -5,7 +5,11 @@ import pytorch_lightning as pl
 import torch.nn.functional as F
 
 import threestudio
-from threestudio.models.exporters.base import Exporter, ExporterOutput
+try:
+    from threestudio.models.exporters.base import Exporter, ExporterOutput
+except ImportError:
+    Exporter = None
+    ExporterOutput = None
 from threestudio.systems.utils import parse_optimizer, parse_scheduler
 from threestudio.utils.base import (
     Updateable,

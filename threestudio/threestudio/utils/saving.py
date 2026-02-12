@@ -8,14 +8,26 @@ import imageio
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import trimesh
-import wandb
+try:
+    import trimesh
+except ImportError:
+    trimesh = None
+try:
+    import wandb
+except ImportError:
+    wandb = None
 from matplotlib import cm
 from matplotlib.colors import LinearSegmentedColormap
 from PIL import Image, ImageDraw
-from pytorch_lightning.loggers import WandbLogger
+try:
+    from pytorch_lightning.loggers import WandbLogger
+except ImportError:
+    WandbLogger = None
 
-from threestudio.models.mesh import Mesh
+try:
+    from threestudio.models.mesh import Mesh
+except ImportError:
+    Mesh = None
 from threestudio.utils.typing import *
 
 
