@@ -12,103 +12,139 @@ A clean reimplementation of **DreamCatalyst** (ICLR 2025) on top of Nerfstudio, 
 DreamCatalyst-PFC/
 ├── pyproject.toml                       # Package config + Nerfstudio entry-point
 ├── README.md
-├── data/                                # Your datasets go here (git-ignored)
-│   └── chair/
-│       ├── images/                      # Raw + COLMAP-copied images
-│       ├── images_2/                    # 2× downscaled
-│       ├── images_4/                    # 4× downscaled
-│       ├── images_8/                    # 8× downscaled
-│       ├── colmap/                      # COLMAP sparse reconstruction
-│       ├── transforms.json              # Camera poses (Nerfstudio format)
-│       └── sparse_pc.ply               # Sparse point cloud
-└── dream_catalyst_ns/                   # Python package
-    ├── __init__.py
-    ├── dream_config.py                  # MethodSpecification (registers with ns-train)
-    └── dream_pipeline.py                # Custom Pipeline
+├── requirements.txt                     # Pip dependencies
+├── setup.sh                             # One-shot Linux/HPC setup
+├── train.sh                             # Training launcher
+├── scripts/
+│   └── process_data.sh                  # COLMAP data processing wrapper
+│
+├── dream_catalyst_ns/                   # ── Custom package ──
+│   ├── __init__.py
+│   ├── dream_config.py                  # MethodSpecification (registers with ns-train)
+│   └── dream_pipeline.py                # Custom Pipeline (SDS + IP2P)
+│
+├── nerfstudio/                          # ── Embedded Nerfstudio v1.1.5 (trimmed) ──
+│   ├── pyproject.toml
+│   └── nerfstudio/
+│       ├── cameras/                     # Camera models & optimizers
+│       ├── configs/                     # Method & dataparser configs (Splatfacto only)
+│       ├── data/                        # Dataparsers, datamanagers, datasets
+│       ├── engine/                      # Trainer, optimizers, schedulers, callbacks
+│       ├── models/                      # base_model + splatfacto only
+│       ├── model_components/            # Losses, bilateral grid, renderers
+│       ├── pipelines/                   # VanillaPipeline + DynamicBatch
+│       ├── process_data/                # COLMAP utilities (for dataparsers)
+│       └── utils/                       # Math, profiling, rich, writer, etc.
+│
+├── threestudio/                         # ── Embedded threestudio v0.2.3 (trimmed) ──
+│   ├── setup.py
+│   ├── launch.py
+│   └── threestudio/
+│       ├── models/
+│       │   ├── guidance/                # ⭐ SDS, InstructPix2Pix, SDI guidance
+│       │   └── prompt_processors/       # Text prompt encoding
+│       ├── systems/                     # DreamFusion, InstructNeRF2NeRF, SDI systems
+│       ├── data/                        # Camera sampling, multiview datasets
+│       └── utils/                       # Config, ops, loss, typing, etc.
+│
+└── data/                                # Your datasets (git-ignored)
+    └── chair/
+        ├── images/                      # Raw images
+        └── ...                          # COLMAP outputs, downscaled copies
 ```
+
+### What was trimmed
+
+Both `nerfstudio/` and `threestudio/` are embedded as **local editable packages**, stripped down to only the modules needed for DreamCatalyst:
+
+| Removed from Nerfstudio | Reason |
+|--------------------------|--------|
+| `viewer/`, `viewer_legacy/` | Interactive viewer — not needed for headless training |
+| `exporter/` | Mesh/point cloud export |
+| `scripts/`, `plugins/` | CLI entrypoints — we use our own |
+| `generative/` | Built-in SD wrappers — threestudio handles this |
+| `fields/`, `field_components/` | Neural fields — Splatfacto uses explicit Gaussians |
+| All NeRF models | Only `splatfacto.py` + `base_model.py` kept |
+| All dataparsers except `nerfstudio` + `colmap` | Unused dataset formats |
+| `docs/`, `tests/`, `colab/` | Development artifacts |
+
+| Removed from threestudio | Reason |
+|---------------------------|--------|
+| `models/geometry/`, `renderers/`, `materials/`, `background/` | Nerfstudio handles 3D representation |
+| `models/exporters/` | Not needed |
+| Most guidance modules | Only `stable_diffusion`, `instructpix2pix`, `sdi` kept |
+| Most systems | Only `base`, `dreamfusion`, `instructnerf2nerf`, `sdi` kept |
+| `extern/`, `load/`, `custom/` | Zero123 / demo data |
+| `docker/`, `docs/`, notebooks, `gradio_app.py` | Development artifacts |
+| Most YAML configs | Only `dreamfusion-sd.yaml`, `instructnerf2nerf.yaml`, `sdi.yaml` kept |
 
 ---
 
-## 1. Installation
+## 1. Installation (Linux / HPC — recommended)
 
-### 1a. Create conda environment
+### Quick start (one command)
 
-```powershell
+```bash
+git clone https://github.com/ArthurgLeonida/DreamCatalyst-PFC.git
+cd DreamCatalyst-PFC
+chmod +x setup.sh
+./setup.sh          # creates conda env '3d_edit', installs everything
+conda activate 3d_edit
+```
+
+### Manual installation
+
+#### 1a. Create conda environment
+
+```bash
 conda create -n 3d_edit python=3.10 -y
 conda activate 3d_edit
 ```
 
-### 1b. Install PyTorch with CUDA 11.8
+#### 1b. Install PyTorch with CUDA 11.8
 
-```powershell
-pip install torch==2.1.2+cu118 torchvision==0.16.2+cu118 --index-url https://download.pytorch.org/whl/cu118
+```bash
+pip install torch==2.1.2+cu118 torchvision==0.16.2+cu118 \
+    --index-url https://download.pytorch.org/whl/cu118
 ```
 
 Verify:
-
-```powershell
+```bash
 python -c "import torch; print('CUDA:', torch.cuda.is_available())"
-# Should print: CUDA: True
 ```
 
-### 1c. Install Nerfstudio
+#### 1c. Install local frameworks
 
-```powershell
-pip install nerfstudio
+```bash
+# Install the embedded nerfstudio (editable)
+pip install -e ./nerfstudio
+
+# Install the embedded threestudio (editable)
+pip install -e ./threestudio
+
+# Install remaining dependencies
+pip install -r requirements.txt
 ```
 
-### 1d. Install FFmpeg 8.0.1 (system binary)
+#### 1d. Install this project
 
-FFmpeg is required by `ns-process-data` for image metadata extraction.
-
-1. Download from <https://www.gyan.dev/ffmpeg/builds/> — get **`ffmpeg-release-essentials.zip`**
-2. Extract to a permanent location (e.g. `C:\ffmpeg\`)
-3. Add the `bin\` folder to your **PATH** environment variable:
-   - Win + S → "Environment Variables" → User variables → Path → New →
-     `C:\ffmpeg\ffmpeg-8.0.1-essentials_build\bin`
-4. Restart your terminal and verify:
-
-```powershell
-ffmpeg -version
-```
-
-### 1e. Install COLMAP 3.9.1 (system binary)
-
-> ⚠️ **COLMAP ≥ 3.13 is NOT compatible** with Nerfstudio 1.1.5
-> (the `--SiftExtraction.use_gpu` flag was removed). Use **COLMAP 3.9.1**.
-
-1. Download **COLMAP 3.9.1** (CUDA) from [GitHub Releases](https://github.com/colmap/colmap/releases/tag/3.9.1) — get `COLMAP-3.9.1-windows-cuda.zip`
-2. Extract to a permanent location (e.g. `C:\colmap\`)
-3. Add the folder to your **PATH** (same process as FFmpeg above)
-4. Restart your terminal and verify:
-
-```powershell
-colmap help
-# Should show: COLMAP 3.9.1
-```
-
-### 1f. Install this project
-
-```powershell
-conda activate 3d_edit
-cd <path-to-this-repo>
-
-# Install in editable mode
+```bash
 pip install -e .
 
-# Re-generate CLI tab-completion (optional)
-ns-install-cli
+# Verify dream-catalyst is registered
+ns-train --help | grep dream-catalyst
 ```
 
-After this, `ns-train --help` should list **`dream-catalyst`** as an available method.
+#### 1e. System dependencies
+
+- **COLMAP** — `apt install colmap` or `module load colmap` (version ≤ 3.9.1 for NS 1.1.5)
+- **FFmpeg** — `apt install ffmpeg`
 
 ---
 
 ## 2. Data Processing
 
 ### 2a. Place your images
-
-Put your photos in a folder:
 
 ```
 data/chair/images/
@@ -117,48 +153,28 @@ data/chair/images/
 ├── ...
 ```
 
-**Tips for good captures:**
-- **50–100 images** is a good range for a single object
-- Walk around the object; ensure significant overlap between views
-- Capture from multiple heights (eye level, low angle, slightly above)
-- Good, even lighting; avoid motion blur
+**Tips**: 50–100 images, walk around the object, multiple heights, good lighting.
 
 ### 2b. Run `ns-process-data`
 
-**From a folder of images (COLMAP):**
+```bash
+# From images (COLMAP):
+ns-process-data images --data data/chair/images --output-dir data/chair
 
-```powershell
-ns-process-data images --data data/chair/images --output-dir data/chair_processed
+# From video:
+ns-process-data video --data data/chair/video.mp4 --output-dir data/chair
 ```
 
-This will:
-1. Run COLMAP feature extraction + matching + sparse reconstruction
-2. Generate `data/chair/transforms.json` with camera poses
-3. Create downscaled image copies (`images_2/`, `images_4/`, `images_8/`)
-4. Generate `sparse_pc.ply` (initial point cloud for Splatfacto)
-
-> ⏱️ COLMAP can take 30–60 minutes depending on image count and resolution.
-
-**From a video:**
-
-```powershell
-ns-process-data video --data data/chair/video.mp4 --output-dir data/chair_processed
+Or use the wrapper script:
+```bash
+bash scripts/process_data.sh chair
 ```
 
-### 2c. Verify the processed dataset
+### 2c. Verify
 
-After processing, run this quick check:
-
-```powershell
-python -c "import json; d=json.load(open('data/chair/transforms.json')); print('Frames:', len(d['frames'])); print('Resolution: %dx%d' % (d['w'], d['h']))"
+```bash
+python -c "import json; d=json.load(open('data/chair/transforms.json')); print('Frames:', len(d['frames']))"
 ```
-
-Also confirm these files/folders exist:
-- `data/chair/transforms.json`
-- `data/chair/sparse_pc.ply`
-- `data/chair/images_2/`, `images_4/`, `images_8/`
-
-You should see a frame count close to your original image count.
 
 ---
 
@@ -166,100 +182,62 @@ You should see a frame count close to your original image count.
 
 ### 3a. Verify with vanilla Splatfacto
 
-Test that the data is correct before using the custom pipeline:
-
-```powershell
-ns-train splatfacto --data data/chair --max-num-iterations 500
+```bash
+ns-train splatfacto --data data/chair --max-num-iterations 500 --vis tensorboard
 ```
 
-In case of GPU memory issues, try downscaling:
-
-```powershell
-ns-train splatfacto --max-num-iterations 500 nerfstudio-data --data data/chair_processed --downscale-factor 4
+With downscaling:
+```bash
+ns-train splatfacto --max-num-iterations 500 --vis tensorboard \
+    nerfstudio-data --data data/chair --downscale-factor 4
 ```
-
-If cameras and images load without errors, the data is good.
 
 ### 3b. Run with DreamCatalyst pipeline
 
-```powershell
-ns-train dream-catalyst --data data/chair
+```bash
+ns-train dream-catalyst --data data/chair --vis tensorboard
 ```
 
----
+Or use the training script:
+```bash
+bash train.sh chair              # 500 iters, splatfacto
+bash train.sh chair 30000 dream  # 30k iters, dream-catalyst
+```
 
-## 4. Linux / HPC Quick Start (H100)
-
-If you're deploying to a Linux server with a GPU (e.g. H100 cluster), the setup is much simpler:
+### 3c. View results
 
 ```bash
-# 1. Clone the repo
-git clone https://github.com/ArthurgLeonida/DreamCatalyst-PFC.git
-cd DreamCatalyst-PFC
-
-# 2. Run the setup script (creates conda env, installs everything)
-chmod +x setup.sh
-./setup.sh            # creates env '3d_edit' by default
-# ./setup.sh my_env   # or use a custom name
-
-# 3. Activate the environment
-conda activate 3d_edit
-
-# 4. Upload & process your data
-# scp your images into data/chair/images/
-bash scripts/process_data.sh chair
-
-# 5. Test with vanilla Splatfacto (500 iters)
-bash train.sh chair
-
-# 6. Full training with DreamCatalyst
-bash train.sh chair 30000 dream
-
-# 7. View results
 tensorboard --logdir outputs/
 ```
-
-### Files overview
-
-| File | Purpose |
-|------|---------|
-| `setup.sh` | One-shot environment setup (conda + pip + verify) |
-| `train.sh` | Training launcher (`train.sh <scene> [iters] [method]`) |
-| `scripts/process_data.sh` | COLMAP data processing wrapper |
-| `requirements.txt` | All pip dependencies (install PyTorch separately first) |
-| `train.bat` | Windows training launcher (with MSVC workarounds) |
 
 ---
 
 ## Environment
 
-| Component  | Version / Notes                                          |
-|------------|----------------------------------------------------------|
-| OS         | Windows 11 / Linux (HPC)                                 |
-| GPU        | NVIDIA RTX 3050 6 GB (local) / H100 80 GB (cluster)      |
-| Python     | 3.10                                                     |
-| PyTorch    | 2.1.2+cu118                                              |
-| CUDA       | 11.8 (via PyTorch wheels)                                |
-| Nerfstudio | 1.1.5                                                    |
-| gsplat     | 1.4.0                                                    |
-| diffusers  | 0.36.0                                                   |
-| COLMAP     | 3.9.1 (system binary)                                    |
-| FFmpeg     | 8.0.1 (system binary)                                    |
+| Component    | Version / Notes                                          |
+|--------------|----------------------------------------------------------|
+| OS           | Linux (HPC) / Windows 11 (local dev)                     |
+| GPU          | H100 80 GB (cluster) / RTX 3050 6 GB (local)             |
+| Python       | 3.10                                                     |
+| PyTorch      | 2.1.2+cu118                                              |
+| CUDA         | 11.8 (via PyTorch wheels)                                |
+| Nerfstudio   | 1.1.5 (local, trimmed)                                   |
+| threestudio  | 0.2.3 (local, trimmed)                                   |
+| gsplat       | 1.4.0                                                    |
+| diffusers    | ≥ 0.36.0                                                 |
+| COLMAP       | ≤ 3.9.1 (system binary)                                  |
+| FFmpeg       | any recent version (system binary)                       |
 
 ---
 
-## Citation
-
-This project reimplements the methodology from:
+## BibTeX
 
 ```bibtex
-@misc{kim2024dreamcatalyst,
-      title={DreamCatalyst: Fast and High-Quality 3D Editing via Controlling Editability and Identity Preservation}, 
-      author={Jiwook Kim and Seonho Lee and Jaeyo Shin and Jiho Choi and Hyunjung Shim},
-      year={2024},
-      eprint={2407.11394},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2407.11394}
+@inproceedings{kim2025dreamcatalyst,
+  title     = {DreamCatalyst: Fast and High-Quality 3D Editing via Controlling Editability and Identity Preservation},
+  author    = {Jiwook Kim and Seonho Lee and Jaeyo Shin and Jiho Choi and Hyunjung Shim},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2025},
+  url       = {https://arxiv.org/abs/2407.11394},
 }
 ```

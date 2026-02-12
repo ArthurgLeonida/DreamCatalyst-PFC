@@ -13,9 +13,11 @@ license = { text = "MIT" }
 # NOTE: The following must be installed BEFORE this package (they require
 # special index URLs or system-level setup that pip cannot resolve here):
 #   - PyTorch 2.1.2+cu118   (see README.md §1)
-#   - nerfstudio 1.1.5      (pip install nerfstudio)
-#   - COLMAP 3.9.1           (system binary – see README.md §2b)
-#   - FFmpeg                 (system binary – see README.md §2a)
+#   - COLMAP 3.9.1           (system binary – see README.md)
+#   - FFmpeg                 (system binary – see README.md)
+#
+# Nerfstudio and threestudio are embedded as local folders in this repo.
+# They are installed via: pip install -e ./nerfstudio && pip install -e ./threestudio
 #
 # Only extra pip-installable dependencies are listed below.
 dependencies = [

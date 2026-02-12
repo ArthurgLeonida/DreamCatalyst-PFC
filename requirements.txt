@@ -6,14 +6,13 @@
 #   pip install torch==2.1.2+cu118 torchvision==0.16.2+cu118 \
 #       --index-url https://download.pytorch.org/whl/cu118
 #
-# Then install everything else:
+# Then install local frameworks + this package:
 #
+#   pip install -e ./nerfstudio
+#   pip install -e ./threestudio
 #   pip install -r requirements.txt
 #   pip install -e .
 # ==============================================================================
-
-# ── Core framework ───────────────────────────────────────────────────────────
-nerfstudio==1.1.5
 
 # ── Gaussian Splatting backend ───────────────────────────────────────────────
 gsplat==1.4.0
@@ -22,6 +21,12 @@ gsplat==1.4.0
 diffusers>=0.36.0
 transformers>=4.36.0
 accelerate>=0.25.0
+
+# ── threestudio dependencies (subset) ───────────────────────────────────────
+lightning==2.0.0
+omegaconf==2.3.0
+jaxtyping
+typeguard
 
 # ── Numerical / utility ─────────────────────────────────────────────────────
 numpy<2

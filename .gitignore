@@ -12,6 +12,7 @@ env/
 venv/
 .env
 *.egg-info/
+*.egg
 dist/
 build/
 eggs/
@@ -30,3 +31,22 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# ── Embedded frameworks (local nerfstudio & threestudio) ──────────────────────
+# Keep their source but ignore build/install artifacts
+nerfstudio/*.egg-info/
+nerfstudio/build/
+nerfstudio/dist/
+threestudio/*.egg-info/
+threestudio/build/
+threestudio/dist/
+
+# Ignore their nested .gitignore (we manage from root)
+# nerfstudio/.gitignore  — keep for reference
+# threestudio/.gitignore — keep for reference
+
+# CUDA / C++ build artifacts
+*.so
+*.o
+*.a
+*.dylib

@@ -27,7 +27,7 @@ echo "============================================"
 if conda info --envs | grep -q "^${ENV_NAME} "; then
     echo "[INFO] Conda env '${ENV_NAME}' already exists. Activating..."
 else
-    echo "[1/5] Creating conda env '${ENV_NAME}' (Python ${PYTHON_VERSION})..."
+    echo "[1/6] Creating conda env '${ENV_NAME}' (Python ${PYTHON_VERSION})..."
     conda create -n "${ENV_NAME}" python="${PYTHON_VERSION}" -y
 fi
 
@@ -39,23 +39,28 @@ echo "[INFO] Python: $(python --version)"
 echo "[INFO] pip:    $(pip --version)"
 
 # ── 2. Install PyTorch with CUDA 11.8 ───────────────────────────────────────
-echo "[2/5] Installing PyTorch 2.1.2+cu118..."
+echo "[2/6] Installing PyTorch 2.1.2+cu118..."
 pip install torch==2.1.2+cu118 torchvision==0.16.2+cu118 \
     --index-url https://download.pytorch.org/whl/cu118
 
 # Verify CUDA
 python -c "import torch; assert torch.cuda.is_available(), 'CUDA not available!'; print(f'  ✓ PyTorch {torch.__version__} with CUDA {torch.version.cuda}')"
 
-# ── 3. Install requirements ────────────────────────────────────────────────
-echo "[3/5] Installing requirements.txt..."
-pip install -r requirements.txt
+# ── 3. Install local nerfstudio (from embedded folder) ──────────────────────
+echo "[3/6] Installing local nerfstudio (editable)..."
+pip install -e ./nerfstudio
 
-# ── 4. Install this project in editable mode ────────────────────────────────
-echo "[4/5] Installing dream_catalyst_ns (editable)..."
+# ── 4. Install local threestudio (from embedded folder) ─────────────────────
+echo "[4/6] Installing local threestudio (editable)..."
+pip install -e ./threestudio
+
+# ── 5. Install remaining requirements + this project ────────────────────────
+echo "[5/6] Installing requirements.txt + dream_catalyst_ns..."
+pip install -r requirements.txt
 pip install -e .
 
-# ── 5. Verify installation ─────────────────────────────────────────────────
-echo "[5/5] Verifying installation..."
+# ── 6. Verify installation ─────────────────────────────────────────────────
+echo "[6/6] Verifying installation..."
 
 python -c "
 import torch, nerfstudio, gsplat, diffusers
@@ -74,6 +79,13 @@ else
     echo "  ✗ WARNING: dream-catalyst not found in ns-train --help"
     echo "    Try: pip install -e . && ns-install-cli"
 fi
+
+# Check threestudio guidance modules
+python -c "
+from threestudio.models.guidance.stable_diffusion_guidance import StableDiffusionGuidance
+from threestudio.models.guidance.instructpix2pix_guidance import InstructPix2PixGuidance
+print('  ✓ threestudio guidance modules importable')
+" 2>/dev/null && true || echo "  ⚠ WARNING: threestudio guidance imports failed (may need lightning/omegaconf)"
 
 echo ""
 echo "============================================"
