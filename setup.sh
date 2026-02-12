@@ -43,6 +43,9 @@ echo "[2/6] Installing PyTorch 2.1.2+cu118..."
 pip install torch==2.1.2+cu118 torchvision==0.16.2+cu118 \
     --index-url https://download.pytorch.org/whl/cu118
 
+# Pin NumPy <2 — PyTorch 2.1.2 was compiled against NumPy 1.x and crashes with NumPy 2.x
+pip install "numpy<2"
+
 # Verify CUDA
 python -c "import torch; assert torch.cuda.is_available(), 'CUDA not available!'; print(f'  ✓ PyTorch {torch.__version__} with CUDA {torch.version.cuda}')"
 
@@ -63,7 +66,12 @@ pip install -e .
 echo "[6/6] Verifying installation..."
 
 python -c "
-import torch, nerfstudio, gsplat, diffusers
+import numpy as np
+import torch
+import nerfstudio
+import gsplat
+import diffusers
+print(f'  ✓ NumPy        {np.__version__}')
 print(f'  ✓ PyTorch      {torch.__version__}')
 print(f'  ✓ CUDA         {torch.version.cuda}')
 print(f'  ✓ GPU          {torch.cuda.get_device_name(0)}')

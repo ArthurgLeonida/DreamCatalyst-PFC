@@ -18,9 +18,10 @@
 gsplat==1.4.0
 
 # ── Diffusion / SDS guidance ────────────────────────────────────────────────
-diffusers>=0.36.0
-transformers>=4.36.0
-accelerate>=0.25.0
+# Pinned upper bounds: newer versions require torch.xpu (PyTorch ≥2.4) or numpy≥2
+diffusers>=0.27.0,<0.31.0
+transformers>=4.36.0,<4.46.0
+accelerate>=0.25.0,<0.34.0
 
 # ── threestudio dependencies (subset) ───────────────────────────────────────
 lightning==2.0.0
@@ -30,6 +31,7 @@ typeguard
 
 # ── Numerical / utility ─────────────────────────────────────────────────────
 numpy<2
+opencv-python<4.11          # 4.11+ requires numpy>=2
 Pillow
 imageio
 imageio-ffmpeg
