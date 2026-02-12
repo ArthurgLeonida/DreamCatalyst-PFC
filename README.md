@@ -13,7 +13,7 @@ DreamCatalyst-PFC/
 ├── pyproject.toml                       # Package config + Nerfstudio entry-point
 ├── README.md
 ├── requirements.txt                     # Pip dependencies
-├── setup.sh                             # One-shot Linux/HPC setup
+├── setup.sh                             # One-shot Linux/HPC setup (clones frameworks)
 ├── train.sh                             # Training launcher
 ├── scripts/
 │   ├── process_data.sh                  # COLMAP data processing wrapper
@@ -22,62 +22,24 @@ DreamCatalyst-PFC/
 ├── dream_catalyst_ns/                   # ── Custom package ──
 │   ├── __init__.py
 │   ├── dream_config.py                  # MethodSpecification (registers with ns-train)
-│   └── dream_pipeline.py                # Custom Pipeline (SDS + IP2P)
+│   └── dream_pipeline.py               # Custom Pipeline (SDS + IP2P skeleton)
 │
-├── nerfstudio/                          # ── Embedded Nerfstudio v1.1.5 (trimmed) ──
-│   ├── pyproject.toml
-│   └── nerfstudio/
-│       ├── cameras/                     # Camera models & optimizers
-│       ├── configs/                     # Method & dataparser configs (Splatfacto only)
-│       ├── data/                        # Dataparsers, datamanagers, datasets
-│       ├── engine/                      # Trainer, optimizers, schedulers, callbacks
-│       ├── models/                      # base_model + splatfacto only
-│       ├── model_components/            # Losses, bilateral grid, renderers
-│       ├── pipelines/                   # VanillaPipeline + DynamicBatch
-│       ├── process_data/                # COLMAP utilities (for dataparsers)
-│       └── utils/                       # Math, profiling, rich, writer, etc.
+├── nerfstudio/                          # ── Upstream Nerfstudio v1.1.5 (cloned by setup.sh, gitignored) ──
 │
-├── threestudio/                         # ── Embedded threestudio v0.2.3 (trimmed) ──
-│   ├── setup.py
-│   ├── launch.py
-│   └── threestudio/
-│       ├── models/
-│       │   ├── guidance/                # ⭐ SDS, InstructPix2Pix, SDI guidance
-│       │   └── prompt_processors/       # Text prompt encoding
-│       ├── systems/                     # DreamFusion, InstructNeRF2NeRF, SDI systems
-│       ├── data/                        # Camera sampling, multiview datasets
-│       └── utils/                       # Config, ops, loss, typing, etc.
+├── threestudio/                         # ── Upstream threestudio (cloned by setup.sh, gitignored) ──
 │
-└── data/                                # Your datasets (git-ignored)
+└── data/                                # Your datasets (gitignored)
     └── chair/
-        ├── images/                      # Raw images
-        └── ...                          # COLMAP outputs, downscaled copies
+        └── images/                      # Raw images
 ```
 
-### What was trimmed
+### Architecture
 
-Both `nerfstudio/` and `threestudio/` are embedded as **local editable packages**, stripped down to only the modules needed for DreamCatalyst:
+The `dream_catalyst_ns/` package is a **Nerfstudio plugin**. It registers itself via `pyproject.toml` entry-points — no modifications to nerfstudio or threestudio internals are needed.
 
-| Removed from Nerfstudio | Reason |
-|--------------------------|--------|
-| `viewer/`, `viewer_legacy/` | Interactive viewer — not needed for headless training |
-| `exporter/` | Mesh/point cloud export |
-| `scripts/`, `plugins/` | CLI entrypoints — we use our own |
-| `generative/` | Built-in SD wrappers — threestudio handles this |
-| `fields/`, `field_components/` | Neural fields — Splatfacto uses explicit Gaussians |
-| All NeRF models | Only `splatfacto.py` + `base_model.py` kept |
-| All dataparsers except `nerfstudio` + `colmap` | Unused dataset formats |
-| `docs/`, `tests/`, `colab/` | Development artifacts |
-
-| Removed from threestudio | Reason |
-|---------------------------|--------|
-| `models/geometry/`, `renderers/`, `materials/`, `background/` | Nerfstudio handles 3D representation |
-| `models/exporters/` | Not needed |
-| Most guidance modules | Only `stable_diffusion`, `instructpix2pix`, `sdi` kept |
-| Most systems | Only `base`, `dreamfusion`, `instructnerf2nerf`, `sdi` kept |
-| `extern/`, `load/`, `custom/` | Zero123 / demo data |
-| `docker/`, `docs/`, notebooks, `gradio_app.py` | Development artifacts |
-| Most YAML configs | Only `dreamfusion-sd.yaml`, `instructnerf2nerf.yaml`, `sdi.yaml` kept |
+- **Nerfstudio** provides the training loop, data pipeline, Splatfacto model, and CLI (`ns-train`)
+- **threestudio** provides diffusion guidance modules (SDS, InstructPix2Pix, SDI)
+- **dream_catalyst_ns** wires them together with a custom pipeline that injects SDS/IP2P losses into the Splatfacto training loop
 
 ---
 
@@ -93,6 +55,14 @@ chmod +x setup.sh
 conda activate 3d_edit
 ```
 
+`setup.sh` will:
+1. Create a conda environment with Python 3.10
+2. Install PyTorch 2.1.2 + CUDA 11.8
+3. Clone & install upstream **nerfstudio v1.1.5**
+4. Clone & install upstream **threestudio**
+5. Install `requirements.txt` + this project (`dream_catalyst_ns`)
+6. Verify everything works
+
 ### Manual installation
 
 #### 1a. Create conda environment
@@ -107,6 +77,7 @@ conda activate 3d_edit
 ```bash
 pip install torch==2.1.2+cu118 torchvision==0.16.2+cu118 \
     --index-url https://download.pytorch.org/whl/cu118
+pip install "numpy<2"
 ```
 
 Verify:
@@ -114,13 +85,17 @@ Verify:
 python -c "import torch; print('CUDA:', torch.cuda.is_available())"
 ```
 
-#### 1c. Install local frameworks
+#### 1c. Clone & install frameworks
 
 ```bash
-# Install the embedded nerfstudio (editable)
+# Clone upstream nerfstudio
+git clone --branch v1.1.5 --depth 1 \
+    https://github.com/nerfstudio-project/nerfstudio.git
 pip install -e ./nerfstudio
 
-# Install the embedded threestudio (editable)
+# Clone upstream threestudio
+git clone --depth 1 \
+    https://github.com/threestudio-project/threestudio.git
 pip install -e ./threestudio
 
 # Install remaining dependencies
@@ -323,10 +298,10 @@ tensorboard --logdir outputs/
 | Python       | 3.10                                                     |
 | PyTorch      | 2.1.2+cu118                                              |
 | CUDA         | 11.8 (via PyTorch wheels)                                |
-| Nerfstudio   | 1.1.5 (local, trimmed)                                   |
-| threestudio  | 0.2.3 (local, trimmed)                                   |
+| Nerfstudio   | 1.1.5 (upstream, cloned by setup.sh)                     |
+| threestudio  | latest (upstream, cloned by setup.sh)                    |
 | gsplat       | 1.4.0                                                    |
-| diffusers    | ≥ 0.36.0                                                 |
+| diffusers    | ≥ 0.27.0, < 0.31.0                                      |
 | COLMAP       | ≤ 3.9.1 (system binary)                                  |
 | FFmpeg       | any recent version (system binary)                       |
 

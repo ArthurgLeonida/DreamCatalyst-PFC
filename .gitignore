@@ -32,7 +32,7 @@ Thumbs.db
 *.swo
 *~
 
-# ── Embedded frameworks ───────────────────────────────────────────────────────
+# ── Upstream frameworks ───────────────────────────────────────────────────────
 # Upstream nerfstudio & threestudio are cloned by setup.sh — not tracked in git.
 /nerfstudio/
 /threestudio/
