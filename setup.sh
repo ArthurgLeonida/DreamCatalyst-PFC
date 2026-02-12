@@ -93,7 +93,7 @@ python -c "
 from threestudio.models.guidance.stable_diffusion_guidance import StableDiffusionGuidance
 from threestudio.models.guidance.instructpix2pix_guidance import InstructPix2PixGuidance
 print('  ✓ threestudio guidance modules importable')
-" 2>/dev/null && true || echo "  ⚠ WARNING: threestudio guidance imports failed (may need lightning/omegaconf)"
+" || echo "  ⚠ WARNING: threestudio guidance imports failed (see error above)"
 
 echo ""
 echo "============================================"
