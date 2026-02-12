@@ -4,13 +4,13 @@
 # ==============================================================================
 #  Usage:
 #    chmod +x setup.sh
-#    ./setup.sh
+#    ./setup.sh [env_name]       (default: 3d_edit)
 #
 #  Prerequisites on the server:
 #    - conda  (or mamba / micromamba)
 #    - CUDA drivers ≥ 11.8  (check with: nvidia-smi)
-#    - COLMAP  (apt install colmap  OR  module load colmap)
-#    - FFmpeg  (apt install ffmpeg  OR  module load ffmpeg)
+#    - COLMAP 3.9.1          (apt install colmap  OR  module load colmap)
+#    - FFmpeg                (apt install ffmpeg  OR  module load ffmpeg)
 # ==============================================================================
 
 set -euo pipefail
@@ -18,46 +18,60 @@ set -euo pipefail
 ENV_NAME="${1:-3d_edit}"
 PYTHON_VERSION="3.10"
 
+# Pinned upstream versions
+NERFSTUDIO_TAG="v1.1.5"
+
 echo "============================================"
 echo " DreamCatalyst-NS — Environment Setup"
 echo " Conda env: ${ENV_NAME}"
 echo "============================================"
 
-# ── 1. Create conda environment ─────────────────────────────────────────────
+# ── 1. Create / activate conda environment ──────────────────────────────────
 if conda info --envs | grep -q "^${ENV_NAME} "; then
-    echo "[INFO] Conda env '${ENV_NAME}' already exists. Activating..."
+    echo "[1/6] Conda env '${ENV_NAME}' already exists. Activating..."
 else
     echo "[1/6] Creating conda env '${ENV_NAME}' (Python ${PYTHON_VERSION})..."
     conda create -n "${ENV_NAME}" python="${PYTHON_VERSION}" -y
 fi
 
-# Activate (works in scripts with conda init)
 eval "$(conda shell.bash hook)"
 conda activate "${ENV_NAME}"
 
-echo "[INFO] Python: $(python --version)"
-echo "[INFO] pip:    $(pip --version)"
+echo "  Python: $(python --version)"
+echo "  pip:    $(pip --version)"
 
 # ── 2. Install PyTorch with CUDA 11.8 ───────────────────────────────────────
 echo "[2/6] Installing PyTorch 2.1.2+cu118..."
 pip install torch==2.1.2+cu118 torchvision==0.16.2+cu118 \
     --index-url https://download.pytorch.org/whl/cu118
 
-# Pin NumPy <2 — PyTorch 2.1.2 was compiled against NumPy 1.x and crashes with NumPy 2.x
+# Pin NumPy <2 — PyTorch 2.1.2 was compiled against NumPy 1.x
 pip install "numpy<2"
 
-# Verify CUDA
-python -c "import torch; assert torch.cuda.is_available(), 'CUDA not available!'; print(f'  ✓ PyTorch {torch.__version__} with CUDA {torch.version.cuda}')"
+python -c "
+import torch
+assert torch.cuda.is_available(), 'CUDA not available!'
+print(f'  ✓ PyTorch {torch.__version__}  CUDA {torch.version.cuda}  GPU: {torch.cuda.get_device_name(0)}')
+"
 
-# ── 3. Install local nerfstudio (from embedded folder) ──────────────────────
-echo "[3/6] Installing local nerfstudio (editable)..."
-# Clear stale bytecode caches so editable installs pick up latest source
-find ./nerfstudio -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-find ./threestudio -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+# ── 3. Clone & install upstream nerfstudio ──────────────────────────────────
+echo "[3/6] Setting up nerfstudio ${NERFSTUDIO_TAG}..."
+if [ -d "nerfstudio" ]; then
+    echo "  nerfstudio/ already exists, skipping clone."
+else
+    git clone --branch "${NERFSTUDIO_TAG}" --depth 1 \
+        https://github.com/nerfstudio-project/nerfstudio.git
+fi
 pip install -e ./nerfstudio
 
-# ── 4. Install local threestudio (from embedded folder) ─────────────────────
-echo "[4/6] Installing local threestudio (editable)..."
+# ── 4. Clone & install upstream threestudio ─────────────────────────────────
+echo "[4/6] Setting up threestudio..."
+if [ -d "threestudio" ]; then
+    echo "  threestudio/ already exists, skipping clone."
+else
+    git clone --depth 1 \
+        https://github.com/threestudio-project/threestudio.git
+fi
 pip install -e ./threestudio
 
 # ── 5. Install remaining requirements + this project ────────────────────────
@@ -91,12 +105,11 @@ else
     echo "    Try: pip install -e . && ns-install-cli"
 fi
 
-# Check threestudio guidance modules
+# Check threestudio
 python -c "
 import threestudio
-threestudio.ensure_loaded()
-print('  ✓ threestudio modules loaded (%d registered)' % len(threestudio.__modules__))
-" || echo "  ⚠ WARNING: threestudio module loading failed (see error above)"
+print('  ✓ threestudio %s (%d modules registered)' % (threestudio.__version__, len(threestudio.__modules__)))
+" || echo "  ⚠ WARNING: threestudio import failed"
 
 echo ""
 echo "============================================"

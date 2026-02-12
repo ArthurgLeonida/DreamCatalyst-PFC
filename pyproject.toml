@@ -16,7 +16,7 @@ license = { text = "MIT" }
 #   - COLMAP 3.9.1           (system binary – see README.md)
 #   - FFmpeg                 (system binary – see README.md)
 #
-# Nerfstudio and threestudio are embedded as local folders in this repo.
+# Nerfstudio and threestudio are cloned from upstream by setup.sh.
 # They are installed via: pip install -e ./nerfstudio && pip install -e ./threestudio
 #
 # Only extra pip-installable dependencies are listed below.

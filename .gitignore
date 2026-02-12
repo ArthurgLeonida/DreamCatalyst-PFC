@@ -32,18 +32,10 @@ Thumbs.db
 *.swo
 *~
 
-# ── Embedded frameworks (local nerfstudio & threestudio) ──────────────────────
-# Keep their source but ignore build/install artifacts
-nerfstudio/*.egg-info/
-nerfstudio/build/
-nerfstudio/dist/
-threestudio/*.egg-info/
-threestudio/build/
-threestudio/dist/
-
-# Ignore their nested .gitignore (we manage from root)
-# nerfstudio/.gitignore  — keep for reference
-# threestudio/.gitignore — keep for reference
+# ── Embedded frameworks ───────────────────────────────────────────────────────
+# Upstream nerfstudio & threestudio are cloned by setup.sh — not tracked in git.
+/nerfstudio/
+/threestudio/
 
 # CUDA / C++ build artifacts
 *.so

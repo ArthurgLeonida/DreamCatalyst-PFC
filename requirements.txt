@@ -1,17 +1,12 @@
 # ==============================================================================
 # DreamCatalyst-NS — Python requirements
 # ==============================================================================
-# Install PyTorch FIRST (it needs a special index URL):
-#
-#   pip install torch==2.1.2+cu118 torchvision==0.16.2+cu118 \
-#       --index-url https://download.pytorch.org/whl/cu118
-#
-# Then install local frameworks + this package:
-#
-#   pip install -e ./nerfstudio
-#   pip install -e ./threestudio
-#   pip install -r requirements.txt
-#   pip install -e .
+# Install order (handled by setup.sh):
+#   1. PyTorch 2.1.2+cu118
+#   2. pip install -e ./nerfstudio   (cloned from upstream)
+#   3. pip install -e ./threestudio  (cloned from upstream)
+#   4. pip install -r requirements.txt
+#   5. pip install -e .
 # ==============================================================================
 
 # ── Gaussian Splatting backend ───────────────────────────────────────────────
@@ -23,15 +18,9 @@ diffusers>=0.27.0,<0.31.0
 transformers>=4.36.0,<4.46.0
 accelerate>=0.25.0,<0.34.0
 
-# ── threestudio dependencies (subset) ───────────────────────────────────────
-lightning==2.0.0
-omegaconf==2.3.0
-jaxtyping
-typeguard
-
 # ── Numerical / utility ─────────────────────────────────────────────────────
 numpy<2
-opencv-python<4.11          # 4.11+ requires numpy>=2
+opencv-python<4.11
 Pillow
 imageio
 imageio-ffmpeg
