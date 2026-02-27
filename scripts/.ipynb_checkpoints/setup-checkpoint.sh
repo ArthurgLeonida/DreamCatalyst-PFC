@@ -9,8 +9,7 @@
 #  Prerequisites on the server:
 #    - conda  (or mamba / micromamba)
 #    - CUDA drivers ≥ 11.8  (check with: nvidia-smi)
-#    - COLMAP 3.9.1          (apt install colmap  OR  module load colmap)
-#    - FFmpeg                (apt install ffmpeg  OR  module load ffmpeg)
+#  COLMAP and FFmpeg are installed automatically in step 2 via conda-forge.
 # ==============================================================================
 
 set -euo pipefail
@@ -40,8 +39,18 @@ conda activate "${ENV_NAME}"
 echo "  Python: $(python --version)"
 echo "  pip:    $(pip --version)"
 
-# ── 2. Install PyTorch with CUDA 11.8 ───────────────────────────────────────
-echo "[2/6] Installing PyTorch 2.1.2+cu118..."
+# ── 2. Install COLMAP and FFmpeg via conda-forge ─────────────────────────────
+# Using conda-forge avoids needing sudo and works on HPC clusters.
+# COLMAP from conda-forge is the CUDA-enabled build (≤ 3.9.1).
+echo "[2/7] Installing COLMAP and FFmpeg via conda-forge..."
+conda install -y -c conda-forge "colmap<=3.9.1" ffmpeg
+
+# Verify
+echo "  COLMAP: $(colmap -h 2>&1 | head -1 || echo 'NOT FOUND')"
+echo "  FFmpeg: $(ffmpeg -version 2>&1 | head -1 || echo 'NOT FOUND')"
+
+# ── 3. Install PyTorch with CUDA 11.8 ───────────────────────────────────────
+echo "[3/7] Installing PyTorch 2.1.2+cu118..."
 pip install torch==2.1.2+cu118 torchvision==0.16.2+cu118 \
     --index-url https://download.pytorch.org/whl/cu118
 
@@ -54,8 +63,8 @@ assert torch.cuda.is_available(), 'CUDA not available!'
 print(f'  ✓ PyTorch {torch.__version__}  CUDA {torch.version.cuda}  GPU: {torch.cuda.get_device_name(0)}')
 "
 
-# ── 3. Clone & install upstream nerfstudio ──────────────────────────────────
-echo "[3/6] Setting up nerfstudio ${NERFSTUDIO_TAG}..."
+# ── 4. Clone & install upstream nerfstudio ──────────────────────────────────
+echo "[4/7] Setting up nerfstudio ${NERFSTUDIO_TAG}..."
 if [ -d "nerfstudio" ]; then
     echo "  nerfstudio/ already exists, skipping clone."
 else
@@ -64,8 +73,8 @@ else
 fi
 pip install -e ./nerfstudio
 
-# ── 4. Clone & install upstream threestudio ─────────────────────────────────
-echo "[4/6] Setting up threestudio..."
+# ── 5. Clone & install upstream threestudio ─────────────────────────────────
+echo "[5/7] Setting up threestudio..."
 if [ -d "threestudio" ]; then
     echo "  threestudio/ already exists, skipping clone."
 else
@@ -74,13 +83,13 @@ else
 fi
 pip install -e ./threestudio
 
-# ── 5. Install remaining requirements + this project ────────────────────────
-echo "[5/6] Installing requirements.txt + dream_catalyst_ns..."
+# ── 6. Install remaining requirements + this project ────────────────────────
+echo "[6/7] Installing requirements.txt + dream_catalyst_ns..."
 pip install -r requirements.txt
 pip install -e .
 
-# ── 6. Verify installation ─────────────────────────────────────────────────
-echo "[6/6] Verifying installation..."
+# ── 7. Verify installation ─────────────────────────────────────────────────
+echo "[7/7] Verifying installation..."
 
 python -c "
 import numpy as np
@@ -96,6 +105,19 @@ print(f'  ✓ Nerfstudio   {pkg_version(\"nerfstudio\")}')
 print(f'  ✓ gsplat       {gsplat.__version__}')
 print(f'  ✓ diffusers    {diffusers.__version__}')
 "
+
+# Check COLMAP and FFmpeg
+if command -v colmap &>/dev/null; then
+    echo "  ✓ COLMAP       $(colmap -h 2>&1 | grep -oP 'COLMAP \K[0-9.]+' | head -1)"
+else
+    echo "  ✗ WARNING: colmap not found in PATH"
+fi
+
+if command -v ffmpeg &>/dev/null; then
+    echo "  ✓ FFmpeg       $(ffmpeg -version 2>&1 | grep -oP 'version \K[^ ]+' | head -1)"
+else
+    echo "  ✗ WARNING: ffmpeg not found in PATH"
+fi
 
 # Check that dream-catalyst is registered
 if ns-train --help 2>&1 | grep -q "dream-catalyst"; then
