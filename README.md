@@ -71,14 +71,9 @@ bash scripts/process_data.sh chair
 
 # From a video file
 bash scripts/process_data.sh chair video
+
 ```
-
 This calls `ns-process-data` with COLMAP and writes output to `data/chair_processed/`.
-
-**Verify** the result:
-```bash
-ls data/chair_processed/transforms.json
-ls data/chair_processed/images_4/
 ```
 
 ---
@@ -86,9 +81,9 @@ ls data/chair_processed/images_4/
 ## 3. Training
 
 ```bash
-bash train.sh chair              # splatfacto, 500 iters (quick test)
-bash train.sh chair 30000        # splatfacto, full run
-bash train.sh chair 30000 dream  # DreamCatalyst pipeline, full run
+bash scripts/train.sh chair              # splatfacto, 500 iters (quick test)
+bash scripts/train.sh chair 30000        # splatfacto, full run
+bash scripts/train.sh chair 30000 dream  # DreamCatalyst pipeline, full run
 ```
 
 `train.sh` automatically selects the least-busy GPU via `scripts/pick_gpu.py`.
@@ -102,8 +97,8 @@ tensorboard --logdir outputs/ --port 6006 --bind_all &
 **Export** the trained splat:
 ```bash
 ns-export gaussian-splat \
-    --load-config outputs/chair/dream-catalyst/<DATE>/config.yml \
-    --output-dir exports/chair
+    --load-config outputs/hero/dream-catalyst/<DATE>/config.yml \
+    --output-dir exports/hero
 ```
 
 ---

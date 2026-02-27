@@ -5,7 +5,6 @@
 #  Usage:
 #    python scripts/check_blur.py chair
 #    python scripts/check_blur.py chair --threshold 150.0
-#    python scripts/check_blur.py chair --delete   # auto-delete blurry images
 # ==============================================================================
 
 import argparse
@@ -25,9 +24,8 @@ def compute_blur_score(img_path: Path) -> float | None:
 
 def main():
     parser = argparse.ArgumentParser(description="Check blur in a scene's image dataset.")
-    parser.add_argument("scene",                  help="Scene name (looks in data/<scene>/images/)")
+    parser.add_argument("scene",                   help="Scene name (looks in data/<scene>/images/)")
     parser.add_argument("--threshold", type=float, default=100.0, help="Blur threshold (default: 100.0)")
-    parser.add_argument("--delete",   action="store_true",        help="Auto-delete blurry images")
     args = parser.parse_args()
 
     data_dir    = Path("data") / args.scene / "images"
@@ -50,7 +48,7 @@ def main():
     print(f" Images    : {len(images)}")
     print("============================================\n")
 
-    scores = []
+    scores  = []
     skipped = []
 
     for img_path in images:
@@ -66,12 +64,13 @@ def main():
         sys.exit(1)
 
     scores.sort(key=lambda x: x[1])
-    blurry = [(p, s) for p, s in scores if s < args.threshold]
-    values = [s for _, s in scores]
+    blurry  = [(p, s) for p, s in scores if s < args.threshold]
+    values  = [s for _, s in scores]
+    pct     = len(blurry) / len(scores) * 100
 
     print(f"  Total checked  : {len(scores)}")
     print(f"  Skipped        : {len(skipped)}")
-    print(f"  Blurry images  : {len(blurry)}")
+    print(f"  Blurry images  : {len(blurry)} ({pct:.1f}%)")
     print(f"  Average score  : {np.mean(values):.2f}")
     print(f"  Sharpest       : {scores[-1][1]:.2f}  ({scores[-1][0].name})")
     print(f"  Blurriest      : {scores[0][1]:.2f}  ({scores[0][0].name})")
@@ -80,14 +79,6 @@ def main():
         print(f"\n  --- Blurry images (score < {args.threshold}) ---")
         for p, s in blurry:
             print(f"  {s:8.2f}  {p.name}")
-
-        if args.delete:
-            print("\n  Deleting blurry images...")
-            for p, s in blurry:
-                p.unlink()
-                print(f"  Deleted: {p.name}")
-        else:
-            print("\n  Tip: run with --delete to remove them automatically")
     else:
         print("\n  All images are sharp!")
 
@@ -95,7 +86,7 @@ def main():
     with open(report_path, "w") as f:
         f.write(f"Blur report — scene: {args.scene}\n")
         f.write(f"Threshold : {args.threshold}\n")
-        f.write(f"Total     : {len(scores)} | Blurry: {len(blurry)} | Skipped: {len(skipped)}\n\n")
+        f.write(f"Total     : {len(scores)} | Blurry: {len(blurry)} ({pct:.1f}%) | Skipped: {len(skipped)}\n\n")
         f.write(f"{'Score':>10}  {'Status':<10}  Filename\n")
         f.write("-" * 55 + "\n")
         for p, s in scores:
