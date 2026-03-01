@@ -27,8 +27,6 @@ fi
 
 # ── Resolve project root ─────────────────────────────────────────────────────
 # pwd -P resolves bind-mounts to their real path (e.g. /lapix → /home/jovyan).
-# This is critical: pip registers the resolved path, so Python imports must
-# also use it. Without -P, editable install finders get the wrong path.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="${SCRIPT_DIR}"
 
@@ -46,35 +44,6 @@ echo "  DreamCatalyst-PFC — Environment Setup"
 echo "  Project root : ${PROJECT_ROOT}"
 echo "  Target       : ${TARGET}"
 echo "============================================================"
-
-# ==============================================================================
-#  Helper: patch editable install finders
-#  Fixes two bugs on bind-mount servers (e.g. VLAB /lapix → /home/jovyan):
-#    1. Stale path in MAPPING after re-clone
-#    2. _EditableFinder appended after PathFinder → namespace package wins
-# ==============================================================================
-patch_editable_finder() {
-    local pkg_name="$1"
-    local finder_file
-    finder_file="$(python -c "
-import site, glob
-candidates = glob.glob('${SITE}/__editable___*${pkg_name%%==*}*finder.py')
-print(candidates[0] if candidates else '')
-" 2>/dev/null)"
-
-    if [ -z "$finder_file" ] || [ ! -f "$finder_file" ]; then
-        echo "  ⚠  Finder not found for ${pkg_name} — skipping patch"
-        return
-    fi
-
-    sed -i "s|/home/jovyan/compartilhado/ArthurLeonida|${PROJECT_ROOT}|g" "$finder_file"
-    sed -i "s|/lapix/compartilhado/ArthurLeonida|${PROJECT_ROOT}|g"       "$finder_file"
-    sed -i "s|sys.meta_path.append(_EditableFinder)|sys.meta_path.insert(0, _EditableFinder)|g" "$finder_file"
-    find "$(dirname "$finder_file")/__pycache__" \
-         -name "$(basename "${finder_file%.py}")*" -delete 2>/dev/null || true
-
-    echo "  ✓  Finder patched: $(basename "$finder_file")"
-}
 
 verify_import() {
     local module="$1"
@@ -146,8 +115,7 @@ setup_ns() {
 
     conda install -y -c "nvidia/label/cuda-11.8.0" cuda-toolkit
 
-    # Pin NumPy <2 immediately — PyTorch 2.1.2 was compiled against NumPy 1.x.
-    # Must happen BEFORE the torch verify below, otherwise the check crashes.
+    # Pin NumPy <2 — PyTorch 2.1.2 was compiled against NumPy 1.x
     pip install "numpy<2"
 
     python -c "
@@ -157,45 +125,40 @@ print(f'  ✓  PyTorch {torch.__version__}  |  CUDA {torch.version.cuda}  |  GPU
 "
 
     # ── 4. tinycudann ─────────────────────────────────────────────────────────
-    # setuptools>=70 removed pkg_resources which tinycudann's setup.py requires.
-    # System nvcc may be newer than CUDA 11.8 — force conda's nvcc.
-    # Compilation takes 5–15 min on first build (CUDA kernel compilation).
+    # - setuptools>=70 removed pkg_resources — pin before build.
+    # - System nvcc may differ from CUDA 11.8 — force conda's nvcc via CUDA_HOME.
+    # - Build AND import verify run inside the subshell: LD_LIBRARY_PATH is
+    #   needed at import time too (.so resolution), not just at compile time.
+    # - Subshell prevents CUDA_HOME / LD_LIBRARY_PATH from leaking into the
+    #   parent shell (which would break git SSH and other tools after setup).
     echo ""
     echo "[4/7] Installing tinycudann from source (NVlabs)..."
     echo "      This will take 5–15 minutes. Please wait..."
     pip install "setuptools<70" wheel ninja
 
-    # Force nvcc to use conda's CUDA 11.8, not the system CUDA (may be newer)
-    export CUDA_HOME="/root/anaconda3/envs/dreamcatalyst_ns"
-    export PATH="${CUDA_HOME}/bin:$PATH"
-    export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
-    echo "  nvcc: $(nvcc --version 2>&1 | grep release)"
-
-    rm -rf /tmp/tiny-cuda-nn
-    git clone https://github.com/NVlabs/tiny-cuda-nn.git /tmp/tiny-cuda-nn
-    cd /tmp/tiny-cuda-nn
-    git submodule update --init --recursive
-    pip install --no-build-isolation ./bindings/torch
-    cd "${PROJECT_ROOT}"
-    rm -rf /tmp/tiny-cuda-nn
+    (
+        export CUDA_HOME="/root/anaconda3/envs/dreamcatalyst_ns"
+        export PATH="${CUDA_HOME}/bin:${PATH}"
+        export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
+        echo "  nvcc: $(nvcc --version 2>&1 | grep release)"
+    
+        rm -rf /tmp/tiny-cuda-nn
+        git clone https://github.com/NVlabs/tiny-cuda-nn.git /tmp/tiny-cuda-nn
+        cd /tmp/tiny-cuda-nn
+        git submodule update --init --recursive
+        pip install --no-build-isolation ./bindings/torch
+        rm -rf /tmp/tiny-cuda-nn
+    )
+    # Verify outside subshell — torch uses its own bundled MKL cleanly
     python -c "import tinycudann; print('  ✓  tinycudann OK')"
 
-    # ── 5. Nerfstudio (upstream) + DreamCatalyst dc package ──────────────────
+    # ── 5. Upstream nerfstudio 1.0.2 ─────────────────────────────────────────
     echo ""
-    echo "[5/7] Installing upstream nerfstudio + DreamCatalyst dc package..."
-    
-    # Install upstream nerfstudio first (dc depends on it)
-    pip install nerfstudio
-    
-    # Then install DreamCatalyst's dc package (registers dc / dc_splat trainers)
-    cd "${NERFSTUDIO_DIR}"
-    pip install -e .
-    cd "${PROJECT_ROOT}"
-    
-    # Verify nerfstudio is importable (now from upstream, not the fork)
+    echo "[5/7] Installing upstream nerfstudio 1.0.2..."
+    pip install "nerfstudio==1.0.2"
     verify_import "nerfstudio"
-    
-    # ── 6. DreamCatalyst dc + dc_nerf (3d_editing) packages ──────────────────
+
+    # ── 6. DreamCatalyst dc + dc_nerf (3d_editing) ───────────────────────────
     echo ""
     echo "[6/7] Installing DreamCatalyst dc + 3d_editing packages..."
     cd "${NERFSTUDIO_DIR}"
@@ -204,7 +167,7 @@ print(f'  ✓  PyTorch {torch.__version__}  |  CUDA {torch.version.cuda}  |  GPU
     cd "${PROJECT_ROOT}"
     pip install numpy==1.26.4
     pip install gsplat==0.1.6
-    # diffusers==0.27.2 requires huggingface_hub<0.24 (cached_download removed in >=0.24)
+    # diffusers==0.27.2 uses cached_download removed in huggingface_hub>=0.24
     pip install "huggingface_hub<0.24"
 
     # ── 7. Verify ─────────────────────────────────────────────────────────────
@@ -219,31 +182,27 @@ print(f'  ✓  CUDA         {torch.version.cuda}')
 print(f'  ✓  GPU          {torch.cuda.get_device_name(0)}')
 print(f'  ✓  NumPy        {np.__version__}')
 print(f'  ✓  gsplat       {gsplat.__version__}')
-print(f'  ✓  nerfstudio   {V(\"dc\")}')
+print(f'  ✓  nerfstudio   {V(\"nerfstudio\")}')
+print(f'  ✓  dc_nerf      {V(\"dc_nerf\")}')
 "
     command -v colmap &>/dev/null \
         && echo "  ✓  COLMAP       ${colmap_ver}" \
         || echo "  ✗  WARNING: colmap not in PATH"
 
-    cd "${NERFSTUDIO_DIR}"
     ns-train -h 2>&1 | grep -qE "\bdc\b" \
         && echo "  ✓  ns-train dc       registered" \
         || echo "  ✗  WARNING: 'dc' not found in ns-train"
     ns-train -h 2>&1 | grep -qE "\bdc_splat\b" \
         && echo "  ✓  ns-train dc_splat registered" \
         || echo "  ✗  WARNING: 'dc_splat' not found in ns-train"
-    cd "${PROJECT_ROOT}"
 
     echo ""
     echo "  ✅  dreamcatalyst_ns setup complete!"
     echo ""
     echo "  Quick start:"
     echo "    conda activate dreamcatalyst_ns"
-    echo "    cd ${NERFSTUDIO_DIR}"
-    echo "    # Step 1 — reconstruct scene"
-    echo "    ns-train splatfacto --data ../data/<scene>"
-    echo "    # Step 2 — edit scene"
-    echo "    ns-train dc_splat --data ../data/<scene> \\"
+    echo "    ns-train splatfacto --data data/<scene>"
+    echo "    ns-train dc_splat --data data/<scene> \\"
     echo "        --load-dir outputs/<scene>/splatfacto/<timestamp>/nerfstudio_models/ \\"
     echo "        --pipeline.dc.src_prompt 'source description' \\"
     echo "        --pipeline.dc.tgt_prompt 'target description'"
@@ -283,7 +242,6 @@ setup_gs() {
 
     eval "$(conda shell.bash hook)"
     conda activate dreamcatalyst_gs
-
     echo "  Python : $(python --version)"
 
     # ── 2. CUDA 11.7 + PyTorch 2.0.1 ─────────────────────────────────────────
@@ -295,7 +253,7 @@ setup_gs() {
         cuda-libraries-dev \
         libcufft-dev \
         libcurand-dev
-    conda install -y -c conda-forge glm   # ← needed by diff-gaussian-rasterization
+    conda install -y -c conda-forge glm
     pip install ninja cmake "setuptools<70"
     conda install -y pytorch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 \
         pytorch-cuda=11.7 -c pytorch -c nvidia
@@ -306,24 +264,37 @@ assert torch.cuda.is_available(), 'CUDA not available!'
 print(f'  ✓  PyTorch {torch.__version__}  |  CUDA {torch.version.cuda}  |  GPU: {torch.cuda.get_device_name(0)}')
 "
 
-    # ── 3. Gaussian Splatting submodules ─────────────────────────────────────────
+    # ── 3. Gaussian Splatting submodules ──────────────────────────────────────
+    # Same subshell pattern as tinycudann above:
+    # - CUDA_HOME scoped to build + import verify only
+    # - prevents LD_LIBRARY_PATH from leaking into parent shell
     echo ""
     echo "[3/5] Installing Gaussian Splatting submodules..."
-    export CUDA_HOME="/root/anaconda3/envs/dreamcatalyst_gs"
-    export PATH="${CUDA_HOME}/bin:${PATH}"
-    export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
-    echo "  nvcc: $(nvcc --version 2>&1 | grep release)"
-    
-    cd "${THREESTUDIO_DIR}/gaussiansplatting"
-    pip install --no-build-isolation submodules/diff-gaussian-rasterization
-    pip install --no-build-isolation submodules/simple-knn
+    (
+        export CUDA_HOME="/root/anaconda3/envs/dreamcatalyst_gs"
+        export PATH="${CUDA_HOME}/bin:${PATH}"
+        export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
+        echo "  nvcc: $(nvcc --version 2>&1 | grep release)"
+
+        cd "${THREESTUDIO_DIR}/gaussiansplatting"
+        rm -rf submodules/diff-gaussian-rasterization/build \
+               submodules/simple-knn/build
+        pip install --no-build-isolation submodules/diff-gaussian-rasterization
+        pip install --no-build-isolation submodules/simple-knn
+
+        # Verify inside subshell — LD_LIBRARY_PATH still active for .so resolution
+        python -c "import diff_gaussian_rasterization; print('  ✓  diff-gaussian-rasterization OK')"
+        python -c "import simple_knn; print('  ✓  simple-knn OK')"
+    )
 
     # ── 4. Required packages ──────────────────────────────────────────────────
     echo ""
     echo "[4/5] Installing required packages..."
     cd "${THREESTUDIO_DIR}"
     pip install tqdm plyfile mediapipe diffusers==0.27.2
+    pip install "huggingface_hub<0.24"
     pip install -r requirements_all.txt
+    cd "${PROJECT_ROOT}"
 
     # ── 5. Verify ─────────────────────────────────────────────────────────────
     echo ""
@@ -336,7 +307,6 @@ print(f'  ✓  CUDA      {torch.version.cuda}')
 print(f'  ✓  GPU       {torch.cuda.get_device_name(0)}')
 print(f'  ✓  diffusers {diffusers.__version__}')
 "
-    cd "${PROJECT_ROOT}"
 
     echo ""
     echo "  ✅  dreamcatalyst_gs setup complete!"
