@@ -22,9 +22,21 @@ echo " Output:           ${OUTPUT_DIR}"
 echo "============================================"
 
 # Verify prerequisites
-command -v colmap        >/dev/null 2>&1 || { echo "ERROR: colmap not found. Install it first."; exit 1; }
-command -v ffmpeg        >/dev/null 2>&1 || { echo "ERROR: ffmpeg not found. Install it first."; exit 1; }
+command -v colmap          >/dev/null 2>&1 || { echo "ERROR: colmap not found. Install it first."; exit 1; }
+command -v ffmpeg          >/dev/null 2>&1 || { echo "ERROR: ffmpeg not found. Install it first."; exit 1; }
 command -v ns-process-data >/dev/null 2>&1 || { echo "ERROR: ns-process-data not found. Activate your nerfstudio env."; exit 1; }
+
+# Normalize image extensions to lowercase before processing
+# Fixes a known nerfstudio bug where uppercase suffixes (.JPG, .PNG)
+# silently reduce the image set fed to COLMAP
+normalize_extensions() {
+    local dir="$1"
+    find "${dir}" -type f \( -name "*.JPG" -o -name "*.JPEG" -o -name "*.PNG" \) | \
+    while read -r f; do
+        lower="${f%.*}.$(echo "${f##*.}" | tr '[:upper:]' '[:lower:]')"
+        [ "$f" != "$lower" ] && mv "$f" "$lower" && echo "  Renamed: $(basename "$f") -> $(basename "$lower")"
+    done
+}
 
 if [ "${SOURCE_TYPE}" = "video" ]; then
     VIDEO_FILE=$(find "${DATA_DIR}" -maxdepth 1 \( -name "*.mp4" -o -name "*.mov" -o -name "*.avi" \) | head -1)
@@ -33,19 +45,36 @@ if [ "${SOURCE_TYPE}" = "video" ]; then
         exit 1
     fi
     echo "Video file: ${VIDEO_FILE}"
-    ns-process-data video --data "${VIDEO_FILE}" --output-dir "${OUTPUT_DIR}"
+    ns-process-data video \
+        --data "${VIDEO_FILE}" \
+        --output-dir "${OUTPUT_DIR}"
 else
     if [ ! -d "${DATA_DIR}/images" ]; then
         echo "ERROR: ${DATA_DIR}/images/ does not exist"
         exit 1
     fi
+
+    # Normalize extensions before counting or processing
+    normalize_extensions "${DATA_DIR}/images"
+
     IMAGE_COUNT=$(find "${DATA_DIR}/images" -type f \( -name "*.jpg" -o -name "*.jpeg" -o -name "*.png" \) | wc -l)
     echo "Found ${IMAGE_COUNT} images"
     if [ "${IMAGE_COUNT}" -eq 0 ]; then
         echo "ERROR: No images found in ${DATA_DIR}/images/"
         exit 1
     fi
-    ns-process-data images --data "${DATA_DIR}/images" --output-dir "${OUTPUT_DIR}" --num-downscales 1
+
+    # Wipe stale output to avoid COLMAP reusing a corrupt database
+    if [ -d "${OUTPUT_DIR}" ]; then
+        echo "Removing stale output dir: ${OUTPUT_DIR}"
+        rm -rf "${OUTPUT_DIR}"
+    fi
+
+    ns-process-data images \
+        --data "${DATA_DIR}/images" \
+        --output-dir "${OUTPUT_DIR}"
+        #--num-downscales 3 \
+        #--matching-method exhaustive
 fi
 
 echo ""
@@ -56,4 +85,5 @@ echo ""
 echo " Verify:"
 echo "   ls ${OUTPUT_DIR}/transforms.json"
 echo "   ls ${OUTPUT_DIR}/images/"
+echo "   COLMAP registered: $(grep -v '^#' ${OUTPUT_DIR}/colmap/sparse/0/images.txt 2>/dev/null | grep -v '^$' | wc -l | awk '{print $1/2}') / ${IMAGE_COUNT} images"
 echo "============================================"

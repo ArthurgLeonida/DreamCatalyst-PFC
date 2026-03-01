@@ -3,8 +3,9 @@
 #  DreamCatalyst-NS — Blur detection script
 # ==============================================================================
 #  Usage:
-#    python scripts/check_blur.py chair
-#    python scripts/check_blur.py chair --threshold 150.0
+#    python scripts/check_blur.py hero
+#    python scripts/check_blur.py hero --threshold 80
+#    python scripts/check_blur.py hero --threshold 50 --delete
 # ==============================================================================
 
 import argparse
@@ -24,9 +25,16 @@ def compute_blur_score(img_path: Path) -> float | None:
 
 def main():
     parser = argparse.ArgumentParser(description="Check blur in a scene's image dataset.")
-    parser.add_argument("scene",                   help="Scene name (looks in data/<scene>/images/)")
-    parser.add_argument("--threshold", type=float, default=100.0, help="Blur threshold (default: 100.0)")
+    parser.add_argument("scene",                    help="Scene name (looks in data/<scene>/images/)")
+    parser.add_argument("--threshold", type=float,  default=None, help="Blur threshold (default: 100.0)")
+    parser.add_argument("--delete",    action="store_true",        help="Delete blurry images (requires --threshold)")
     args = parser.parse_args()
+
+    # --delete requires --threshold to be explicitly set
+    if args.delete and args.threshold is None:
+        parser.error("--delete requires --threshold to be explicitly provided.")
+
+    threshold = args.threshold if args.threshold is not None else 100.0
 
     data_dir    = Path("data") / args.scene / "images"
     report_path = Path("data") / args.scene / "blur_report.txt"
@@ -44,8 +52,9 @@ def main():
     print("============================================")
     print(f" Scene     : {args.scene}")
     print(f" Image dir : {data_dir}")
-    print(f" Threshold : {args.threshold}")
+    print(f" Threshold : {threshold}")
     print(f" Images    : {len(images)}")
+    print(f" Delete    : {'yes' if args.delete else 'no'}")
     print("============================================\n")
 
     scores  = []
@@ -64,7 +73,7 @@ def main():
         sys.exit(1)
 
     scores.sort(key=lambda x: x[1])
-    blurry  = [(p, s) for p, s in scores if s < args.threshold]
+    blurry  = [(p, s) for p, s in scores if s < threshold]
     values  = [s for _, s in scores]
     pct     = len(blurry) / len(scores) * 100
 
@@ -76,21 +85,41 @@ def main():
     print(f"  Blurriest      : {scores[0][1]:.2f}  ({scores[0][0].name})")
 
     if blurry:
-        print(f"\n  --- Blurry images (score < {args.threshold}) ---")
+        print(f"\n  --- Blurry images (score < {threshold}) ---")
         for p, s in blurry:
             print(f"  {s:8.2f}  {p.name}")
     else:
         print("\n  All images are sharp!")
 
+    # Delete blurry images if requested
+    deleted  = []
+    d_failed = []
+    if args.delete and blurry:
+        print(f"\n  --- Deleting {len(blurry)} blurry image(s) ---")
+        for p, s in blurry:
+            try:
+                p.unlink()
+                deleted.append(p.name)
+                print(f"  DELETED  {p.name}  (score: {s:.2f})")
+            except OSError as e:
+                d_failed.append(p.name)
+                print(f"  FAILED   {p.name}  ({e})")
+
     # Save report
     with open(report_path, "w") as f:
         f.write(f"Blur report — scene: {args.scene}\n")
-        f.write(f"Threshold : {args.threshold}\n")
-        f.write(f"Total     : {len(scores)} | Blurry: {len(blurry)} ({pct:.1f}%) | Skipped: {len(skipped)}\n\n")
+        f.write(f"Threshold : {threshold}\n")
+        f.write(f"Total     : {len(scores)} | Blurry: {len(blurry)} ({pct:.1f}%) | Skipped: {len(skipped)}\n")
+        if args.delete:
+            f.write(f"Deleted   : {len(deleted)} | Failed: {len(d_failed)}\n")
+        f.write("\n")
         f.write(f"{'Score':>10}  {'Status':<10}  Filename\n")
         f.write("-" * 55 + "\n")
         for p, s in scores:
-            status = "BLURRY" if s < args.threshold else "OK"
+            if s < threshold:
+                status = "DELETED" if p.name in deleted else ("FAILED" if p.name in d_failed else "BLURRY")
+            else:
+                status = "OK"
             f.write(f"{s:10.2f}  {status:<10}  {p.name}\n")
 
     print(f"\n  Report saved to: {report_path}")

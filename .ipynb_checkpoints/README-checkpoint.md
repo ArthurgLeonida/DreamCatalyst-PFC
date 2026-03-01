@@ -61,24 +61,44 @@ conda activate 3d_edit
 
 ---
 
-## 2. Data preparation
+## 2. Data Preparation
 
+Choose one of the options below.
+
+### Option A — Mip-NeRF 360 (Real-World Scenes)
+Real-world scenes (garden, kitchen, room, counter, bicycle, etc.) captured with a DSLR. Good for benchmarking against published results since PSNR/SSIM/LPIPS numbers are directly comparable.
+
+```bash
+# Download from the official source
+cd data/
+wget http://storage.googleapis.com/gresearch/refraw360/360_v2.zip
+unzip 360_v2.zip
+```
+
+### Option B — NeRF Synthetic (Blender Scenes)
+8 synthetic objects (lego, chair, hotdog, drums, etc.) rendered at 800×800 with `transforms.json` already included — no COLMAP needed.
+
+```bash
+ns-download-data blender --save-dir data/blender
+```
+
+### Option C — Custom Images
 Place your images at `data/<scene>/images/` (50–100 JPGs, walk around the object at multiple heights), then run:
 
 ```bash
-# From images
+# From a folder of images
 bash scripts/process_data.sh chair
 
 # From a video file
 bash scripts/process_data.sh chair video
+```
 
-```
-This calls `ns-process-data` with COLMAP and writes output to `data/chair_processed/`.
-```
+This calls `ns-process-data` with COLMAP (exhaustive matching) and writes output to `data/chair_processed/`.
 
 ---
 
 ## 3. Training
+
 
 ```bash
 bash scripts/train.sh chair              # splatfacto, 500 iters (quick test)
