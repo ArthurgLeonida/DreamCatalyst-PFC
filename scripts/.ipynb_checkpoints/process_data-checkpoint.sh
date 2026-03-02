@@ -3,8 +3,11 @@
 #  DreamCatalyst-NS — Data processing script (Linux)
 # ==============================================================================
 #  Usage:
-#    bash scripts/process_data.sh chair
-#    bash scripts/process_data.sh chair video    # if using a video source
+#    bash scripts/process_data.sh <scene_name> [images|video]
+#
+#  Examples:
+#    bash scripts/process_data.sh hero
+#    bash scripts/process_data.sh hero video
 # ==============================================================================
 
 set -euo pipefail
@@ -13,6 +16,7 @@ SCENE="${1:?Usage: $0 <scene_name> [images|video]}"
 SOURCE_TYPE="${2:-images}"
 DATA_DIR="data/${SCENE}"
 OUTPUT_DIR="data/${SCENE}_processed"
+IMAGE_COUNT=0   # initialized here so it's always in scope
 
 echo "============================================"
 echo " Processing scene: ${SCENE}"
@@ -22,13 +26,12 @@ echo " Output:           ${OUTPUT_DIR}"
 echo "============================================"
 
 # Verify prerequisites
-command -v colmap          >/dev/null 2>&1 || { echo "ERROR: colmap not found. Install it first."; exit 1; }
-command -v ffmpeg          >/dev/null 2>&1 || { echo "ERROR: ffmpeg not found. Install it first."; exit 1; }
-command -v ns-process-data >/dev/null 2>&1 || { echo "ERROR: ns-process-data not found. Activate your nerfstudio env."; exit 1; }
+command -v colmap          >/dev/null 2>&1 || { echo "ERROR: colmap not found."; exit 1; }
+command -v ffmpeg          >/dev/null 2>&1 || { echo "ERROR: ffmpeg not found."; exit 1; }
+command -v ns-process-data >/dev/null 2>&1 || { echo "ERROR: ns-process-data not found. Run: conda activate dreamcatalyst_ns"; exit 1; }
 
-# Normalize image extensions to lowercase before processing
-# Fixes a known nerfstudio bug where uppercase suffixes (.JPG, .PNG)
-# silently reduce the image set fed to COLMAP
+# Normalize image extensions to lowercase
+# Fixes nerfstudio silently dropping .JPG/.PNG files (uppercase not matched)
 normalize_extensions() {
     local dir="$1"
     find "${dir}" -type f \( -name "*.JPG" -o -name "*.JPEG" -o -name "*.PNG" \) | \
@@ -45,16 +48,19 @@ if [ "${SOURCE_TYPE}" = "video" ]; then
         exit 1
     fi
     echo "Video file: ${VIDEO_FILE}"
+
     ns-process-data video \
         --data "${VIDEO_FILE}" \
-        --output-dir "${OUTPUT_DIR}"
+        --output-dir "${OUTPUT_DIR}" \
+        --num-downscales 3 \
+        --matching-method exhaustive
+
 else
     if [ ! -d "${DATA_DIR}/images" ]; then
         echo "ERROR: ${DATA_DIR}/images/ does not exist"
         exit 1
     fi
 
-    # Normalize extensions before counting or processing
     normalize_extensions "${DATA_DIR}/images"
 
     IMAGE_COUNT=$(find "${DATA_DIR}/images" -type f \( -name "*.jpg" -o -name "*.jpeg" -o -name "*.png" \) | wc -l)
@@ -71,10 +77,10 @@ else
     fi
 
     ns-process-data images \
-        --data "${DATA_DIR}/images" \
-        --output-dir "${OUTPUT_DIR}"
-        #--num-downscales 3 \
-        #--matching-method exhaustive
+      --data "${DATA_DIR}/images" \
+      --output-dir "${OUTPUT_DIR}" \
+      --matching-method exhaustive \
+      --no-gpu # Fixed to run on the server, GPU was not working
 fi
 
 echo ""
@@ -85,5 +91,9 @@ echo ""
 echo " Verify:"
 echo "   ls ${OUTPUT_DIR}/transforms.json"
 echo "   ls ${OUTPUT_DIR}/images/"
-echo "   COLMAP registered: $(grep -v '^#' ${OUTPUT_DIR}/colmap/sparse/0/images.txt 2>/dev/null | grep -v '^$' | wc -l | awk '{print $1/2}') / ${IMAGE_COUNT} images"
+if [ "${IMAGE_COUNT}" -gt 0 ]; then
+    REGISTERED=$(grep -v '^#' "${OUTPUT_DIR}/colmap/sparse/0/images.txt" 2>/dev/null \
+        | grep -v '^$' | wc -l | awk '{print int($1/2)}')
+    echo "   COLMAP registered: ${REGISTERED} / ${IMAGE_COUNT} images"
+fi
 echo "============================================"
