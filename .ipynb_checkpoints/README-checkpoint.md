@@ -117,8 +117,8 @@ tensorboard --logdir outputs/ --port 6006 --bind_all &
 **Export** the trained splat:
 ```bash
 ns-export gaussian-splat \
-    --load-config outputs/hero/dream-catalyst/<DATE>/config.yml \
-    --output-dir exports/hero
+    --load-config outputs/bicycle/splatfacto/2026-03-02_030601/config.yml \
+    --output-dir exports/bicycle
 ```
 
 ---

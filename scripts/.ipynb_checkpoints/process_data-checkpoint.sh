@@ -77,10 +77,11 @@ else
     fi
 
     ns-process-data images \
-      --data "${DATA_DIR}/images" \
-      --output-dir "${OUTPUT_DIR}" \
-      --matching-method exhaustive \
-      --no-gpu # Fixed to run on the server, GPU was not working
+        --data "${DATA_DIR}/images" \
+        --output-dir "${OUTPUT_DIR}" \
+        --matching-method exhaustive \
+        --no-gpu # Fixed to run on the server, GPU was not working
+
 fi
 
 echo ""

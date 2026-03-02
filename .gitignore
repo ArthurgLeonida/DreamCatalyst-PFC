@@ -21,6 +21,7 @@ eggs/
 
 # Outputs / checkpoints
 outputs/
+exports/
 
 # Other files
 *.pdf
