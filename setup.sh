@@ -69,18 +69,6 @@ setup_ns() {
     echo "  [ENV 1/2] dreamcatalyst_ns  (Nerfstudio pipeline)"
     echo "============================================================"
 
-    # ── Check DreamCatalyst fork ──────────────────────────────────────────────
-    if [ ! -d "${NERFSTUDIO_DIR}/3d_editing" ]; then
-        echo "  nerfstudio/3d_editing not found — re-cloning DreamCatalyst fork..."
-        rm -rf "${NERFSTUDIO_DIR}"
-        git clone --depth 1 https://github.com/kaist-cvml/DreamCatalyst.git /tmp/_dc_src
-        cp -r /tmp/_dc_src/nerfstudio "${NERFSTUDIO_DIR}"
-        rm -rf /tmp/_dc_src
-        echo "  ✓  DreamCatalyst nerfstudio fork cloned."
-    else
-        echo "  ✓  DreamCatalyst fork detected (3d_editing/ present)."
-    fi
-
     # ── 1. Create conda env ───────────────────────────────────────────────────
     echo ""
     echo "[1/7] Creating conda env 'dreamcatalyst_ns' (Python 3.9)..."
@@ -218,18 +206,6 @@ setup_gs() {
     echo "============================================================"
     echo "  [ENV 2/2] dreamcatalyst_gs  (GaussianEditor pipeline)"
     echo "============================================================"
-
-    # ── Check threestudio fork ────────────────────────────────────────────────
-    if [ ! -d "${THREESTUDIO_DIR}/gaussiansplatting" ]; then
-        echo "  threestudio/gaussiansplatting not found — re-cloning DreamCatalyst fork..."
-        rm -rf "${THREESTUDIO_DIR}"
-        git clone --depth 1 https://github.com/kaist-cvml/DreamCatalyst.git /tmp/_dc_src2
-        cp -r /tmp/_dc_src2/threestudio "${THREESTUDIO_DIR}"
-        rm -rf /tmp/_dc_src2
-        echo "  ✓  DreamCatalyst threestudio fork cloned."
-    else
-        echo "  ✓  DreamCatalyst threestudio fork detected."
-    fi
 
     # ── 1. Create conda env ───────────────────────────────────────────────────
     echo ""
