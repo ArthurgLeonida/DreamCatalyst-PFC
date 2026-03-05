@@ -33,11 +33,6 @@ Thumbs.db
 *.swo
 *~
 
-# ── Upstream frameworks ───────────────────────────────────────────────────────
-# Upstream nerfstudio & threestudio are cloned by setup.sh — not tracked in git.
-/nerfstudio/
-/threestudio/
-
 # CUDA / C++ build artifacts
 *.so
 *.o
