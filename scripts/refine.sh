@@ -53,7 +53,8 @@ ns-train dc_splat_refinement \
     --experiment-name "${SCENE}" \
     --load-dir "${LOAD_DIR}" \
     --pipeline.dc.tgt-prompt "${TGT_PROMPT}" \
-    --pipeline.datamanager.dataparser.data "${DATA_DIR}"
+    pipeline.datamanager:dc-splat-data-manager-config \
+        --pipeline.datamanager.dataparser.data "${DATA_DIR}"
 
 echo ""
 echo "============================================"
