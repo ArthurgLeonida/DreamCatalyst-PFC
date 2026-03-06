@@ -10,6 +10,9 @@
 #  gs  → dreamcatalyst_gs  (GaussianEditor, Python 3.8, CUDA 11.7) ← optional
 #  all → both environments
 #
+#  Conda envs use --prefix so they live on persistent bind-mounted storage
+#  and survive container restarts.
+#
 #  Prerequisites:
 #    - conda available in PATH
 #    - CUDA drivers ≥ 11.8 (check: nvidia-smi)
@@ -26,7 +29,6 @@ if [[ "$TARGET" != "ns" && "$TARGET" != "gs" && "$TARGET" != "all" ]]; then
 fi
 
 # ── Resolve project root ─────────────────────────────────────────────────────
-# pwd -P resolves bind-mounts to their real path (e.g. /lapix → /home/jovyan).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="${SCRIPT_DIR}"
 
@@ -39,9 +41,15 @@ fi
 NERFSTUDIO_DIR="${PROJECT_ROOT}/nerfstudio"
 THREESTUDIO_DIR="${PROJECT_ROOT}/threestudio"
 
+# ── Persistent env paths (survive container restarts) ─────────────────────────
+ENV_DIR="${PROJECT_ROOT}/envs"
+NS_PREFIX="${ENV_DIR}/dreamcatalyst_ns"
+GS_PREFIX="${ENV_DIR}/dreamcatalyst_gs"
+
 echo "============================================================"
 echo "  DreamCatalyst-PFC — Environment Setup"
 echo "  Project root : ${PROJECT_ROOT}"
+echo "  Env storage  : ${ENV_DIR}"
 echo "  Target       : ${TARGET}"
 echo "============================================================"
 
@@ -71,15 +79,15 @@ setup_ns() {
 
     # ── 1. Create conda env ───────────────────────────────────────────────────
     echo ""
-    echo "[1/7] Creating conda env 'dreamcatalyst_ns' (Python 3.9)..."
-    if conda info --envs | grep -q "^dreamcatalyst_ns "; then
+    echo "[1/7] Creating conda env at ${NS_PREFIX} (Python 3.9)..."
+    if [ -d "${NS_PREFIX}" ]; then
         echo "  Already exists, skipping creation."
     else
-        conda create -n dreamcatalyst_ns python=3.9 -y
+        conda create --prefix "${NS_PREFIX}" python=3.9 -y
     fi
 
     eval "$(conda shell.bash hook)"
-    conda activate dreamcatalyst_ns
+    conda activate "${NS_PREFIX}"
     SITE="$(python -c 'import site; print(site.getsitepackages()[0])')"
 
     echo "  Python : $(python --version)"
@@ -113,23 +121,17 @@ print(f'  ✓  PyTorch {torch.__version__}  |  CUDA {torch.version.cuda}  |  GPU
 "
 
     # ── 4. tinycudann ─────────────────────────────────────────────────────────
-    # - setuptools>=70 removed pkg_resources — pin before build.
-    # - System nvcc may differ from CUDA 11.8 — force conda's nvcc via CUDA_HOME.
-    # - Build AND import verify run inside the subshell: LD_LIBRARY_PATH is
-    #   needed at import time too (.so resolution), not just at compile time.
-    # - Subshell prevents CUDA_HOME / LD_LIBRARY_PATH from leaking into the
-    #   parent shell (which would break git SSH and other tools after setup).
     echo ""
     echo "[4/7] Installing tinycudann from source (NVlabs)..."
     echo "      This will take 5–15 minutes. Please wait..."
     pip install "setuptools<70" wheel ninja
 
     (
-        export CUDA_HOME="/root/anaconda3/envs/dreamcatalyst_ns"
+        export CUDA_HOME="${NS_PREFIX}"
         export PATH="${CUDA_HOME}/bin:${PATH}"
         export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
         echo "  nvcc: $(nvcc --version 2>&1 | grep release)"
-    
+
         rm -rf /tmp/tiny-cuda-nn
         git clone https://github.com/NVlabs/tiny-cuda-nn.git /tmp/tiny-cuda-nn
         cd /tmp/tiny-cuda-nn
@@ -137,7 +139,7 @@ print(f'  ✓  PyTorch {torch.__version__}  |  CUDA {torch.version.cuda}  |  GPU
         pip install --no-build-isolation ./bindings/torch
         rm -rf /tmp/tiny-cuda-nn
     )
-    # Verify outside subshell — torch uses its own bundled MKL cleanly
+    # Verify outside subshell
     python -c "import tinycudann; print('  ✓  tinycudann OK')"
 
     # ── 5. Upstream nerfstudio 1.0.2 ─────────────────────────────────────────
@@ -155,7 +157,6 @@ print(f'  ✓  PyTorch {torch.__version__}  |  CUDA {torch.version.cuda}  |  GPU
     cd "${PROJECT_ROOT}"
     pip install numpy==1.26.4
     pip install gsplat==0.1.6
-    # diffusers==0.27.2 uses cached_download removed in huggingface_hub>=0.24
     pip install "huggingface_hub<0.24"
 
     # ── 7. Verify ─────────────────────────────────────────────────────────────
@@ -177,10 +178,10 @@ print(f'  ✓  dc_nerf      {V(\"dc_nerf\")}')
         && echo "  ✓  COLMAP       ${colmap_ver}" \
         || echo "  ✗  WARNING: colmap not in PATH"
 
-    ns-train -h 2>&1 | grep -qE "\bdc\b" \
+    ns-train -h 2>&1 | grep -qP "•\s+dc\s" \
         && echo "  ✓  ns-train dc       registered" \
         || echo "  ✗  WARNING: 'dc' not found in ns-train"
-    ns-train -h 2>&1 | grep -qE "\bdc_splat\b" \
+    ns-train -h 2>&1 | grep -qP "•\s+dc_splat\s" \
         && echo "  ✓  ns-train dc_splat registered" \
         || echo "  ✗  WARNING: 'dc_splat' not found in ns-train"
 
@@ -188,7 +189,7 @@ print(f'  ✓  dc_nerf      {V(\"dc_nerf\")}')
     echo "  ✅  dreamcatalyst_ns setup complete!"
     echo ""
     echo "  Quick start:"
-    echo "    conda activate dreamcatalyst_ns"
+    echo "    conda activate ${NS_PREFIX}"
     echo "    ns-train splatfacto --data data/<scene>"
     echo "    ns-train dc_splat --data data/<scene> \\"
     echo "        --load-dir outputs/<scene>/splatfacto/<timestamp>/nerfstudio_models/ \\"
@@ -209,15 +210,15 @@ setup_gs() {
 
     # ── 1. Create conda env ───────────────────────────────────────────────────
     echo ""
-    echo "[1/5] Creating conda env 'dreamcatalyst_gs' (Python 3.8)..."
-    if conda info --envs | grep -q "^dreamcatalyst_gs "; then
+    echo "[1/5] Creating conda env at ${GS_PREFIX} (Python 3.8)..."
+    if [ -d "${GS_PREFIX}" ]; then
         echo "  Already exists, skipping creation."
     else
-        conda create -n dreamcatalyst_gs python=3.8 -y
+        conda create --prefix "${GS_PREFIX}" python=3.8 -y
     fi
 
     eval "$(conda shell.bash hook)"
-    conda activate dreamcatalyst_gs
+    conda activate "${GS_PREFIX}"
     echo "  Python : $(python --version)"
 
     # ── 2. CUDA 11.7 + PyTorch 2.0.1 ─────────────────────────────────────────
@@ -241,13 +242,10 @@ print(f'  ✓  PyTorch {torch.__version__}  |  CUDA {torch.version.cuda}  |  GPU
 "
 
     # ── 3. Gaussian Splatting submodules ──────────────────────────────────────
-    # Same subshell pattern as tinycudann above:
-    # - CUDA_HOME scoped to build + import verify only
-    # - prevents LD_LIBRARY_PATH from leaking into parent shell
     echo ""
     echo "[3/5] Installing Gaussian Splatting submodules..."
     (
-        export CUDA_HOME="/root/anaconda3/envs/dreamcatalyst_gs"
+        export CUDA_HOME="${GS_PREFIX}"
         export PATH="${CUDA_HOME}/bin:${PATH}"
         export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
         echo "  nvcc: $(nvcc --version 2>&1 | grep release)"
@@ -258,7 +256,6 @@ print(f'  ✓  PyTorch {torch.__version__}  |  CUDA {torch.version.cuda}  |  GPU
         pip install --no-build-isolation submodules/diff-gaussian-rasterization
         pip install --no-build-isolation submodules/simple-knn
 
-        # Verify inside subshell — LD_LIBRARY_PATH still active for .so resolution
         python -c "import diff_gaussian_rasterization; print('  ✓  diff-gaussian-rasterization OK')"
         python -c "import simple_knn; print('  ✓  simple-knn OK')"
     )
@@ -288,7 +285,7 @@ print(f'  ✓  diffusers {diffusers.__version__}')
     echo "  ✅  dreamcatalyst_gs setup complete!"
     echo ""
     echo "  Quick start:"
-    echo "    conda activate dreamcatalyst_gs"
+    echo "    conda activate ${GS_PREFIX}"
     echo "    cd ${THREESTUDIO_DIR}"
     echo "    python launch.py --config configs/edit-dc.yaml --train --gpu 0 \\"
     echo "        system.seg_prompt='a man' \\"
@@ -312,9 +309,9 @@ echo "  All requested environments ready."
 echo ""
 echo "  Environments:"
 if [[ "$TARGET" == "ns"  || "$TARGET" == "all" ]]; then
-    echo "    conda activate dreamcatalyst_ns   ← thesis pipeline (use this)"
+    echo "    conda activate ${NS_PREFIX}   ← thesis pipeline (use this)"
 fi
 if [[ "$TARGET" == "gs"  || "$TARGET" == "all" ]]; then
-    echo "    conda activate dreamcatalyst_gs   ← GaussianEditor variant"
+    echo "    conda activate ${GS_PREFIX}   ← GaussianEditor variant"
 fi
 echo "============================================================"
