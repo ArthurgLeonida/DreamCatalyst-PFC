@@ -17,7 +17,7 @@ import math
 
 @dataclass
 class DCConfig:
-    sd_pretrained_model_or_path: str = "runwayml/stable-diffusion-v1-5"
+    sd_pretrained_model_or_path: str = "timbrooks/instruct-pix2pix"
     
     num_inference_steps: int = 500
     min_step_ratio: float = 0.2
