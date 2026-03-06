@@ -20,6 +20,7 @@ from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
 from nerfstudio.plugins.types import MethodSpecification
 from dc.dc import DCConfig
+from dc.tasd_config import DC_CUSTOM_PARAMS
 
 nerfacto_method = MethodSpecification(
     config=TrainerConfig(
@@ -69,7 +70,7 @@ dc_method = MethodSpecification(
         mixed_precision=False,
         load_scheduler=False,
         pipeline=DCPipelineConfig(
-            dc=DCConfig(src_prompt="", tgt_prompt="", guidance_scale=7.5),
+            dc=DCConfig(src_prompt="", tgt_prompt="", guidance_scale=7.5, **DC_CUSTOM_PARAMS),
             datamanager=DCDataManagerConfig(
                 dataparser=DCDataParserConfig(),
                 train_num_rays_per_batch=4096,
@@ -113,7 +114,7 @@ refinement_method = MethodSpecification(
         mixed_precision=False,
         load_scheduler=False,
         pipeline=RefinementPipelineConfig(
-            dc=DCConfig(src_prompt="", tgt_prompt="", num_inference_steps=20, guidance_scale=15),
+            dc=DCConfig(src_prompt="", tgt_prompt="", num_inference_steps=20, guidance_scale=15, **DC_CUSTOM_PARAMS),
             skip_min_ratio=0.8,
             skip_max_ratio=0.9,
             datamanager=DCDataManagerConfig(
@@ -159,7 +160,7 @@ dc_splat_method = MethodSpecification(
         mixed_precision=False,
         load_scheduler=False,
         pipeline=DCPipelineConfig(
-            dc=DCConfig(src_prompt="", tgt_prompt=""),
+            dc=DCConfig(src_prompt="", tgt_prompt="", **DC_CUSTOM_PARAMS),
             datamanager=DCSplatDataManagerConfig(
                 dataparser=DCDataParserConfig(),
                 patch_size=32,
@@ -249,7 +250,7 @@ dc_splat_refinement_method = MethodSpecification(
         mixed_precision=False,
         load_scheduler=False,
         pipeline=RefinementPipelineConfig(
-            dc=DCConfig(src_prompt="", tgt_prompt="", num_inference_steps=20, guidance_scale=15),
+            dc=DCConfig(src_prompt="", tgt_prompt="", num_inference_steps=20, guidance_scale=15, **DC_CUSTOM_PARAMS),
             skip_min_ratio=0.8,
             skip_max_ratio=0.9,
             datamanager=DCSplatDataManagerConfig(

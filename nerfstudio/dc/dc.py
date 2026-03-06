@@ -41,7 +41,8 @@ class DCConfig:
     freeu_s1: float=0.9
     freeu_s2: float=0.2
 
-    # From TAG paper idea
+    # TAG (Tangential Amplified Guidance)
+    tag_enabled: bool = True
     eta_tag: float = 1.15
 
 
@@ -254,16 +255,14 @@ class DC(object):
             else:
                 noise_pred = noise_pred_uncond + self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
 
-            # Computes from the pre-TAG noise prediction
-            # mu, pred_x0 = self.compute_posterior_mean(latents_noisy, noise_pred, t, t_prev)
-
             # TAG: amplify tangential component of noise prediction
-            # =================================================================================
-            v = latents_noisy / (latents_noisy.norm(p=2, dim=(1,2,3), keepdim=True) + 1e-8)
-            noise_parallel = (noise_pred * v).sum(dim=(1,2,3), keepdim=True) * v
-            noise_tangential = noise_pred - noise_parallel
-            noise_pred = noise_parallel + self.config.eta_tag * noise_tangential
-            # =================================================================================
+            # =========================================================================================================
+            if self.config.tag_enabled:
+                v = latents_noisy / (latents_noisy.norm(p=2, dim=(1,2,3), keepdim=True) + 1e-8)
+                noise_parallel = (noise_pred * v).sum(dim=(1,2,3), keepdim=True) * v
+                noise_tangential = noise_pred - noise_parallel
+                noise_pred = noise_parallel + self.config.eta_tag * noise_tangential
+            # =========================================================================================================
             
             mu, pred_x0 = self.compute_posterior_mean(latents_noisy, noise_pred, t, t_prev)
 
@@ -321,7 +320,7 @@ class DC(object):
         # TAG Modification
         # =========================================================================================================
         for t in op:
-            xt_prev = xt.clone() # save previous state (for TAG)
+            xt_prev = xt.clone()
             xt_input = torch.cat([xt] * 2)
             noise_pred = self.unet.forward(
                 xt_input,
@@ -333,12 +332,12 @@ class DC(object):
             xt = self.reverse_step(noise_pred, t, xt, eta=eta)
             
             # TAG: amplify tangential component of denoising step
-            delta = xt - xt_prev
-            v = xt_prev / (xt_prev.norm(p=2, dim=(1,2,3), keepdim=True) + 1e-8)
-            u_n = (delta * v).sum(dim=(1,2,3), keepdim=True) * v
-            u_t = delta - u_n
-            xt = xt_prev + u_n + self.config.eta_tag * u_t
-            
+            if self.config.tag_enabled:
+                delta = xt - xt_prev
+                v = xt_prev / (xt_prev.norm(p=2, dim=(1,2,3), keepdim=True) + 1e-8)
+                u_n = (delta * v).sum(dim=(1,2,3), keepdim=True) * v
+                u_t = delta - u_n
+                xt = xt_prev + u_n + self.config.eta_tag * u_t
         # =========================================================================================================
 
         return xt
