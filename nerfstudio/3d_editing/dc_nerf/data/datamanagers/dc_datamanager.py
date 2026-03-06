@@ -8,7 +8,7 @@ from nerfstudio.data.datamanagers.base_datamanager import (
     VanillaDataManager, VanillaDataManagerConfig)
 from nerfstudio.data.utils.dataloaders import CacheDataloader
 from nerfstudio.model_components.ray_generators import RayGenerator
-#from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
+from dc_nerf.data.dataparsers.dc_dataparser import DCDataParserConfig
 
 CONSOLE = Console(width=120)
 
@@ -16,7 +16,7 @@ CONSOLE = Console(width=120)
 @dataclass
 class DCDataManagerConfig(VanillaDataManagerConfig):
     _target: Type = field(default_factory=lambda: DCDataManager)
-    #dataparser: NerfstudioDataParserConfig = NerfstudioDataParserConfig()
+    dataparser: DCDataParserConfig = field(default_factory=DCDataParserConfig)
 
 
 class DCDataManager(VanillaDataManager):
