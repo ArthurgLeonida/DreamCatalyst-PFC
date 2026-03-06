@@ -58,7 +58,7 @@ ns-train dc_splat \
     --load-dir "${LOAD_DIR}" \
     --pipeline.dc.src-prompt "${SRC_PROMPT}" \
     --pipeline.dc.tgt-prompt "${TGT_PROMPT}" \
-    nerfstudio-data --data "${DATA_DIR}"
+    --pipeline.datamanager.dataparser.data "${DATA_DIR}"
 
 echo ""
 echo "============================================"
