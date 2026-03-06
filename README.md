@@ -42,26 +42,24 @@ Output: `outputs/<scene>/splatfacto/<timestamp>/`
 ## Step 3 — Edit with DreamCatalyst (DDS)
 
 ```bash
-ns-train dc_splat \
-    --max-num-iterations 3000 \
-    --pipeline.dc.src-prompt "a photo of a bicycle leaning against a bench" \
-    --pipeline.dc.tgt-prompt "a photo of a motorcycle leaning against a bench" \
-    --load-dir outputs/<scene>/splatfacto/<timestamp>/nerfstudio_models/ \
-    nerfstudio-data --data data/<scene>_processed
+bash scripts/edit.sh bicycle \
+    "a photo of a bicycle leaning against a bench" \
+    "a photo of a motorcycle leaning against a bench" \
+    outputs/bicycle/splatfacto/<timestamp>/nerfstudio_models/
+# Usage: bash scripts/edit.sh <scene> <src_prompt> <tgt_prompt> <load_dir> [max_iters]
 ```
 
-This loads the reconstruction from Step 2 and optimizes the Gaussians toward the target prompt using DDS guidance. Each iteration renders a view, computes guidance loss, and backprops into the splat parameters.
+Loads the reconstruction from Step 2 and optimizes the Gaussians toward the target prompt using DDS guidance. Each iteration renders a view, computes guidance loss, and backprops into the splat parameters.
 
 Output: `outputs/<scene>/dc_splat/<timestamp>/`
 
 ## Step 4 — Refinement (optional)
 
 ```bash
-ns-train dc_splat_refinement \
-    --max-num-iterations 30000 \
-    --pipeline.dc.tgt-prompt "a photo of a motorcycle leaning against a bench" \
-    --load-dir outputs/<scene>/dc_splat/<timestamp>/nerfstudio_models/ \
-    nerfstudio-data --data data/<scene>_processed
+bash scripts/refine.sh bicycle \
+    "a photo of a motorcycle leaning against a bench" \
+    outputs/bicycle/dc_splat/<timestamp>/nerfstudio_models/
+# Usage: bash scripts/refine.sh <scene> <tgt_prompt> <load_dir> [max_iters]
 ```
 
 Uses SDEdit to produce edited 2D images, then retrains the Gaussians against them. Cleans up artifacts from Step 3.
