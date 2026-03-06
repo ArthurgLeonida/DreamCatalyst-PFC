@@ -14,7 +14,7 @@ from nerfstudio.data.datamanagers.full_images_datamanager import (
     FullImageDatamanager, FullImageDatamanagerConfig)
 from nerfstudio.data.pixel_samplers import PixelSamplerConfig
 from nerfstudio.data.utils.nerfstudio_collate import nerfstudio_collate
-#from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
+from dc_nerf.data.dataparsers.dc_dataparser import DCDataParserConfig
 
 CONSOLE = Console(width=120)
 
@@ -23,7 +23,7 @@ class DCSplatDataManagerConfig(FullImageDatamanagerConfig):
     """Configuration for the InstructNeRF2NeRFDataManager."""
 
     _target: Type = field(default_factory=lambda: DCSplatDataManager)
-    #dataparser: NerfstudioDataParserConfig = NerfstudioDataParserConfig() # Added this line to allow selecting the downscale factor
+    dataparser: DCDataParserConfig = field(default_factory=DCDataParserConfig)
     patch_size: int = 32
     """Size of patch to sample from. If >1, patch-based sampling will be used."""
 
