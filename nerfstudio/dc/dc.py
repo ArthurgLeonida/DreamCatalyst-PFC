@@ -41,9 +41,10 @@ class DCConfig:
     freeu_s1: float=0.9
     freeu_s2: float=0.2
 
-    # TAG (Tangential Amplified Guidance)
-    tag_enabled: bool = True
-    eta_tag: float = 1.15
+    # TAG (Tangential Amplified Guidance) — eta_tag=1.0 disables TAG
+    eta_tag: float = 1.0
+    adaptive_tag: bool = False
+    asymmetric_tag: bool = False
 
 
 class DC(object):
@@ -197,7 +198,15 @@ class DC(object):
 
         batch_size = tgt_x0.shape[0]
         t, t_prev, t_normalized = self.dc_timestep_sampling(batch_size)
-        
+
+        # Adaptive TAG: anneal η from eta_tag (high noise) → 1.0 (low noise)
+        # ====================================================================================
+        if self.config.adaptive_tag:
+            eta_tag_current = 1.0 + (self.config.eta_tag - 1.0) * t_normalized
+        else:
+            eta_tag_current = self.config.eta_tag
+        # ====================================================================================
+
         beta_t = scheduler.betas[t].to(device)
         alpha_t = scheduler.alphas[t].to(device)
         alpha_bar_t = scheduler.alphas_cumprod[t].to(device)
@@ -256,13 +265,17 @@ class DC(object):
                 noise_pred = noise_pred_uncond + self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
 
             # TAG: amplify tangential component of noise prediction
-            # =========================================================================================================
-            if self.config.tag_enabled:
-                v = latents_noisy / (latents_noisy.norm(p=2, dim=(1,2,3), keepdim=True) + 1e-8)
-                noise_parallel = (noise_pred * v).sum(dim=(1,2,3), keepdim=True) * v
-                noise_tangential = noise_pred - noise_parallel
-                noise_pred = noise_parallel + self.config.eta_tag * noise_tangential
-            # =========================================================================================================
+            # ====================================================================================
+            if self.config.asymmetric_tag:
+                eta_current = eta_tag_current if name == "tgt" else 1.0
+            else:
+                eta_current = eta_tag_current
+            
+            v = latents_noisy / (latents_noisy.norm(p=2, dim=(1, 2, 3), keepdim=True) + 1e-8)
+            noise_parallel = (noise_pred * v).sum(dim=(1, 2, 3), keepdim=True) * v
+            noise_tangential = noise_pred - noise_parallel
+            noise_pred = noise_parallel + eta_current * noise_tangential
+            # ====================================================================================
             
             mu, pred_x0 = self.compute_posterior_mean(latents_noisy, noise_pred, t, t_prev)
 
@@ -316,9 +329,6 @@ class DC(object):
 
         op = timesteps[-S:]
 
-        
-        # TAG Modification
-        # =========================================================================================================
         for t in op:
             xt_prev = xt.clone()
             xt_input = torch.cat([xt] * 2)
@@ -330,15 +340,21 @@ class DC(object):
             noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
             noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_uncond)
             xt = self.reverse_step(noise_pred, t, xt, eta=eta)
-            
+        
             # TAG: amplify tangential component of denoising step
-            if self.config.tag_enabled:
-                delta = xt - xt_prev
-                v = xt_prev / (xt_prev.norm(p=2, dim=(1,2,3), keepdim=True) + 1e-8)
-                u_n = (delta * v).sum(dim=(1,2,3), keepdim=True) * v
-                u_t = delta - u_n
-                xt = xt_prev + u_n + self.config.eta_tag * u_t
-        # =========================================================================================================
+            # =====================================================================   
+            if self.config.adaptive_tag:
+                t_ratio = t.item() / self.scheduler.config.num_train_timesteps
+                eta_tag_step = 1.0 + (self.config.eta_tag - 1.0) * t_ratio
+            else:
+                eta_tag_step = self.config.eta_tag
+
+            delta = xt - xt_prev
+            v = xt_prev / (xt_prev.norm(p=2, dim=(1,2,3), keepdim=True) + 1e-8)
+            u_n = (delta * v).sum(dim=(1,2,3), keepdim=True) * v
+            u_t = delta - u_n
+            xt = xt_prev + u_n + eta_tag_step * u_t
+            # =====================================================================
 
         return xt
 
