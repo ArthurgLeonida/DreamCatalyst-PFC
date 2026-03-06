@@ -44,8 +44,8 @@ Output: `outputs/<scene>/splatfacto/<timestamp>/`
 ```bash
 ns-train dc_splat \
     --max-num-iterations 3000 \
-    --pipeline.dc.src-prompt "a photo of a bear statue" \
-    --pipeline.dc.tgt-prompt "a photo of a grizzly bear" \
+    --pipeline.dc.src-prompt "a photo of a bicycle leaning against a bench" \
+    --pipeline.dc.tgt-prompt "a photo of a motorcycle leaning against a bench" \
     --load-dir outputs/<scene>/splatfacto/<timestamp>/nerfstudio_models/ \
     nerfstudio-data --data data/<scene>_processed
 ```
@@ -59,7 +59,7 @@ Output: `outputs/<scene>/dc_splat/<timestamp>/`
 ```bash
 ns-train dc_splat_refinement \
     --max-num-iterations 30000 \
-    --pipeline.dc.tgt-prompt "a photo of a grizzly bear" \
+    --pipeline.dc.tgt-prompt "a photo of a motorcycle leaning against a bench" \
     --load-dir outputs/<scene>/dc_splat/<timestamp>/nerfstudio_models/ \
     nerfstudio-data --data data/<scene>_processed
 ```

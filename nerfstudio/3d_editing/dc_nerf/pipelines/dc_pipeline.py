@@ -15,6 +15,7 @@ from typing_extensions import Literal
 
 from dc_nerf.pipelines.base_pipeline import ModifiedVanillaPipeline
 from dc_nerf.data.datamanagers.dc_datamanager import DCDataManagerConfig
+from dc_nerf.data.datamanagers.dc_splat_datamanager import DCSplatDataManagerConfig
 from dc.dc import DC, DCConfig, tensor_to_pil, DC
 from dc.utils.imageutil import merge_images
 from dc.utils.sysutil import clean_gpu
@@ -26,7 +27,7 @@ cmap = plt.get_cmap("viridis")
 @dataclass
 class DCPipelineConfig(VanillaPipelineConfig):
     _target: Type = field(default_factory=lambda: DCPipeline)
-    datamanager: DCDataManagerConfig = DCDataManagerConfig()
+    datamanager: Union[DCDataManagerConfig, DCSplatDataManagerConfig] = DCDataManagerConfig()
 
     # DC configs.
     dc: DCConfig = DCConfig()
