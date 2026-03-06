@@ -25,6 +25,7 @@ exports/
 
 # Other files
 *.pdf
+*.out
 
 # OS / editor
 .DS_Store
