@@ -45,35 +45,74 @@ Output: `outputs/<scene>/splatfacto/<timestamp>/`
 bash scripts/edit.sh bicycle \
     "a photo of a bicycle leaning against a bench" \
     "a photo of a motorcycle leaning against a bench" \
-    outputs/bicycle/splatfacto/<timestamp>/nerfstudio_models/
+    outputs/bicycle/splatfacto/<timestamp>/nerfstudio_models/ \
+    3000
 # Usage: bash scripts/edit.sh <scene> <src_prompt> <tgt_prompt> <load_dir> [max_iters]
+# Default: 3000 iterations
 ```
 
 Loads the reconstruction from Step 2 and optimizes the Gaussians toward the target prompt using DDS guidance. Each iteration renders a view, computes guidance loss, and backprops into the splat parameters.
 
+The `max_iters` argument is synced to `--pipeline.dc.max-iteration` so the timestep schedule covers the full training range.
+
+**Prompt guidelines:**
+- Describe the **full scene**, not just the object: `"a photo of a bicycle leaning against a bench"` not `"a bicycle"`.
+- Keep the source and target prompts as similar as possible — only change the edited element.
+- Prefix with `"a photo of"` to anchor the diffusion model to photorealistic outputs.
+
 Output: `outputs/<scene>/dc_splat/<timestamp>/`
 
-## Step 4 — Refinement (optional)
+### Render after editing (check before refinement)
+
+```bash
+ns-render interpolate \
+    --load-config outputs/<scene>/dc_splat/<timestamp>/config.yml \
+    --output-path renders/<scene>_edited.mp4
+```
+
+## Step 4 — Refinement
 
 ```bash
 bash scripts/refine.sh bicycle \
     "a photo of a motorcycle leaning against a bench" \
-    outputs/bicycle/dc_splat/<timestamp>/nerfstudio_models/
+    outputs/bicycle/dc_splat/<timestamp>/nerfstudio_models/ \
+    30000
 # Usage: bash scripts/refine.sh <scene> <tgt_prompt> <load_dir> [max_iters]
+# Default: 30000 iterations
 ```
 
-Uses SDEdit to produce edited 2D images, then retrains the Gaussians against them. Cleans up artifacts from Step 3.
+Uses SDEdit to produce edited 2D images, then retrains the Gaussians against them. Cleans up floater artifacts from Step 3. **Do not skip this step** — it significantly improves output quality.
 
-## Export & view
+### Render after refinement
+
+```bash
+ns-render interpolate \
+    --load-config outputs/<scene>/dc_splat_refinement/<timestamp>/config.yml \
+    --output-path renders/<scene>_refined.mp4
+```
+
+## Export & monitor
 
 ```bash
 ns-export gaussian-splat \
-    --load-config outputs/<scene>/dc_splat/<timestamp>/config.yml \
+    --load-config outputs/<scene>/dc_splat_refinement/<timestamp>/config.yml \
     --output-dir exports/<scene>
 
-# Monitor training
+# Monitor training in real time
 tensorboard --logdir outputs/ --port 6006 --bind_all
 ```
+
+## Fixes over original DreamCatalyst repo
+
+The [original repo](https://github.com/kaist-cvml/DreamCatalyst) ships `runwayml/stable-diffusion-v1-5` in `DCConfig`, but the `__call__` method constructs 8-channel UNet inputs with 3-way CFG — this is the InstructPix2Pix architecture, not SD 1.5 (4-channel, 2-way CFG). Running the original config as-is crashes.
+
+| Fix | File | Description |
+|---|---|---|
+| **Model path** | `dc.py` DCConfig | Changed to `timbrooks/instruct-pix2pix` to match the 8-channel UNet input the code actually builds. |
+| **`run_sdedit` channel mismatch** | `dc.py` | The original `run_sdedit` passes 4-channel input (`[xt]*2`) to the UNet, but IP2P expects 8 channels. Added `image_cond` parameter and concatenates it to produce `[B, 8, H, W]` input. |
+| **Refinement pipeline** | `refinement_pipeline.py` | Now computes and passes `image_cond` via `encode_src_image()` when calling `run_sdedit`. Without this, Step 4 crashes on the first SDEdit call. |
+| **Hardcoded `max_iteration`** | `dc.py` DCConfig | Was hardcoded to 3000 in `__init__`. Now a config field (`max_iteration`) so the timestep curriculum schedule syncs with the actual `--max-num-iterations` value. |
+| **`edit.sh` iteration sync** | `scripts/edit.sh` | Passes `--pipeline.dc.max-iteration` matching `--max-num-iterations` so shorter/longer runs don't break the timestep schedule. |
 
 ## Novelties
 
