@@ -99,6 +99,8 @@ class RefinementPipeline(ModifiedVanillaPipeline):
 
                     resized_img = torch.nn.functional.interpolate(input_img, size=(h, w), mode="bilinear")
                     latents = self.dc.encode_image(resized_img.to(self.dc_device))
+                    # Image conditioning for InstructPix2Pix UNet (matches encode_src_image)
+                    image_cond = self.dc.encode_src_image(resized_img.to(self.dc_device)).latent_dist.mode()
 
                 ## config ##
                 x0 = latents
@@ -107,7 +109,7 @@ class RefinementPipeline(ModifiedVanillaPipeline):
                 max_step = int(num_inference_steps * self.config.skip_max_ratio)
                 skip = random.randint(min_step, max_step)
 
-                edit_x0 = self.dc.run_sdedit(x0, skip=skip)
+                edit_x0 = self.dc.run_sdedit(x0, skip=skip, image_cond=image_cond)
                 edit_img = self.dc.decode_latent(edit_x0)
 
                 if edit_img.size() != rendered_image.size():

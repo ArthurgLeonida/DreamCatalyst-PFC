@@ -58,6 +58,7 @@ ns-train dc_splat \
     --load-dir "${LOAD_DIR}" \
     --pipeline.dc.src-prompt "${SRC_PROMPT}" \
     --pipeline.dc.tgt-prompt "${TGT_PROMPT}" \
+    --pipeline.dc.max-iteration "${MAX_ITERS}" \
     pipeline.datamanager:dc-splat-data-manager-config \
         --pipeline.datamanager.dataparser.data "${DATA_DIR}"
 

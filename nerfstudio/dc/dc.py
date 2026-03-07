@@ -41,6 +41,9 @@ class DCConfig:
     freeu_s1: float=0.9
     freeu_s2: float=0.2
 
+    # Maximum iterations (must match --max-num-iterations for correct timestep schedule)
+    max_iteration: int = 3000
+
     # TAG (Tangential Amplified Guidance) — eta_tag=1.0 disables TAG
     eta_tag: float = 1.0
     adaptive_tag: bool = False
@@ -83,7 +86,7 @@ class DC(object):
         self.check = 0
         self.w_s = 1.5
         self.iteration = 0
-        self.max_iteration = 3000
+        self.max_iteration = config.max_iteration
 
         b1 = self.config.freeu_b1
         b2 = self.config.freeu_b2
@@ -310,7 +313,7 @@ class DC(object):
         else:
             return loss
 
-    def run_sdedit(self, x0, tgt_prompt=None, num_inference_steps=20, skip=7, eta=0):
+    def run_sdedit(self, x0, tgt_prompt=None, num_inference_steps=20, skip=7, eta=0, image_cond=None):
         scheduler = self.scheduler
         scheduler.set_timesteps(num_inference_steps)
         timesteps = scheduler.timesteps
@@ -322,6 +325,10 @@ class DC(object):
 
         xt = scheduler.add_noise(x0, noise, t)
 
+        # Image conditioning for InstructPix2Pix UNet (8-channel input)
+        if image_cond is None:
+            image_cond = torch.zeros_like(x0)
+
         self.update_text_features(None, tgt_prompt=tgt_prompt)
         tgt_text_embedding = self.tgt_text_feature
         null_text_embedding = self.null_text_feature
@@ -332,6 +339,7 @@ class DC(object):
         for t in op:
             xt_prev = xt.clone()
             xt_input = torch.cat([xt] * 2)
+            xt_input = torch.cat([xt_input, torch.cat([image_cond, image_cond], dim=0)], dim=1)
             noise_pred = self.unet.forward(
                 xt_input,
                 torch.cat([t[None]] * 2).to(self.device),
