@@ -88,7 +88,7 @@ class RefinementPipeline(ModifiedVanillaPipeline):
         if step % self.config.edit_rate == 0:
             for i in range(self.config.edit_count):
                 rendered_image, original_image, current_spot = self.get_current_rendering()
-                input_img = original_image
+                input_img = rendered_image  # use the edited rendering, not the original
 
                 # with torch.no_grad():
                 if True:
