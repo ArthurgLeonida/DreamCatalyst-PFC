@@ -30,6 +30,7 @@ class RefinementPipelineConfig(VanillaPipelineConfig):
 
     skip_min_ratio: float = 0.8
     skip_max_ratio: float = 0.9
+    sdedit_steps: int = 20
 
     log_step: int = 100
     edit_rate: int = 10
@@ -102,12 +103,12 @@ class RefinementPipeline(ModifiedVanillaPipeline):
 
                     ## config ##
                     x0 = latents
-                    num_inference_steps = self.dc.config.num_inference_steps
-                    min_step = int(num_inference_steps * self.config.skip_min_ratio)
-                    max_step = int(num_inference_steps * self.config.skip_max_ratio)
+                    sdedit_steps = self.config.sdedit_steps
+                    min_step = int(sdedit_steps * self.config.skip_min_ratio)
+                    max_step = int(sdedit_steps * self.config.skip_max_ratio)
                     skip = random.randint(min_step, max_step)
 
-                    edit_x0 = self.dc.run_sdedit(x0, skip=skip, image_cond=image_cond)
+                    edit_x0 = self.dc.run_sdedit(x0, num_inference_steps=sdedit_steps, skip=skip, image_cond=image_cond)
                     edit_img = self.dc.decode_latent(edit_x0)
 
                     # Resize to match the cached training image dimensions

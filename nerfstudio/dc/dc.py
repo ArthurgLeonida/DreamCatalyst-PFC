@@ -121,7 +121,8 @@ class DC(object):
         return self.vae.encode(x).latent_dist.sample() * 0.18215
     
     def encode_src_image(self, img_tensor: Float[torch.Tensor, "B C H W"]):
-        x = img_tensor.float()
+        x = 2 * img_tensor - 1
+        x = x.float()
         return self.vae.encode(x)
 
     def encode_text(self, prompt):
