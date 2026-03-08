@@ -112,9 +112,11 @@ class RefinementPipeline(ModifiedVanillaPipeline):
                 edit_x0 = self.dc.run_sdedit(x0, skip=skip, image_cond=image_cond)
                 edit_img = self.dc.decode_latent(edit_x0)
 
-                if edit_img.size() != rendered_image.size():
+                # Resize to match the cached training image dimensions
+                target_size = self.datamanager.image_batch["image"][current_spot].shape[:2]  # [H, W]
+                if edit_img.shape[2:] != target_size:
                     edit_img = torch.nn.functional.interpolate(
-                        edit_img, size=rendered_image.size()[2:], mode="bilinear"
+                        edit_img, size=target_size, mode="bilinear"
                     )
 
                 self.datamanager.image_batch["image"][current_spot] = edit_img.squeeze().permute(1, 2, 0)  # [H,W,3]

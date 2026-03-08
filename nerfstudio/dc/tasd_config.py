@@ -4,7 +4,7 @@
 
 DC_CUSTOM_PARAMS = dict(
     # TAG (Tangential Amplified Guidance)
-    eta_tag=1.15,
-    adaptive_tag=True,
-    asymmetric_tag=True,
+    eta_tag=1.0,
+    adaptive_tag=False,
+    asymmetric_tag=False,
 )
