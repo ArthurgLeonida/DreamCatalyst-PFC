@@ -87,11 +87,10 @@ class RefinementPipeline(ModifiedVanillaPipeline):
 
         if step % self.config.edit_rate == 0:
             for i in range(self.config.edit_count):
-                rendered_image, original_image, current_spot = self.get_current_rendering()
-                input_img = rendered_image  # use the edited rendering, not the original
+                with torch.no_grad():
+                    rendered_image, original_image, current_spot = self.get_current_rendering()
+                    input_img = rendered_image  # use the edited rendering, not the original
 
-                # with torch.no_grad():
-                if True:
                     h, w = input_img.shape[2:]
                     l = min(h, w)
                     h = int(h * 512 / l)
@@ -102,24 +101,24 @@ class RefinementPipeline(ModifiedVanillaPipeline):
                     # Image conditioning for InstructPix2Pix UNet (matches encode_src_image)
                     image_cond = self.dc.encode_src_image(resized_img.to(self.dc_device)).latent_dist.mode()
 
-                ## config ##
-                x0 = latents
-                num_inference_steps = self.dc.config.num_inference_steps
-                min_step = int(num_inference_steps * self.config.skip_min_ratio)
-                max_step = int(num_inference_steps * self.config.skip_max_ratio)
-                skip = random.randint(min_step, max_step)
+                    ## config ##
+                    x0 = latents
+                    num_inference_steps = self.dc.config.num_inference_steps
+                    min_step = int(num_inference_steps * self.config.skip_min_ratio)
+                    max_step = int(num_inference_steps * self.config.skip_max_ratio)
+                    skip = random.randint(min_step, max_step)
 
-                edit_x0 = self.dc.run_sdedit(x0, skip=skip, image_cond=image_cond)
-                edit_img = self.dc.decode_latent(edit_x0)
+                    edit_x0 = self.dc.run_sdedit(x0, skip=skip, image_cond=image_cond)
+                    edit_img = self.dc.decode_latent(edit_x0)
 
-                # Resize to match the cached training image dimensions
-                target_size = self.datamanager.image_batch["image"][current_spot].shape[:2]  # [H, W]
-                if edit_img.shape[2:] != target_size:
-                    edit_img = torch.nn.functional.interpolate(
-                        edit_img, size=target_size, mode="bilinear"
-                    )
+                    # Resize to match the cached training image dimensions
+                    target_size = self.datamanager.image_batch["image"][current_spot].shape[:2]  # [H, W]
+                    if edit_img.shape[2:] != target_size:
+                        edit_img = torch.nn.functional.interpolate(
+                            edit_img, size=target_size, mode="bilinear"
+                        )
 
-                self.datamanager.image_batch["image"][current_spot] = edit_img.squeeze().permute(1, 2, 0)  # [H,W,3]
+                    self.datamanager.image_batch["image"][current_spot] = edit_img.squeeze().permute(1, 2, 0)  # [H,W,3]
 
             if step % self.config.log_step == 0:
                 with torch.no_grad():
