@@ -162,7 +162,7 @@ class DC(object):
 
     def dc_timestep_sampling(self, batch_size):
         self.scheduler.set_timesteps(self.config.num_inference_steps)
-        timesteps = reversed(self.scheduler.timesteps)
+        timesteps = self.scheduler.timesteps.flip(0)
 
         min_step = 1 if self.config.min_step_ratio <= 0 else int(len(timesteps) * self.config.min_step_ratio)
         max_step = (
@@ -318,7 +318,7 @@ class DC(object):
         scheduler = self.scheduler
         scheduler.set_timesteps(num_inference_steps)
         timesteps = scheduler.timesteps
-        reversed_timesteps = reversed(scheduler.timesteps)
+        reversed_timesteps = timesteps.flip(0)
 
         S = num_inference_steps - skip
         t = reversed_timesteps[S - 1]

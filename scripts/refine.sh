@@ -53,6 +53,9 @@ ns-train dc_splat_refinement \
     --experiment-name "${SCENE}" \
     --load-dir "${LOAD_DIR}" \
     --pipeline.dc.tgt-prompt "${TGT_PROMPT}" \
+    --optimizers.xyz.optimizer.lr 1.6e-5 \
+    --optimizers.scaling.optimizer.lr 0.001 \
+    --optimizers.opacity.optimizer.lr 0.01 \
     pipeline.datamanager:dc-splat-data-manager-config \
         --pipeline.datamanager.dataparser.data "${DATA_DIR}"
 
