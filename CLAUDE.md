@@ -31,6 +31,7 @@ The original repo has several bugs that prevent it from working end-to-end:
 4. **Refinement resize mismatch**: Original resized `edit_img` to match `rendered_image` but assigned to `datamanager.image_batch` (different size). Fixed: resize to `datamanager.image_batch[current_spot].shape[:2]`.
 5. **Hardcoded `max_iteration=3000`**: Broke timestep schedule when using non-3000 iterations. Fixed: added `max_iteration` field to `DCConfig`, `edit.sh` syncs it with `--max-num-iterations`.
 6. **Refinement uses original images**: `input_img = original_image` feeds unedited photos from disk through SDEdit, erasing the Step 3 edit. Fixed: `input_img = rendered_image` so SDEdit starts from the edited model's rendering.
+7. **Refinement double backward crash**: `get_current_rendering()` does a second forward pass through the gaussian model (overwriting saved CUDA rasterizer state from the photometric forward pass), causing `RuntimeError: Trying to backward through the graph a second time`. Fixed: wrapped the entire SDEdit block (including `get_current_rendering()`) in `torch.no_grad()` since it only generates target images — no gradients needed.
 
 ## Coding rules
 - New hyperparameters go in `DCConfig` dataclass with defaults that reproduce original behavior (e.g., `eta_tag=1.0` = no-op).

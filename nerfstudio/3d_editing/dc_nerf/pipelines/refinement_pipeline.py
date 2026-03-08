@@ -81,16 +81,15 @@ class RefinementPipeline(ModifiedVanillaPipeline):
         return rendered_image, original_image, current_spot
 
     def get_train_loss_dict(self, step: int):
-        ray_bundle, batch = self.datamanager.next_train(step)
-        model_outputs = self.model(ray_bundle)
-        metrics_dict = self.model.get_metrics_dict(model_outputs, batch)
-
+        # --- SDEdit target generation (runs BEFORE photometric forward pass) ---
+        # Must happen first so the photometric forward pass is the last one through
+        # the CUDA rasterizer, preserving its saved state for backward.
         if step % self.config.edit_rate == 0:
             for i in range(self.config.edit_count):
-                with torch.no_grad():
-                    rendered_image, original_image, current_spot = self.get_current_rendering()
-                    input_img = rendered_image  # use the edited rendering, not the original
+                rendered_image, original_image, current_spot = self.get_current_rendering()
+                input_img = rendered_image.detach()  # no gradients needed for SDEdit
 
+                with torch.no_grad():
                     h, w = input_img.shape[2:]
                     l = min(h, w)
                     h = int(h * 512 / l)
@@ -134,6 +133,10 @@ class RefinementPipeline(ModifiedVanillaPipeline):
                     save_img_pil = imageutil.merge_images([rendered_img_pil, edit_img_pil])
                     save_img_pil.save(self.base_dir / f"logging/replace-out-{step}.png")
 
+        # --- Photometric forward pass (must be LAST through rasterizer for backward) ---
+        ray_bundle, batch = self.datamanager.next_train(step)
+        model_outputs = self.model(ray_bundle)
+        metrics_dict = self.model.get_metrics_dict(model_outputs, batch)
         loss_dict = self.model.get_loss_dict(model_outputs, batch, metrics_dict)
 
         return model_outputs, loss_dict, metrics_dict
