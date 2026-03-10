@@ -121,8 +121,7 @@ class DC(object):
         return self.vae.encode(x).latent_dist.sample() * 0.18215
     
     def encode_src_image(self, img_tensor: Float[torch.Tensor, "B C H W"]):
-        x = 2 * img_tensor - 1
-        x = x.float()
+        x = img_tensor.float()
         return self.vae.encode(x)
 
     def encode_text(self, prompt):
@@ -262,8 +261,11 @@ class DC(object):
             unet_feats = unet_outputs.features
 
             noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
-            noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_image) + \
-                self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
+            if name == "tgt":
+                noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_image) + \
+                    self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
+            else:
+                noise_pred = noise_pred_uncond + self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
 
             # TAG: amplify tangential component of noise prediction
             # ====================================================================================
