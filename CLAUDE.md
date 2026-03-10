@@ -30,11 +30,10 @@ The original repo has several bugs that prevent it from working end-to-end:
 3. **Refinement pipeline missing image_cond**: `refinement_pipeline.py` now computes `image_cond = encode_src_image(resized_img).latent_dist.mode()` and passes it to `run_sdedit`.
 4. **Refinement resize mismatch**: Original resized `edit_img` to match `rendered_image` but assigned to `datamanager.image_batch` (different size). Fixed: resize to `datamanager.image_batch[current_spot].shape[:2]`.
 5. **Hardcoded `max_iteration=3000`**: Broke timestep schedule when using non-3000 iterations. Fixed: added `max_iteration` field to `DCConfig`, `edit.sh` syncs it with `--max-num-iterations`.
-6. **Refinement uses original images**: `input_img = original_image` feeds unedited photos from disk through SDEdit, erasing the Step 3 edit. Fixed: `input_img = rendered_image` so SDEdit starts from the edited model's rendering.
+6. **Refinement SDEdit input**: Original repo correctly uses `input_img = original_image` — SDEdit starts from clean original photos, adds light noise, and denoises with the IP2P edit prompt to produce clean, multi-view consistent targets. Using `rendered_image` instead was WRONG (compounds 3DGS artifacts over 30k iterations → blurry output).
 7. **Refinement SDEdit skip/steps mismatch**: `skip` was computed from `self.dc.config.num_inference_steps` (500, the DDS schedule) but `run_sdedit` uses 20 steps internally. Result: `S = 20 - 400 = -380`, denoising loop is empty, returns raw noise → model degrades to blurry painterly mess. Fixed: added `sdedit_steps: int = 20` to `RefinementPipelineConfig`, compute skip from that, and pass `num_inference_steps=sdedit_steps` to `run_sdedit`.
 8. **`encode_src_image` missing normalization**: VAE expects [-1,1] input but `encode_src_image` passed [0,1] directly (no `2*x - 1`). Affects image conditioning quality in both `__call__` (Step 3) and `run_sdedit` (Step 4). Fixed: added `x = 2 * img_tensor - 1` normalization.
-9. **`reversed()` fragile in `run_sdedit` and `dc_timestep_sampling`**: `reversed(scheduler.timesteps)` returns a `reversed` iterator in some PyTorch versions, which is NOT subscriptable → `TypeError` crashes `run_sdedit` silently. Fixed: replaced with `scheduler.timesteps.flip(0)` (returns a proper tensor).
-10. **Refinement geometry LRs too high**: Default refinement config had xyz=1.6e-4, scaling=0.005, opacity=0.05 — same as splatfacto training from scratch. These are 5-10x too high for refinement, causing massive floaters when training targets are mixed (some SDEdited, most original). Fixed: `refine.sh` now passes reduced LRs matching Step 3 (xyz=1.6e-5, scaling=0.001, opacity=0.01).
+9. **Asymmetric CFG causes spatial leakage**: Original uses full 3-way IP2P CFG for tgt branch but only 2-way (image+uncond, no text) for src branch. Result: `eps_tgt - eps_src = gs*(text_tgt - image)`, which applies the FULL text influence globally — background gets edited too. Fixed: both branches now use identical 3-way CFG with their respective text embeddings. DDS difference becomes `gs*(text_tgt - text_src)`, which cancels for background pixels (both prompts describe the same background) and only produces non-zero gradient where the prompts differ (the edited object). Use descriptive prompts for best localization.
 
 ## Coding rules
 - New hyperparameters go in `DCConfig` dataclass with defaults that reproduce original behavior (e.g., `eta_tag=1.0` = no-op).
@@ -44,14 +43,8 @@ The original repo has several bugs that prevent it from working end-to-end:
 - `--mixed-precision False` is required for Steps 3 and 4 (FP16 corrupts DDS gradients).
 
 ## Editing tips (learned from experiments)
-- **Prompts must describe the full scene**: `"a photo of a yellow LEGO bulldozer on a wooden table"` not `"a yellow LEGO bulldozer"`. Vague prompts destroy geometry.
 - **Guidance scale**: Default 7.5 may be too weak. 12.5 worked well for material changes.
-- **Geometry LRs**: Reduce xyz/scaling/opacity LRs to prevent floaters while allowing color changes:
-  - `--optimizers.xyz.optimizer.lr 1.6e-5` (10x lower than default)
-  - `--optimizers.scaling.optimizer.lr 0.001` (5x lower)
-  - `--optimizers.opacity.optimizer.lr 0.01` (5x lower)
 - **TAG novelties**: Can cause floaters. Disable (`eta_tag=1.0`) when debugging other issues. Re-enable gradually (1.05 → 1.10 → 1.15).
-- **Step 4 refinement**: 30000 iters, ~1h on H100. Most iters are cheap photometric loss; SDEdit runs every 10 steps with only 2-4 denoising passes.
 
 ## Novelties (TASD)
 Five modifications to DDS guidance in dc.py. See `docs/TASD_implementation_guide.md` for full details.

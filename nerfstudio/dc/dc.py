@@ -162,7 +162,7 @@ class DC(object):
 
     def dc_timestep_sampling(self, batch_size):
         self.scheduler.set_timesteps(self.config.num_inference_steps)
-        timesteps = self.scheduler.timesteps.flip(0)
+        timesteps = reversed(self.scheduler.timesteps)
 
         min_step = 1 if self.config.min_step_ratio <= 0 else int(len(timesteps) * self.config.min_step_ratio)
         max_step = (
@@ -262,11 +262,8 @@ class DC(object):
             unet_feats = unet_outputs.features
 
             noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
-            if name == "tgt":
-                noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_image) + \
-                    self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
-            else:
-                noise_pred = noise_pred_uncond + self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
+            noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_image) + \
+                self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
 
             # TAG: amplify tangential component of noise prediction
             # ====================================================================================
@@ -318,7 +315,7 @@ class DC(object):
         scheduler = self.scheduler
         scheduler.set_timesteps(num_inference_steps)
         timesteps = scheduler.timesteps
-        reversed_timesteps = timesteps.flip(0)
+        reversed_timesteps = reversed(scheduler.timesteps)
 
         S = num_inference_steps - skip
         t = reversed_timesteps[S - 1]

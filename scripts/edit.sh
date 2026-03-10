@@ -51,6 +51,7 @@ if [ ! -d "${LOAD_DIR}" ]; then
 fi
 
 ns-train dc_splat \
+    --machine.seed 42 \
     --max-num-iterations "${MAX_ITERS}" \
     --mixed-precision False \
     --vis tensorboard \
@@ -59,6 +60,7 @@ ns-train dc_splat \
     --pipeline.dc.src-prompt "${SRC_PROMPT}" \
     --pipeline.dc.tgt-prompt "${TGT_PROMPT}" \
     --pipeline.dc.max-iteration "${MAX_ITERS}" \
+    --pipeline.dc.guidance-scale 12.5 \
     pipeline.datamanager:dc-splat-data-manager-config \
         --pipeline.datamanager.dataparser.data "${DATA_DIR}"
 
