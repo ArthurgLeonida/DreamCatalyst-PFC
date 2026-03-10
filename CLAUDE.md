@@ -22,16 +22,25 @@ Pipeline: COLMAP → Nerfstudio splatfacto → DreamCatalyst (DDS editing) → R
 - `scripts/refine.sh` — Step 4 wrapper.
 - There is NO separate `guidance/` folder. Everything is in dc.py.
 
-## Fixes over original DreamCatalyst repo (https://github.com/kaist-cvml/DreamCatalyst)
-The original repo has several bugs that prevent it from working end-to-end:
+## Two-model architecture (CRITICAL)
+The original DreamCatalyst uses TWO different diffusion models:
+- **Step 3 (editing via DDS)**: `timbrooks/instruct-pix2pix` — 8-ch UNet, 3-way IP2P CFG. Passed via CLI in `edit.sh`.
+- **Step 4 (refinement via SDEdit)**: `runwayml/stable-diffusion-v1-5` — 4-ch UNet, 2-way text CFG. Uses DCConfig default.
+- The config default is SD 1.5. Editing overrides it to IP2P at runtime. Refinement uses the default.
+- `run_sdedit` uses 4-channel input (no image conditioning) — designed for SD 1.5 only.
+- `__call__` uses 8-channel input (with image conditioning) — designed for IP2P only.
+- **NEVER** change the DCConfig default to IP2P — it breaks refinement.
 
-1. **Model path mismatch**: Original config has `runwayml/stable-diffusion-v1-5` (4-ch UNet) but `__call__` builds 8-channel input with 3-way CFG (InstructPix2Pix architecture). Fixed: changed to `timbrooks/instruct-pix2pix`.
-2. **`run_sdedit` channel mismatch**: Passes 4-ch input (`[xt]*2`) to UNet, but IP2P expects 8 channels. Fixed: added `image_cond` parameter, concatenates `[xt_input, image_cond]` along dim=1 for 8-ch input.
-3. **Refinement pipeline missing image_cond**: `refinement_pipeline.py` now computes `image_cond = encode_src_image(resized_img).latent_dist.mode()` and passes it to `run_sdedit`.
-4. **Refinement resize mismatch**: Original resized `edit_img` to match `rendered_image` but assigned to `datamanager.image_batch` (different size). Fixed: resize to `datamanager.image_batch[current_spot].shape[:2]`.
+## Fixes over original DreamCatalyst repo (https://github.com/kaist-cvml/DreamCatalyst)
+Verified changes (original repo has bugs/missing features):
+
+1. **~~Model path mismatch~~** [NOT A BUG — two-model design]: Config default `runwayml/stable-diffusion-v1-5` is intentional for refinement. Step 3 overrides to IP2P via CLI `--pipeline.dc.sd-pretrained-model-or-path timbrooks/instruct-pix2pix`.
+2. **~~`run_sdedit` channel mismatch~~** [NOT A BUG]: `run_sdedit` uses 4-ch input for SD 1.5 refinement. This is correct. Do NOT add image_cond.
+3. **~~Refinement pipeline missing image_cond~~** [NOT A BUG]: Refinement uses SD 1.5 with 4-ch text-only denoising. No image_cond needed.
+4. **~~Refinement resize mismatch~~** [REVERTED]: Original resizes to `rendered_image.size()` — kept as original.
 5. **Hardcoded `max_iteration=3000`**: Broke timestep schedule when using non-3000 iterations. Fixed: added `max_iteration` field to `DCConfig`, `edit.sh` syncs it with `--max-num-iterations`.
-6. **Refinement SDEdit input**: Original repo correctly uses `input_img = original_image` — SDEdit starts from clean original photos, adds light noise, and denoises with the IP2P edit prompt to produce clean, multi-view consistent targets. Using `rendered_image` instead was WRONG (compounds 3DGS artifacts over 30k iterations → blurry output).
-7. **~~Refinement SDEdit skip/steps mismatch~~** [MISDIAGNOSED]: The original refinement config already sets `num_inference_steps=20` in DCConfig, so skip is correctly computed from 20. The `sdedit_steps` addition is harmless but redundant.
+6. **Refinement SDEdit input**: Original repo correctly uses `input_img = original_image` — SDEdit starts from clean original photos, adds light noise, and denoises with the edit prompt to produce clean, multi-view consistent targets.
+7. **~~Refinement SDEdit skip/steps mismatch~~** [MISDIAGNOSED]: The original refinement config already sets `num_inference_steps=20` in DCConfig, so skip is correctly computed from 20.
 8. **`encode_src_image` unnormalized input** [INTENTIONAL, NOT A BUG]: The original passes [0,1] to VAE (no `2*x-1`). This produces weaker/noisier image conditioning, which is actually DESIRED — it lets the text guidance dominate in the DDS difference. Adding proper normalization makes image conditioning too strong, drowning out the editing signal. **Reverted to original behavior.**
 9. **Asymmetric CFG spatial leakage** [KNOWN ISSUE]: The original uses full 3-way IP2P CFG for tgt branch but only 2-way (image+uncond, no text) for src branch. This means `eps_tgt - eps_src = gs*(text_tgt - image)`, which applies text influence globally. Attempted fix (symmetric CFG for both branches) FAILED — `gs*(text_tgt - text_src)` signal is too weak, produces only noise/artifacts with no edit. The asymmetric formulation is correct; spatial leakage should be addressed via masking (restrict gradient to target Gaussians), not by changing the CFG formula.
 

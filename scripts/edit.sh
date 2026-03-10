@@ -61,6 +61,7 @@ ns-train dc_splat \
     --pipeline.dc.tgt-prompt "${TGT_PROMPT}" \
     --pipeline.dc.max-iteration "${MAX_ITERS}" \
     --pipeline.dc.guidance-scale 7.5 \
+    --pipeline.dc.sd-pretrained-model-or-path timbrooks/instruct-pix2pix \
     pipeline.datamanager:dc-splat-data-manager-config \
         --pipeline.datamanager.dataparser.data "${DATA_DIR}"
 

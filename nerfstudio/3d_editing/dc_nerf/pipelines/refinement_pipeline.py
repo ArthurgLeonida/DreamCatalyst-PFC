@@ -30,7 +30,6 @@ class RefinementPipelineConfig(VanillaPipelineConfig):
 
     skip_min_ratio: float = 0.8
     skip_max_ratio: float = 0.9
-    sdedit_steps: int = 20
 
     log_step: int = 100
     edit_rate: int = 10
@@ -82,15 +81,17 @@ class RefinementPipeline(ModifiedVanillaPipeline):
         return rendered_image, original_image, current_spot
 
     def get_train_loss_dict(self, step: int):
-        # --- SDEdit target generation (runs BEFORE photometric forward pass) ---
-        # Must happen first so the photometric forward pass is the last one through
-        # the CUDA rasterizer, preserving its saved state for backward.
+        ray_bundle, batch = self.datamanager.next_train(step)
+        model_outputs = self.model(ray_bundle)
+        metrics_dict = self.model.get_metrics_dict(model_outputs, batch)
+
         if step % self.config.edit_rate == 0:
             for i in range(self.config.edit_count):
                 rendered_image, original_image, current_spot = self.get_current_rendering()
-                input_img = original_image  # SDEdit starts from clean originals (not rendered)
+                input_img = original_image
 
-                with torch.no_grad():
+                # with torch.no_grad():
+                if True:
                     h, w = input_img.shape[2:]
                     l = min(h, w)
                     h = int(h * 512 / l)
@@ -98,27 +99,23 @@ class RefinementPipeline(ModifiedVanillaPipeline):
 
                     resized_img = torch.nn.functional.interpolate(input_img, size=(h, w), mode="bilinear")
                     latents = self.dc.encode_image(resized_img.to(self.dc_device))
-                    # Image conditioning for InstructPix2Pix UNet (matches encode_src_image)
-                    image_cond = self.dc.encode_src_image(resized_img.to(self.dc_device)).latent_dist.mode()
 
-                    ## config ##
-                    x0 = latents
-                    sdedit_steps = self.config.sdedit_steps
-                    min_step = int(sdedit_steps * self.config.skip_min_ratio)
-                    max_step = int(sdedit_steps * self.config.skip_max_ratio)
-                    skip = random.randint(min_step, max_step)
+                ## config ##
+                x0 = latents
+                num_inference_steps = self.dc.config.num_inference_steps
+                min_step = int(num_inference_steps * self.config.skip_min_ratio)
+                max_step = int(num_inference_steps * self.config.skip_max_ratio)
+                skip = random.randint(min_step, max_step)
 
-                    edit_x0 = self.dc.run_sdedit(x0, num_inference_steps=sdedit_steps, skip=skip, image_cond=image_cond)
-                    edit_img = self.dc.decode_latent(edit_x0)
+                edit_x0 = self.dc.run_sdedit(x0, skip=skip)
+                edit_img = self.dc.decode_latent(edit_x0)
 
-                    # Resize to match the cached training image dimensions
-                    target_size = self.datamanager.image_batch["image"][current_spot].shape[:2]  # [H, W]
-                    if edit_img.shape[2:] != target_size:
-                        edit_img = torch.nn.functional.interpolate(
-                            edit_img, size=target_size, mode="bilinear"
-                        )
+                if edit_img.size() != rendered_image.size():
+                    edit_img = torch.nn.functional.interpolate(
+                        edit_img, size=rendered_image.size()[2:], mode="bilinear"
+                    )
 
-                    self.datamanager.image_batch["image"][current_spot] = edit_img.squeeze().permute(1, 2, 0)  # [H,W,3]
+                self.datamanager.image_batch["image"][current_spot] = edit_img.squeeze().permute(1, 2, 0)  # [H,W,3]
 
             if step % self.config.log_step == 0:
                 with torch.no_grad():
@@ -134,10 +131,6 @@ class RefinementPipeline(ModifiedVanillaPipeline):
                     save_img_pil = imageutil.merge_images([rendered_img_pil, edit_img_pil])
                     save_img_pil.save(self.base_dir / f"logging/replace-out-{step}.png")
 
-        # --- Photometric forward pass (must be LAST through rasterizer for backward) ---
-        ray_bundle, batch = self.datamanager.next_train(step)
-        model_outputs = self.model(ray_bundle)
-        metrics_dict = self.model.get_metrics_dict(model_outputs, batch)
         loss_dict = self.model.get_loss_dict(model_outputs, batch, metrics_dict)
 
         return model_outputs, loss_dict, metrics_dict
