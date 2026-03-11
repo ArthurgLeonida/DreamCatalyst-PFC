@@ -69,4 +69,5 @@ def pick_idle_gpu(
 
 
 if __name__ == "__main__":
-    pick_idle_gpu()
+    gpu_id = pick_idle_gpu(set_env=False)
+    print(gpu_id)

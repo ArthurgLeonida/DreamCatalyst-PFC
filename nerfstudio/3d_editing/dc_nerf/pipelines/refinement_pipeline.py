@@ -110,9 +110,12 @@ class RefinementPipeline(ModifiedVanillaPipeline):
                 edit_x0 = self.dc.run_sdedit(x0, skip=skip)
                 edit_img = self.dc.decode_latent(edit_x0)
 
-                if edit_img.size() != rendered_image.size():
+                if edit_img.shape[2:] != rendered_image.shape[2:]:
                     edit_img = torch.nn.functional.interpolate(
-                        edit_img, size=rendered_image.size()[2:], mode="bilinear"
+                        edit_img,
+                        size=rendered_image.shape[2:],  # (H, W) from (B, C, H, W)
+                        mode="bilinear",
+                        align_corners=False             # best practice for bilinear
                     )
 
                 self.datamanager.image_batch["image"][current_spot] = edit_img.squeeze().permute(1, 2, 0)  # [H,W,3]

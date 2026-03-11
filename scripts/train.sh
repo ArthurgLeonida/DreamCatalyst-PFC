@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  DreamCatalyst-NS — Training script (Linux / H100)
+#  DreamCatalyst-NS — Training script (Step 2: initialization)
 # ==============================================================================
 #  Usage:
 #    bash scripts/train.sh bicycle                    # splatfacto, 500 iters (quick test)
-#    bash scripts/train.sh bicycle 30000              # splatfacto, full training  
-#    bash scripts/train.sh bicycle 30000 2 dc_splat   # DreamCatalyst + 2x downscale
+#    bash scripts/train.sh bicycle 30000              # splatfacto, full training
+#    bash scripts/train.sh bicycle 30000 2            # splatfacto + 2x downscale
+#
+#  This script is for initialization only (splatfacto / nerfacto).
+#  For editing (Step 3), use:  bash scripts/edit.sh
+#  For refinement (Step 4), use:  bash scripts/refine.sh
 # ==============================================================================
 
 set -euo pipefail
@@ -13,17 +17,24 @@ set -euo pipefail
 SCENE="${1:?Usage: $0 <scene_name> [max_iters] [downscale] [method]}"
 MAX_ITERS="${2:-500}"
 DOWNSCALE="${3:-auto}"           # auto | 1 | 2 | 4
-METHOD="${4:-splatfacto}"        # default: splatfacto (matches README)
+METHOD="${4:-splatfacto}"        # splatfacto | nerfacto
 DATA_DIR="data/${SCENE}_processed"
 
-# Normalize aliases for DreamCatalyst
-if [ "${METHOD}" = "dream" ] || [ "${METHOD}" = "dream-catalyst" ]; then
-    METHOD="dc_splat"
-fi
+# Block editing methods — they need edit.sh / refine.sh
+case "${METHOD}" in
+    dc_splat|dc|dream|dream-catalyst)
+        echo "ERROR: '${METHOD}' is an editing method. Use scripts/edit.sh instead."
+        exit 1
+        ;;
+    dc_splat_refinement|dc_refinement)
+        echo "ERROR: '${METHOD}' is a refinement method. Use scripts/refine.sh instead."
+        exit 1
+        ;;
+esac
 
 # ── Auto-select least-busy GPU ───────────────────────────────────────────────
 echo "[train.sh] Selecting best available GPU..."
-GPU_ID=$(python scripts/pick_gpu.py 2>/dev/null | grep -oP 'CUDA_VISIBLE_DEVICES=\K[0-9]+' || echo "0")
+GPU_ID=$(python scripts/pick_gpu.py 2>/dev/null | tail -1 || echo "0")
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 
 echo "============================================"
@@ -42,17 +53,9 @@ if [ ! -f "${DATA_DIR}/transforms.json" ]; then
     exit 1
 fi
 
-# ── Build ns-train command ────────────────────────────────────────────────────
-if [ "${METHOD}" = "splatfacto" ]; then
-    MP_FLAG="False"
-else
-    MP_FLAG="True"
-fi
-
 # Base command
 CMD=(ns-train "${METHOD}" \
         --max-num-iterations "${MAX_ITERS}" \
-        --mixed-precision "${MP_FLAG}" \
         --vis tensorboard \
         --experiment-name "${SCENE}" \
         nerfstudio-data \

@@ -23,7 +23,7 @@ DATA_DIR="data/${SCENE}_processed"
 
 # ── Auto-select least-busy GPU ───────────────────────────────────────────────
 echo "[edit.sh] Selecting best available GPU..."
-GPU_ID=$(python scripts/pick_gpu.py 2>/dev/null | grep -oP 'CUDA_VISIBLE_DEVICES=\K[0-9]+' || echo "0")
+GPU_ID=$(python scripts/pick_gpu.py 2>/dev/null | tail -1 || echo "0")
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 
 echo "============================================"
