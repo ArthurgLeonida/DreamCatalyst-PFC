@@ -7,6 +7,9 @@
 #
 #  rep: splat (default) or nerf
 #
+#  For NeRF, two GPUs are auto-selected (NeRF model + diffusion model).
+#  Override with: CUDA_VISIBLE_DEVICES=5,7 bash scripts/refine.sh ...
+#
 #  Examples:
 #    bash scripts/refine.sh bicycle \
 #        "a photo of a motorcycle leaning against a bench" \
@@ -30,9 +33,11 @@ DATA_DIR="data/${SCENE}_processed"
 case "${REP}" in
     splat|3dgs|gaussian)
         METHOD="dc_splat_refinement"
+        NUM_GPUS=1
         ;;
     nerf|nerfacto)
         METHOD="dc_refinement"
+        NUM_GPUS=2       # NeRF needs 2 GPUs: model + diffusion
         ;;
     *)
         echo "ERROR: Unknown representation '${REP}'. Use 'splat' or 'nerf'."
@@ -40,10 +45,12 @@ case "${REP}" in
         ;;
 esac
 
-# ── Auto-select least-busy GPU ───────────────────────────────────────────────
-echo "[refine.sh] Selecting best available GPU..."
-GPU_ID=$(python scripts/pick_gpu.py 2>/dev/null | tail -1 || echo "0")
-export CUDA_VISIBLE_DEVICES="${GPU_ID}"
+# ── Auto-select GPU(s) unless CUDA_VISIBLE_DEVICES is already set ────────────
+if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    echo "[refine.sh] Selecting ${NUM_GPUS} best available GPU(s)..."
+    GPU_IDS=$(python scripts/pick_gpu.py "${NUM_GPUS}" 2>/dev/null | tail -1 || echo "0")
+    export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
+fi
 
 echo "============================================"
 echo " Refinement: ${METHOD}"
@@ -52,8 +59,7 @@ echo " Data:       ${DATA_DIR}"
 echo " Iters:      ${MAX_ITERS}"
 echo " Tgt:        ${TGT_PROMPT}"
 echo " Load from:  ${LOAD_DIR}"
-echo " GPU idx:    ${CUDA_VISIBLE_DEVICES}"
-echo " GPU name:   $(nvidia-smi -i "${CUDA_VISIBLE_DEVICES}" --query-gpu=name --format=csv,noheader,nounits 2>/dev/null || echo 'unknown')"
+echo " GPUs:       ${CUDA_VISIBLE_DEVICES}"
 echo "============================================"
 
 if [ ! -f "${DATA_DIR}/transforms.json" ]; then
@@ -67,14 +73,22 @@ if [ ! -d "${LOAD_DIR}" ]; then
     exit 1
 fi
 
-ns-train "${METHOD}" \
+# ── Build ns-train command ────────────────────────────────────────────────────
+CMD=(ns-train "${METHOD}" \
     --max-num-iterations "${MAX_ITERS}" \
     --mixed-precision False \
     --vis tensorboard \
     --experiment-name "${SCENE}" \
     --data "${DATA_DIR}" \
     --load-dir "${LOAD_DIR}" \
-    --pipeline.dc.tgt-prompt "${TGT_PROMPT}"
+    --pipeline.dc.tgt-prompt "${TGT_PROMPT}")
+
+# For NeRF: offload diffusion model to second GPU
+if [ "${NUM_GPUS}" -ge 2 ]; then
+    CMD+=(--pipeline.dc-device cuda:1)
+fi
+
+"${CMD[@]}"
 
 echo ""
 echo "============================================"

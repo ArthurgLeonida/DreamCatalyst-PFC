@@ -3,10 +3,12 @@
 #  DreamCatalyst-NS — Training script (Step 2: initialization)
 # ==============================================================================
 #  Usage:
-#    bash scripts/train.sh bicycle                    # splatfacto, 500 iters (quick test)
-#    bash scripts/train.sh bicycle 30000              # splatfacto, full training
-#    bash scripts/train.sh bicycle 30000 2            # splatfacto + 2x downscale
-#
+#    bash scripts/train.sh bicycle                       # splatfacto, 500 iters (quick test)
+#    bash scripts/train.sh bicycle 30000                 # splatfacto, full training
+#    bash scripts/train.sh bicycle 30000 2               # splatfacto + 2x downscale
+#    bash scripts/train.sh bicycle 30000 auto nerfacto  # nerfacto, full training
+#    bash scripts/train.sh bicycle 30000 2 nerfacto     # nerfacto + 2x downscale
+
 #  This script is for initialization only (splatfacto / nerfacto).
 #  For editing (Step 3), use:  bash scripts/edit.sh
 #  For refinement (Step 4), use:  bash scripts/refine.sh
