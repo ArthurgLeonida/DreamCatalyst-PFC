@@ -3,21 +3,42 @@
 #  DreamCatalyst-NS — Refinement script (Step 4: SDEdit)
 # ==============================================================================
 #  Usage:
-#    bash scripts/refine.sh <scene> <tgt_prompt> <load_dir> [max_iters]
+#    bash scripts/refine.sh <scene> <tgt_prompt> <load_dir> [max_iters] [rep]
 #
-#  Example:
+#  rep: splat (default) or nerf
+#
+#  Examples:
 #    bash scripts/refine.sh bicycle \
 #        "a photo of a motorcycle leaning against a bench" \
 #        outputs/bicycle/dc_splat/2026-03-06_120000/nerfstudio_models/
+#
+#    bash scripts/refine.sh bicycle \
+#        "a photo of a motorcycle" \
+#        outputs/bicycle/dc/.../nerfstudio_models/ 15000 nerf
 # ==============================================================================
 
 set -euo pipefail
 
-SCENE="${1:?Usage: $0 <scene> <tgt_prompt> <load_dir> [max_iters]}"
+SCENE="${1:?Usage: $0 <scene> <tgt_prompt> <load_dir> [max_iters] [rep]}"
 TGT_PROMPT="${2:?Missing tgt_prompt}"
-LOAD_DIR="${3:?Missing load_dir (path to dc_splat nerfstudio_models/)}"
+LOAD_DIR="${3:?Missing load_dir (path to edited model nerfstudio_models/)}"
 MAX_ITERS="${4:-30000}"
+REP="${5:-splat}"        # splat | nerf
 DATA_DIR="data/${SCENE}_processed"
+
+# ── Resolve method from representation ────────────────────────────────────────
+case "${REP}" in
+    splat|3dgs|gaussian)
+        METHOD="dc_splat_refinement"
+        ;;
+    nerf|nerfacto)
+        METHOD="dc_refinement"
+        ;;
+    *)
+        echo "ERROR: Unknown representation '${REP}'. Use 'splat' or 'nerf'."
+        exit 1
+        ;;
+esac
 
 # ── Auto-select least-busy GPU ───────────────────────────────────────────────
 echo "[refine.sh] Selecting best available GPU..."
@@ -25,7 +46,7 @@ GPU_ID=$(python scripts/pick_gpu.py 2>/dev/null | tail -1 || echo "0")
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 
 echo "============================================"
-echo " Refinement: dc_splat_refinement"
+echo " Refinement: ${METHOD}"
 echo " Scene:      ${SCENE}"
 echo " Data:       ${DATA_DIR}"
 echo " Iters:      ${MAX_ITERS}"
@@ -46,21 +67,17 @@ if [ ! -d "${LOAD_DIR}" ]; then
     exit 1
 fi
 
-ns-train dc_splat_refinement \
+ns-train "${METHOD}" \
     --max-num-iterations "${MAX_ITERS}" \
     --mixed-precision False \
     --vis tensorboard \
     --experiment-name "${SCENE}" \
+    --data "${DATA_DIR}" \
     --load-dir "${LOAD_DIR}" \
-    --pipeline.dc.tgt-prompt "${TGT_PROMPT}" \
-    --optimizers.xyz.optimizer.lr 1.6e-5 \
-    --optimizers.scaling.optimizer.lr 0.001 \
-    --optimizers.opacity.optimizer.lr 0.01 \
-    pipeline.datamanager:dc-splat-data-manager-config \
-        --pipeline.datamanager.dataparser.data "${DATA_DIR}"
+    --pipeline.dc.tgt-prompt "${TGT_PROMPT}"
 
 echo ""
 echo "============================================"
 echo " Refinement complete!"
-echo " Outputs in: outputs/${SCENE}/dc_splat_refinement/<timestamp>/"
+echo " Outputs in: outputs/${SCENE}/${METHOD}/<timestamp>/"
 echo "============================================"
