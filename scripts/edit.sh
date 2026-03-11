@@ -93,9 +93,15 @@ CMD=(ns-train "${METHOD}" \
     --pipeline.dc.guidance-scale 7.5 \
     --pipeline.dc.sd-pretrained-model-or-path timbrooks/instruct-pix2pix)
 
-# For NeRF: offload diffusion model to second GPU
-if [ "${NUM_GPUS}" -ge 2 ]; then
+# For NeRF: offload diffusion model to second GPU if available
+# Count how many GPUs are actually visible (comma-separated list)
+ACTUAL_GPUS=$(echo "${CUDA_VISIBLE_DEVICES}" | tr ',' '\n' | wc -l)
+if [ "${NUM_GPUS}" -ge 2 ] && [ "${ACTUAL_GPUS}" -ge 2 ]; then
     CMD+=(--pipeline.dc-device cuda:1)
+elif [ "${NUM_GPUS}" -ge 2 ] && [ "${ACTUAL_GPUS}" -lt 2 ]; then
+    echo "WARNING: NeRF editing needs 2 GPUs but only ${ACTUAL_GPUS} available."
+    echo "         This will likely OOM. Set CUDA_VISIBLE_DEVICES=X,Y manually."
+    echo "         Proceeding on single GPU anyway..."
 fi
 
 "${CMD[@]}"

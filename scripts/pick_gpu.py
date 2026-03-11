@@ -46,9 +46,9 @@ def pick_idle_gpus(
     """
     gpus = _query_gpus()
 
-    # Prefer idle GPUs, fall back to all
+    # Prefer idle GPUs; fall back to all if not enough idle ones
     idle = [g for g in gpus if g[1] < mem_threshold_mb and g[2] < util_threshold_pct]
-    candidates = idle or gpus
+    candidates = idle if len(idle) >= n else gpus
 
     ranked = sorted(candidates, key=lambda x: (x[1], x[2]))
     selected = ranked[:n]
