@@ -49,6 +49,14 @@ class DCConfig:
     adaptive_tag: bool = False
     asymmetric_tag: bool = False
 
+    # Conflict-Free Guidance — project out conflicting component of eps_tgt
+    conflict_free: bool = False
+
+    # STG (Self-attention skip guidance) — replace CFG with structure-preserving perturbation
+    stg_enabled: bool = False
+    stg_scale: float = 1.0
+    stg_skip_layers: List[int] = field(default_factory=lambda: [1, 2])
+
 
 class DC(object):
     def __init__(self, config: DCConfig, use_wandb=False):
@@ -159,6 +167,34 @@ class DC(object):
                 self.tgt_prompt = tgt_prompt
                 self.tgt_text_feature = self.encode_text(tgt_prompt)
 
+    def _run_unet_with_skipped_attn(self, latent_model_input, t, text_embeddings):
+        """Run UNet forward pass with self-attention zeroed out in selected up_blocks.
+        This produces the 'weak model' prediction for STG.
+        Hooks are always removed in finally block."""
+        hooks = []
+        try:
+            for layer_idx in self.config.stg_skip_layers:
+                block = self.unet.up_blocks[layer_idx]
+                if not hasattr(block, "attentions"):
+                    continue
+                for attn_module in block.attentions:
+                    for transformer_block in attn_module.transformer_blocks:
+                        hook = transformer_block.attn1.register_forward_hook(
+                            lambda m, inp, out: torch.zeros_like(out)
+                        )
+                        hooks.append(hook)
+
+            with torch.no_grad():
+                output = self.unet.forward(
+                    latent_model_input,
+                    torch.cat([t] * 3).to(self.device),
+                    encoder_hidden_states=text_embeddings,
+                )
+            return output.sample
+        finally:
+            for hook in hooks:
+                hook.remove()
+
     def dc_timestep_sampling(self, batch_size):
         self.scheduler.set_timesteps(self.config.num_inference_steps)
         timesteps = reversed(self.scheduler.timesteps)
@@ -264,6 +300,19 @@ class DC(object):
             if name == "tgt":
                 noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_image) + \
                     self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
+
+                # STG: blend full prediction with weak (self-attn skipped) prediction
+                # eps_stg = eps_weak + stg_scale * (eps_full - eps_weak)
+                # ==============================================================================
+                if self.config.stg_enabled:
+                    weak_pred = self._run_unet_with_skipped_attn(
+                        latent_model_input, t, text_embeddings
+                    )
+                    weak_text, weak_image, weak_uncond = weak_pred.chunk(3)
+                    noise_pred_weak = weak_uncond + self.config.guidance_scale * (weak_text - weak_image) + \
+                        self.config.image_guidance_scale * (weak_image - weak_uncond)
+                    noise_pred = noise_pred_weak + self.config.stg_scale * (noise_pred - noise_pred_weak)
+                # ==============================================================================
             else:
                 noise_pred = noise_pred_uncond + self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
 
@@ -285,7 +334,15 @@ class DC(object):
             eps[name] = noise_pred
             pred_x0s[name] = pred_x0
             noisy_latents[name] = latents_noisy
-           
+
+        # Conflict-Free Guidance: project out component of eps_tgt parallel to eps_src
+        # ====================================================================================
+        if self.config.conflict_free:
+            src_norm_sq = (eps["src"] * eps["src"]).sum(dim=(1, 2, 3), keepdim=True).clamp(min=1e-8)
+            projection = (eps["tgt"] * eps["src"]).sum(dim=(1, 2, 3), keepdim=True) / src_norm_sq
+            eps["tgt"] = eps["tgt"] - projection * eps["src"]
+        # ====================================================================================
+
         self.iteration += 1
         
         w_DDS = self.config.delta + self.config.gamma * (t_normalized ** (1/math.e))

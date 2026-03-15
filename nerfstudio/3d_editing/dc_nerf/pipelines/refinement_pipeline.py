@@ -118,7 +118,12 @@ class RefinementPipeline(ModifiedVanillaPipeline):
                         align_corners=False             # best practice for bilinear
                     )
 
-                self.datamanager.image_batch["image"][current_spot] = edit_img.squeeze().permute(1, 2, 0)  # [H,W,3]
+                # Fix VAE 8-pixel rounding mismatch by cropping to the exact target size
+                target_h, target_w = self.datamanager.image_batch["image"][current_spot].shape[:2]
+                formatted_img = edit_img.squeeze().permute(1, 2, 0)
+                self.datamanager.image_batch["image"][current_spot] = formatted_img[:target_h, :target_w, :]
+
+                # self.datamanager.image_batch["image"][current_spot] = edit_img.squeeze().permute(1, 2, 0)  # [H,W,3]
 
             if step % self.config.log_step == 0:
                 with torch.no_grad():

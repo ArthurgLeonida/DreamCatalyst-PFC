@@ -12,8 +12,8 @@ Pipeline: COLMAP → Nerfstudio splatfacto → DreamCatalyst (DDS editing) → R
 
 ## Key files
 - `nerfstudio/dc/dc.py` — all guidance logic, DDS loss, novelties. This is THE file to edit.
-- `nerfstudio/dc/dc_unet.py` — CustomUNet2DConditionModel (read-only, unless implementing STG hooks).
-- `nerfstudio/dc/tasd_config.py` — TASD novelty params (eta_tag, adaptive_tag, asymmetric_tag). Unpacked into DCConfig via `**DC_CUSTOM_PARAMS`.
+- `nerfstudio/dc/dc_unet.py` — CustomUNet2DConditionModel (read-only). STG hooks are registered dynamically from dc.py, no modification needed.
+- `nerfstudio/dc/tasd_config.py` — TASD novelty params (eta_tag, adaptive_tag, asymmetric_tag, conflict_free, stg_enabled, stg_scale, stg_skip_layers). Unpacked into DCConfig via `**DC_CUSTOM_PARAMS`.
 - `nerfstudio/dc/utils/free_lunch.py` — FreeU registration.
 - `nerfstudio/3d_editing/dc_nerf/dc_config.py` — all method configs (dc_splat, dc_splat_refinement, etc). Imports DC_CUSTOM_PARAMS.
 - `nerfstudio/3d_editing/dc_nerf/pipelines/dc_pipeline.py` — Step 3 editing pipeline.
@@ -54,15 +54,100 @@ Verified changes (original repo has bugs/missing features):
 ## Editing tips (learned from experiments)
 - **Guidance scale**: Default 7.5 may be too weak. 12.5 worked well for material changes.
 - **TAG novelties**: Can cause floaters. Disable (`eta_tag=1.0`) when debugging other issues. Re-enable gradually (1.05 → 1.10 → 1.15).
+- **NeRF (dc) memory**: NeRF editing needs ~77 GiB VRAM for differentiable full-image rendering + IP2P. Use `--pipeline.dc-device cuda:1` to offload diffusion to a second GPU, or use 3DGS (dc_splat) which is more memory-efficient.
+- **STG**: Adds ~50% per-iteration time. Start with `stg_scale=1.0` and `stg_skip_layers=[1, 2]`.
+- **Conflict-Free**: Zero overhead. Safe to always enable as a first experiment.
 
 ## Novelties (TASD)
-Five modifications to DDS guidance in dc.py. See `docs/TASD_implementation_guide.md` for full details.
 
-1. **TAG in SDS/DDS** [DONE] — tangential amplification of noise_pred after CFG. Config: `eta_tag`. Based on: TAG (Cho et al., arXiv 2510.04533, Seungryong Kim's lab @ KAIST).
-2. **Adaptive TAG** [DONE] — anneal η with `t_normalized`. Config: `adaptive_tag`. Original contribution inspired by TAG §6.
-3. **Asymmetric TAG** [DONE] — apply TAG only to target branch. Config: `asymmetric_tag`. Original contribution.
-4. **STG** [TODO] — skip self-attention in up_blocks for weak-model guidance. Config: `stg_enabled`. Based on: STG (Hyung et al., CVPR 2025, Jaegul Choo's lab @ KAIST).
-5. **Conflict-Free Guidance** [TODO] — project out conflicting text/image guidance. Config: `conflict_free`. Based on: Devil in Detail (Jo et al., CVPR 2025, Jaegul Choo's lab @ KAIST).
+Modifications to DDS guidance in `dc.py`. Novelties N1–N5 are done; N6–N9 are TODO in priority order.
+
+---
+
+### ✅ DONE
+
+1. **TAG in DDS** [DONE] — tangential amplification of `noise_pred` after CFG.
+   * **Config:** `eta_tag` (default 1.0 = no-op).
+   * **Based on:** TAG (Cho et al., arXiv 2510.04533, Seungryong Kim's lab @ KAIST).
+
+2. **Adaptive TAG** [DONE] — anneal η with `t_normalized` over training.
+   * **Config:** `adaptive_tag` (default False).
+   * Original contribution inspired by TAG §6.
+
+3. **Asymmetric TAG** [DONE] — apply TAG only to `eps_tgt`, not `eps_src`.
+   * **Config:** `asymmetric_tag` (default False).
+   * Original contribution. Preserves source branch identity signal.
+
+4. **STG** [DONE] — skip self-attention in `up_blocks` for implicit weak-model guidance. Replaces or augments CFG with a structure-preserving perturbation.
+   * **Config:** `stg_enabled` (default False), `stg_scale` (default 1.0), `stg_skip_layers` (default [1, 2]).
+   * **Implementation:** `_run_unet_with_skipped_attn()` registers forward hooks on `unet.up_blocks[i].attentions[j].transformer_blocks[k].attn1` that zero out self-attn output. Runs a second "weak" UNet pass, then blends: `eps_stg = eps_weak + stg_scale*(eps_full - eps_weak)`. Applied ONLY to `eps_tgt`. Hooks cleaned up in `finally` block.
+   * **Based on:** STG (Hyung et al., CVPR 2025, Jaegul Choo's lab @ KAIST).
+   * ⚠️ Only works with IP2P (Step 3). Do NOT apply in `run_sdedit`.
+   * ⚠️ Adds ~50% per-iteration time (extra UNet forward pass, but `torch.no_grad()`).
+
+5. **Conflict-Free Guidance** [DONE] — project out the component of `eps_tgt` that is parallel (conflicting) to `eps_src` before computing the DDS delta.
+   * **Config:** `conflict_free` (default False).
+   * **Implementation:** after the tgt/src loop, before gradient computation: `eps_tgt = eps_tgt - (dot(eps_tgt, eps_src) / dot(eps_src, eps_src)) * eps_src`. Applied after TAG (both branches computed first, then conflict removal).
+   * **Based on:** Devil in Detail (Jo et al., CVPR 2025, Jaegul Choo's lab @ KAIST).
+
+---
+
+### 🟡 TODO — Medium Priority (professor's recommended papers)
+
+6. **Depth Regularization** [TODO] — add a monocular depth consistency loss to the DreamCatalyst loss `L_DC` to anchor Gaussian positions during editing. Prevents floaters introduced by TAG at high η.
+   * **Config:** `depth_reg_weight` (default 0.0), `depth_model` (default `"midas"`).
+   * **Implementation:** in `dc.py` loss computation, load MiDaS depth prediction for the current render and add `depth_reg_weight * L1(depth_pred, depth_anchor)` where `depth_anchor` is computed once from the original unedited scene.
+   * **Based on:** Depth-Regularized Optimization for 3DGS (Chung et al., CVPRW 2024).
+   * ⚠️ Adds ~1.2s per iteration. Use `depth_reg_freq=10` (every 10 iters) to amortize.
+
+7. **3D-GALP Part Masking** [TODO] — restrict DDS gradient to Gaussians that belong to the target semantic region, leaving background untouched.
+   * **Config:** `galp_enabled` (default False), `galp_seg_prompt` (str, e.g. `"face"`).
+   * **Implementation:** run a zero-shot segmentation (e.g. Grounded-SAM) on the source render to get a 2D mask per camera. Project mask into 3D via splatting opacity weights to identify "target Gaussians". Zero out `∇θ L_DC` for non-target Gaussians before the Adam step.
+   * **Based on:** RoMaP (Kim, Jang & Chun, 2025).
+   * ⚠️ Requires `groundingdino` + `segment-anything` in the env. Heavy dependency.
+   * ⚠️ 200 MB VRAM overhead. Run with `--pipeline.datamanager.train-num-rays-per-batch 2048`.
+
+8. **GAP³D Cross-View Attention Prior** [TODO] — enforce multi-view consistency by injecting cross-attention keys/values from a second camera view into the current view's UNet forward pass during guidance.
+   * **Config:** `gap3d_enabled` (default False), `gap3d_num_views` (default 4).
+   * **Implementation:** at each iteration, sample `gap3d_num_views` additional cameras, render and encode them, then patch `unet.up_blocks` cross-attention to attend over the multi-view feature set. This requires modifying `dc_unet.py` (the one read-only file — make a backup first).
+   * **Based on:** InterGSEdit (Wen et al., 2025).
+   * ⚠️ 300 MB VRAM overhead per extra view. Start with `gap3d_num_views=2`.
+   * ⚠️ Most complex novelty. Implement AFTER N4–N7 are validated.
+
+---
+
+### 🟢 TODO — Low Priority (optional, bonus contribution)
+
+9. **Anchor L1 Loss (RoMaP-style)** [TODO] — add a part-level L1 anchor term that penalizes deviation of edited Gaussians from their original positions, preventing over-deformation of geometry during aggressive edits.
+   * **Config:** `anchor_l1_weight` (default 0.0), `anchor_l1_region` (`"full"` or `"background"`).
+   * **Implementation:** cache `theta_0` (original Gaussian positions `mu_i`) before training starts. Add `anchor_l1_weight * mean(|mu_i - mu_i_0|)` to `L_DC`. When `galp_enabled=True`, apply only to non-target Gaussians (background anchor).
+   * **Based on:** RoMaP (Kim, Jang & Chun, 2025).
+   * ⚠️ Much simpler than N7 (3D-GALP). Can be implemented independently in ~20 lines.
+
+---
+
+### Implementation Order Recommendation
+
+1. ~~N4 (STG) + N5 (Conflict-Free)~~ [DONE]
+2. N6 (Depth Reg) + N9 (Anchor L1) [lightweight losses]
+3. N7 (3D-GALP masking) [needs Grounded-SAM setup]
+4. N8 (GAP³D) [most complex, needs dc_unet.py edit]
+
+---
+
+### 📚 Related Work (NOT dc.py novelties — cite in thesis only)
+
+**OmniSplat** (Lee et al., arXiv 2412.16604, Kyoung Mu Lee's lab @ SNU) 
+
+What it is: Feed-forward 3DGS reconstruction from omnidirectional (360°) images using Yin-Yang grid decomposition to bridge the domain gap with perspective-trained encoders. Relevance to your project: NOT applicable as a dc.py novelty. Your pipeline uses perspective images + COLMAP + nerfstudio. OmniSplat replaces Steps 1-2 entirely. 
+
+Cite in: Chapter 2 (Related Work §2.1), Chapter 7 (Future Work — 360° capture).
+
+**C3G** (An, Jung et al., KAIST AI, 2025, Seungryong Kim's lab — same as TAG)
+
+What it is: Compact 3DGS using only 2K learnable query tokens instead of per-pixel Gaussians. 65× fewer Gaussians, lower VRAM, competitive reconstruction quality. Includes C3G-F for view-invariant feature lifting without autoencoder compression. Relevance to your project: NOT applicable as a dc.py novelty, but highly relevant as a future pipeline evolution. Running DDS editing on 2K compact Gaussians instead of millions would: (a) reduce floater risk, (b) make N9 Anchor L1 trivial, (c) make N8 GAP³D unnecessary since C3G-F already provides view-invariant features. Same lab as TAG (N1) — strengthens the KAIST-connection narrative of your thesis.
+
+Cite in: Chapter 2 (Related Work §2.1), Chapter 7 (Future Work — compact base repr).
 
 ## Build gotchas
 - System nvcc 12.4 vs PyTorch CUDA 11.8 → CUDA_HOME must point to conda env.

@@ -37,10 +37,12 @@ case "${REP}" in
     splat|3dgs|gaussian)
         METHOD="dc_splat"
         NUM_GPUS=1
+        DM_CONFIG="dc-splat-data-manager-config"
         ;;
     nerf|nerfacto)
         METHOD="dc"
-        NUM_GPUS=2       # NeRF needs 2 GPUs: model + diffusion
+        NUM_GPUS=1       # 80GB H100 can easily fit both!
+        DM_CONFIG="dc-data-manager-config"
         ;;
     *)
         echo "ERROR: Unknown representation '${REP}'. Use 'splat' or 'nerf'."
@@ -90,8 +92,11 @@ CMD=(ns-train "${METHOD}" \
     --pipeline.dc.src-prompt "${SRC_PROMPT}" \
     --pipeline.dc.tgt-prompt "${TGT_PROMPT}" \
     --pipeline.dc.max-iteration "${MAX_ITERS}" \
-    --pipeline.dc.guidance-scale 7.5 \
-    --pipeline.dc.sd-pretrained-model-or-path timbrooks/instruct-pix2pix)
+    --pipeline.dc.guidance-scale 12.5 \
+    --pipeline.dc-device "cuda:0" \
+    --pipeline.dc.sd-pretrained-model-or-path timbrooks/instruct-pix2pix \
+    pipeline.datamanager:"${DM_CONFIG}" \
+    --pipeline.datamanager.dataparser.downscale-factor 2)
 
 # For NeRF: offload diffusion model to second GPU if available
 # Count how many GPUs are actually visible (comma-separated list)

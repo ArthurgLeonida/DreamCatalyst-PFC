@@ -47,7 +47,8 @@ bash scripts/edit.sh bicycle \
     "a photo of a motorcycle leaning against a bench" \
     outputs/bicycle/splatfacto/<timestamp>/nerfstudio_models/ \
     3000
-# Usage: bash scripts/edit.sh <scene> <src_prompt> <tgt_prompt> <load_dir> [max_iters]
+# Usage: bash scripts/edit.sh <scene> <src_prompt> <tgt_prompt> <load_dir> [max_iters] [rep]
+# rep: splat (default) or nerf
 # Default: 3000 iterations
 ```
 
@@ -123,8 +124,8 @@ This project extends DreamCatalyst's DDS guidance with modifications to the nois
 | 1 | **TAG** | `eta_tag=1.15` | Amplifies the tangential component of the noise prediction relative to the noisy latent, improving detail and reducing oversaturation. Based on TAG (Cho et al., 2024). `eta_tag=1.0` disables it. | Done |
 | 2 | **Adaptive TAG** | `adaptive_tag=True` | Anneals η from `eta_tag` at high noise to 1.0 at low noise: `η(t) = 1 + (eta_tag - 1) * t_normalized`. Stronger amplification when the signal is noisiest, tapering off as denoising progresses. Original contribution. | Done |
 | 3 | **Asymmetric TAG** | `asymmetric_tag=True` | Applies TAG only to the target branch of DDS, leaving the source branch unmodified (`η=1.0`). This amplifies the editing direction without disturbing source reconstruction. Original contribution. | Done |
-| 4 | **STG** | `stg_enabled` | Skips self-attention in UNet up_blocks for classifier-free guidance without a negative prompt. Based on STG (Hyung et al., CVPR 2025). | TODO |
-| 5 | **Conflict-Free Guidance** | `conflict_free` | Projects out conflicting components between text and image guidance vectors. Based on Devil in Detail (Jo et al., CVPR 2025). | TODO |
+| 4 | **STG** | `stg_enabled=True` | Runs a second "weak" UNet pass with self-attention zeroed out in selected up_blocks, then blends: `eps = eps_weak + stg_scale * (eps_full - eps_weak)`. Applied only to target branch. Based on STG (Hyung et al., CVPR 2025). | Done |
+| 5 | **Conflict-Free Guidance** | `conflict_free=True` | Projects out the component of `eps_tgt` parallel to `eps_src` before the DDS delta, making the two guidance signals orthogonal. Based on Devil in Detail (Jo et al., CVPR 2025). | Done |
 
 ```python
 # nerfstudio/dc/tasd_config.py
@@ -132,6 +133,10 @@ DC_CUSTOM_PARAMS = dict(
     eta_tag=1.15,         # 1.0 = disabled
     adaptive_tag=True,    # anneal η with timestep
     asymmetric_tag=True,  # TAG only on target branch
+    conflict_free=False,  # project out conflicting components
+    stg_enabled=False,    # self-attention skip guidance
+    stg_scale=1.0,        # STG blend strength
+    stg_skip_layers=[1, 2],  # which up_blocks to skip
 )
 ```
 
