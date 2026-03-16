@@ -81,13 +81,6 @@ def render_all_views(config_path, device):
     Returns list of (rendered_image_tensor, gt_image_tensor) pairs.
     rendered images are [1,C,H,W] in [0,1].
     """
-    import yaml
-
-    # Load config to find data path and model
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
-
-    # Use ns-process to load the pipeline
     from nerfstudio.utils.eval_utils import eval_setup
     _, pipeline, _, _ = eval_setup(Path(config_path))
     pipeline.eval()

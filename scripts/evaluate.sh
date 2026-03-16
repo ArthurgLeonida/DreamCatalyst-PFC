@@ -10,10 +10,10 @@
 #
 #  Examples:
 #    bash scripts/evaluate.sh \
-#        outputs/bicycle/dc_splat/2026-03-11_025213/config.yml \
-#        "a photo of a bicycle" \
-#        "a photo of a motorcycle" \
-#        eval_results/bicycle_fulltag_1.1
+#        outputs/face/dc/2026-03-12_062915/config.yml \
+#        "a photo of a face" \
+#        "Turn him into the Tolkien Elf" \
+#        eval_results/face_fulltag_1.1
 #
 #    bash scripts/evaluate.sh --compare \
 #        eval_results/bicycle_fulltag_1.1 \
