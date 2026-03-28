@@ -7,8 +7,8 @@ DC_CUSTOM_PARAMS = dict(
     eta_tag=1.0,
     adaptive_tag=False,
     asymmetric_tag=False,
-    # Conflict-Free Guidance (project out conflicting component)
-    conflict_free=False,
+    # Perpendicular Gradient Projection (Perp-Neg) — orthogonalize eps_tgt w.r.t. eps_src
+    perp_neg=False,
     # STG (Self-attention skip guidance)
     stg_enabled=False,
     stg_scale=1.0,

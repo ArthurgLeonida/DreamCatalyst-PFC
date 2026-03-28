@@ -13,7 +13,7 @@ Pipeline: COLMAP → Nerfstudio splatfacto → DreamCatalyst (DDS editing) → R
 ## Key files
 - `nerfstudio/dc/dc.py` — all guidance logic, DDS loss, novelties. This is THE file to edit.
 - `nerfstudio/dc/dc_unet.py` — CustomUNet2DConditionModel (read-only). STG hooks are registered dynamically from dc.py, no modification needed.
-- `nerfstudio/dc/tasd_config.py` — TASD novelty params (eta_tag, adaptive_tag, asymmetric_tag, conflict_free, stg_enabled, stg_scale, stg_skip_layers). Unpacked into DCConfig via `**DC_CUSTOM_PARAMS`.
+- `nerfstudio/dc/tasd_config.py` — TASD novelty params (eta_tag, adaptive_tag, asymmetric_tag, perp_neg, stg_enabled, stg_scale, stg_skip_layers). Unpacked into DCConfig via `**DC_CUSTOM_PARAMS`.
 - `nerfstudio/dc/utils/free_lunch.py` — FreeU registration.
 - `nerfstudio/3d_editing/dc_nerf/dc_config.py` — all method configs (dc_splat, dc_splat_refinement, etc). Imports DC_CUSTOM_PARAMS.
 - `nerfstudio/3d_editing/dc_nerf/pipelines/dc_pipeline.py` — Step 3 editing pipeline.
@@ -56,7 +56,7 @@ Verified changes (original repo has bugs/missing features):
 - **TAG novelties**: Can cause floaters. Disable (`eta_tag=1.0`) when debugging other issues. Re-enable gradually (1.05 → 1.10 → 1.15).
 - **NeRF (dc) memory**: NeRF editing needs ~77 GiB VRAM for differentiable full-image rendering + IP2P. Use `--pipeline.dc-device cuda:1` to offload diffusion to a second GPU, or use 3DGS (dc_splat) which is more memory-efficient.
 - **STG**: Adds ~50% per-iteration time. Start with `stg_scale=1.0` and `stg_skip_layers=[1, 2]`.
-- **Conflict-Free**: Zero overhead. Safe to always enable as a first experiment.
+- **Perp-Neg**: Zero overhead. Safe to always enable as a first experiment.
 
 ## Novelties (TASD)
 
@@ -85,10 +85,11 @@ Modifications to DDS guidance in `dc.py`. Novelties N1–N5 are done; N6–N9 ar
    * ⚠️ Only works with IP2P (Step 3). Do NOT apply in `run_sdedit`.
    * ⚠️ Adds ~50% per-iteration time (extra UNet forward pass, but `torch.no_grad()`).
 
-5. **Conflict-Free Guidance** [DONE] — project out the component of `eps_tgt` that is parallel (conflicting) to `eps_src` before computing the DDS delta.
-   * **Config:** `conflict_free` (default False).
-   * **Implementation:** after the tgt/src loop, before gradient computation: `eps_tgt = eps_tgt - (dot(eps_tgt, eps_src) / dot(eps_src, eps_src)) * eps_src`. Applied after TAG (both branches computed first, then conflict removal).
-   * **Based on:** Devil in Detail (Jo et al., CVPR 2025, Jaegul Choo's lab @ KAIST).
+5. **Perpendicular Gradient Projection (Perp-Neg)** [DONE] — Gram-Schmidt orthogonalization of `eps_tgt` w.r.t. `eps_src` before computing the DDS delta. Forces the editing signal to be perpendicular to the source identity signal, preventing the edit from destroying underlying geometry.
+   * **Config:** `perp_neg` (default False).
+   * **Implementation:** after the tgt/src loop, before gradient computation: `eps_tgt = eps_tgt - (dot(eps_tgt, eps_src) / dot(eps_src, eps_src)) * eps_src`. Applied after TAG (both branches computed first, then projection).
+   * **Based on:** PCGrad (Yu et al., NeurIPS 2020) — conflicting gradient projection for multi-task learning; adapted to diffusion guidance by Perp-Neg (Armandpour et al., ICML 2023).
+   * ⚠️ Previously misattributed to "Devil in Detail" (Jo et al., CVPR 2025), which proposes a different technique (excluding image prompts from negative CFG branch in self-attention KV injection for 2D image prompting — unrelated to DDS gradient projection).
 
 ---
 
@@ -128,7 +129,7 @@ Modifications to DDS guidance in `dc.py`. Novelties N1–N5 are done; N6–N9 ar
 
 ### Implementation Order Recommendation
 
-1. ~~N4 (STG) + N5 (Conflict-Free)~~ [DONE]
+1. ~~N4 (STG) + N5 (Perp-Neg)~~ [DONE]
 2. N6 (Depth Reg) + N9 (Anchor L1) [lightweight losses]
 3. N7 (3D-GALP masking) [needs Grounded-SAM setup]
 4. N8 (GAP³D) [most complex, needs dc_unet.py edit]

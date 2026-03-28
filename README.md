@@ -125,7 +125,7 @@ This project extends DreamCatalyst's DDS guidance with modifications to the nois
 | 2 | **Adaptive TAG** | `adaptive_tag=True` | Anneals η from `eta_tag` at high noise to 1.0 at low noise: `η(t) = 1 + (eta_tag - 1) * t_normalized`. Stronger amplification when the signal is noisiest, tapering off as denoising progresses. Original contribution. | Done |
 | 3 | **Asymmetric TAG** | `asymmetric_tag=True` | Applies TAG only to the target branch of DDS, leaving the source branch unmodified (`η=1.0`). This amplifies the editing direction without disturbing source reconstruction. Original contribution. | Done |
 | 4 | **STG** | `stg_enabled=True` | Runs a second "weak" UNet pass with self-attention zeroed out in selected up_blocks, then blends: `eps = eps_weak + stg_scale * (eps_full - eps_weak)`. Applied only to target branch. Based on STG (Hyung et al., CVPR 2025). | Done |
-| 5 | **Conflict-Free Guidance** | `conflict_free=True` | Projects out the component of `eps_tgt` parallel to `eps_src` before the DDS delta, making the two guidance signals orthogonal. Based on Devil in Detail (Jo et al., CVPR 2025). | Done |
+| 5 | **Perpendicular Gradient Projection** | `perp_neg=True` | Gram-Schmidt orthogonalization of `eps_tgt` w.r.t. `eps_src` before the DDS delta, making the two guidance signals perpendicular. Based on PCGrad (Yu et al., NeurIPS 2020) and Perp-Neg (Armandpour et al., ICML 2023). | Done |
 
 ```python
 # nerfstudio/dc/tasd_config.py
@@ -133,7 +133,7 @@ DC_CUSTOM_PARAMS = dict(
     eta_tag=1.15,         # 1.0 = disabled
     adaptive_tag=True,    # anneal η with timestep
     asymmetric_tag=True,  # TAG only on target branch
-    conflict_free=False,  # project out conflicting components
+    perp_neg=False,       # perpendicular gradient projection (orthogonalize eps_tgt w.r.t. eps_src)
     stg_enabled=False,    # self-attention skip guidance
     stg_scale=1.0,        # STG blend strength
     stg_skip_layers=[1, 2],  # which up_blocks to skip
@@ -176,10 +176,17 @@ DC_CUSTOM_PARAMS = dict(
   year      = {2025},
 }
 
-@inproceedings{jo2025devil,
-  title     = {Devil in the Details: Towards Conflict-Free Guidance for Image Editing},
-  author    = {Seonho Jo and Jaegul Choo},
-  booktitle = {CVPR},
-  year      = {2025},
+@inproceedings{yu2020pcgrad,
+  title     = {Gradient Surgery for Multi-Task Learning},
+  author    = {Tianhe Yu and Saurabh Kumar and Abhishek Gupta and Sergey Levine and Karol Hausman and Chelsea Finn},
+  booktitle = {NeurIPS},
+  year      = {2020},
+}
+
+@inproceedings{armandpour2023perpneg,
+  title     = {Re-imagine the Negative Prompt Algorithm: Transform 2D Diffusion into 3D, alleviate Janus Problem and Beyond},
+  author    = {Mohammadreza Armandpour and Ali Sadeghian and Huangjie Zheng and Amir Sadeghian and Mingyuan Zhou},
+  booktitle = {ICML},
+  year      = {2023},
 }
 ```

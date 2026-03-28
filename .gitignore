@@ -27,10 +27,12 @@ eggs/
 outputs/
 exports/
 renders/
+eval_results/
 
 # Other files
 *.pdf
 *.out
+docs/
 
 # OS / editor
 .DS_Store

@@ -49,8 +49,8 @@ class DCConfig:
     adaptive_tag: bool = False
     asymmetric_tag: bool = False
 
-    # Conflict-Free Guidance — project out conflicting component of eps_tgt
-    conflict_free: bool = False
+    # Perpendicular Gradient Projection (Perp-Neg) — orthogonalize eps_tgt w.r.t. eps_src
+    perp_neg: bool = False
 
     # STG (Self-attention skip guidance) — replace CFG with structure-preserving perturbation
     stg_enabled: bool = False
@@ -283,10 +283,18 @@ class DC(object):
 
             src_encoded = src_emb.latent_dist.mode()
             
+            # STARTING SHAPES: [1, 4, 64, 64]
             uncond_image_latent = torch.zeros_like(src_encoded)
+            # SHAPE: [1, 4, 64, 64] (But filled entirely with 0s)
+            
             latent_image = torch.cat([src_encoded, src_encoded, uncond_image_latent], dim=0)
-            latent_model_input = torch.cat([latents_noisy] * 3, dim=0)
+            # SHAPE: [3, 4, 64, 64] (Stack of 3 condition images)
+            
+            latent_model_input = torch.cat([latents_noisy] * 3, dim=0) 
+            # SHAPE: [3, 4, 64, 64] (Stack of 3 noisy images)
+            
             latent_model_input = torch.cat([latent_model_input, latent_image], dim=1)
+            # FINAL SHAPE: [3, 8, 64, 64] (The mutant InstructPix2Pix tensor ready for the U-Net!) 
 
             unet_outputs = self.unet.forward(
                 latent_model_input,
@@ -335,9 +343,9 @@ class DC(object):
             pred_x0s[name] = pred_x0
             noisy_latents[name] = latents_noisy
 
-        # Conflict-Free Guidance: project out component of eps_tgt parallel to eps_src
+        # Perpendicular Gradient Projection (Perp-Neg): orthogonalize eps_tgt w.r.t. eps_src
         # ====================================================================================
-        if self.config.conflict_free:
+        if self.config.perp_neg:
             src_norm_sq = (eps["src"] * eps["src"]).sum(dim=(1, 2, 3), keepdim=True).clamp(min=1e-8)
             projection = (eps["tgt"] * eps["src"]).sum(dim=(1, 2, 3), keepdim=True) / src_norm_sq
             eps["tgt"] = eps["tgt"] - projection * eps["src"]
