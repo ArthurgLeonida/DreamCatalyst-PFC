@@ -33,6 +33,7 @@ eval_results/
 *.pdf
 *.out
 docs/
+scripts/fill_anteprojeto.py
 
 # OS / editor
 .DS_Store

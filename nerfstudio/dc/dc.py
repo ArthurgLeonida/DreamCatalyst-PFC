@@ -241,7 +241,7 @@ class DC(object):
         # Adaptive TAG: anneal η from eta_tag (high noise) → 1.0 (low noise)
         # ====================================================================================
         if self.config.adaptive_tag:
-            eta_tag_current = 1.0 + (self.config.eta_tag - 1.0) * t_normalized
+            eta_tag_current = 1.0 + (self.config.eta_tag - 1.0) * t_normalized ** (1/math.e) # Maybe test with other exponents too
         else:
             eta_tag_current = self.config.eta_tag
         # ====================================================================================

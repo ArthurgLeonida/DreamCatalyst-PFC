@@ -32,7 +32,7 @@ The original DreamCatalyst uses TWO different diffusion models:
 - **NEVER** change the DCConfig default to IP2P — it breaks refinement.
 
 ## Fixes over original DreamCatalyst repo (https://github.com/kaist-cvml/DreamCatalyst)
-Verified changes (original repo has bugs/missing features):
+Verified changes:
 
 1. **~~Model path mismatch~~** [NOT A BUG — two-model design]: Config default `runwayml/stable-diffusion-v1-5` is intentional for refinement. Step 3 overrides to IP2P via CLI `--pipeline.dc.sd-pretrained-model-or-path timbrooks/instruct-pix2pix`.
 2. **~~`run_sdedit` channel mismatch~~** [NOT A BUG]: `run_sdedit` uses 4-ch input for SD 1.5 refinement. This is correct. Do NOT add image_cond.
@@ -72,7 +72,9 @@ Modifications to DDS guidance in `dc.py`. Novelties N1–N5 are done; N6–N9 ar
 
 2. **Adaptive TAG** [DONE] — anneal η with `t_normalized` over training.
    * **Config:** `adaptive_tag` (default False).
+   * **Formula:** `η(t̂) = 1 + (η_max − 1) · t̂^(1/e)` — concave decay (stays strong longer than linear, drops steeply near end). Exponent `1/e` mirrors DreamCatalyst's own `w_DDS` schedule for natural coupling.
    * Original contribution inspired by TAG §6.
+   * ⚠️ Previously used linear decay `η(t̂) = 1 + (η_max − 1)·t̂`; updated to `t̂^(1/e)` to keep amplification strong during the high-noise (structural) phase and decay later.
 
 3. **Asymmetric TAG** [DONE] — apply TAG only to `eps_tgt`, not `eps_src`.
    * **Config:** `asymmetric_tag` (default False).
@@ -84,12 +86,14 @@ Modifications to DDS guidance in `dc.py`. Novelties N1–N5 are done; N6–N9 ar
    * **Based on:** STG (Hyung et al., CVPR 2025, Jaegul Choo's lab @ KAIST).
    * ⚠️ Only works with IP2P (Step 3). Do NOT apply in `run_sdedit`.
    * ⚠️ Adds ~50% per-iteration time (extra UNet forward pass, but `torch.no_grad()`).
+   * **Future experiment — Adaptive STG scale:** apply the same decay schedule as Adaptive TAG to `stg_scale`. `stg_scale_current = stg_scale * t̂^(1/e)`. STG at full power during late (low-noise) timesteps fights fine-detail sharpening; decaying it mirrors the same intuition as Adaptive TAG.
 
 5. **Perpendicular Gradient Projection (Perp-Neg)** [DONE] — Gram-Schmidt orthogonalization of `eps_tgt` w.r.t. `eps_src` before computing the DDS delta. Forces the editing signal to be perpendicular to the source identity signal, preventing the edit from destroying underlying geometry.
    * **Config:** `perp_neg` (default False).
    * **Implementation:** after the tgt/src loop, before gradient computation: `eps_tgt = eps_tgt - (dot(eps_tgt, eps_src) / dot(eps_src, eps_src)) * eps_src`. Applied after TAG (both branches computed first, then projection).
    * **Based on:** PCGrad (Yu et al., NeurIPS 2020) — conflicting gradient projection for multi-task learning; adapted to diffusion guidance by Perp-Neg (Armandpour et al., ICML 2023).
    * ⚠️ Previously misattributed to "Devil in Detail" (Jo et al., CVPR 2025), which proposes a different technique (excluding image prompts from negative CFG branch in self-attention KV injection for 2D image prompting — unrelated to DDS gradient projection).
+   * **Future experiment — Depth-Masked Perp-Neg:** apply the projection only to foreground (target object) pixels using a depth mask from the NeRF renderer. Nerfacto outputs per-pixel expected depth (volume-rendering weighted sum of sample distances). Threshold it (e.g. `mask = depth < threshold`), resize to `[64, 64]` latent space, then: `eps_tgt = eps_tgt - (projection * eps_src) * mask`. Background pixels (mask=0) are untouched, preserving background identity. Zero extra model cost — depth is already computed every iteration.
 
 ---
 
