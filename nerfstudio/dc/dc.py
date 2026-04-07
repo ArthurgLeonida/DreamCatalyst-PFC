@@ -309,8 +309,9 @@ class DC(object):
                 noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_image) + \
                     self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
 
-                # STG: blend full prediction with weak (self-attn skipped) prediction
-                # eps_stg = eps_weak + stg_scale * (eps_full - eps_weak)
+                # STG: amplify structural signal beyond full model (paper Eq 13)
+                # eps_stg = eps_full + stg_scale * (eps_full - eps_weak)
+                # stg_scale=0 → no effect, stg_scale=1.0 → paper default (STG-R)
                 # ==============================================================================
                 if self.config.stg_enabled:
                     weak_pred = self._run_unet_with_skipped_attn(
@@ -319,7 +320,7 @@ class DC(object):
                     weak_text, weak_image, weak_uncond = weak_pred.chunk(3)
                     noise_pred_weak = weak_uncond + self.config.guidance_scale * (weak_text - weak_image) + \
                         self.config.image_guidance_scale * (weak_image - weak_uncond)
-                    noise_pred = noise_pred_weak + self.config.stg_scale * (noise_pred - noise_pred_weak)
+                    noise_pred = noise_pred + self.config.stg_scale * (noise_pred - noise_pred_weak)
                 # ==============================================================================
             else:
                 noise_pred = noise_pred_uncond + self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
