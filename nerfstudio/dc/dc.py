@@ -54,8 +54,8 @@ class DCConfig:
 
     # STG (Self-attention skip guidance) — replace CFG with structure-preserving perturbation
     stg_enabled: bool = False
-    stg_scale: float = 1.0
-    stg_skip_layers: List[int] = field(default_factory=lambda: [1, 2])
+    stg_scale: float = 0.5
+    stg_skip_layers: List[int] = field(default_factory=lambda: [2])
 
 
 class DC(object):

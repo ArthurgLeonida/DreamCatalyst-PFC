@@ -11,6 +11,6 @@ DC_CUSTOM_PARAMS = dict(
     perp_neg=False,
     # STG (Self-attention skip guidance)
     stg_enabled=False,
-    stg_scale=1.0,
-    stg_skip_layers=[1, 2],
+    stg_scale=0.5,
+    stg_skip_layers=[2],
 )

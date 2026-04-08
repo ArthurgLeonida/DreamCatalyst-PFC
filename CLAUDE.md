@@ -55,7 +55,7 @@ Verified changes:
 - **Guidance scale**: Default 7.5 may be too weak. 12.5 worked well for material changes.
 - **TAG novelties**: Can cause floaters. Disable (`eta_tag=1.0`) when debugging other issues. Re-enable gradually (1.05 → 1.10 → 1.15).
 - **NeRF (dc) memory**: NeRF editing needs ~77 GiB VRAM for differentiable full-image rendering + IP2P. Use `--pipeline.dc-device cuda:1` to offload diffusion to a second GPU, or use 3DGS (dc_splat) which is more memory-efficient.
-- **STG**: Adds ~50% per-iteration time. Formula now matches paper Eq 13: `ε̃ = ε_full + w·(ε_full − ε_weak)`. `stg_scale=0` = off, `stg_scale=1.0` = paper default (STG-R). Start with `stg_scale=1.0` and `stg_skip_layers=[1, 2]`. ⚠️ Old formula `ε_weak + λ·(ε_full − ε_weak)` had λ=1 as no-op — all prior STG experiments with `stg_scale=1.0` had zero STG effect.
+- **STG**: Adds ~50% per-iteration time. Formula matches paper Eq 13: `ε̃ = ε_full + w·(ε_full − ε_weak)`. `stg_scale=0` = off. Hook zeroes `attn1` output; with residual connection this IS the identity skip (correct STG-A behavior). Paper default `w=2.0` is too aggressive when combined with IP2P 3-way CFG at `guidance_scale=12.5` — start with `stg_scale=0.5` and `stg_skip_layers=[2]`, sweep up. ⚠️ Old formula `ε_weak + λ·(ε_full − ε_weak)` had λ=1 as no-op — all prior STG experiments with `stg_scale=1.0` had zero STG effect.
 - **Perp-Neg**: Zero overhead. Safe to always enable as a first experiment.
 - **Face dataset dimensions (downscale-factor 2)**: Original images in `images_2/` are 497×369 (W×H). Pipeline resizes smallest-side to 512 → `[1, 3, 512, 689]`. VAE encodes (8× spatial compression) → latent `[1, 4, 64, 86]`. UNet spatial progression: 64×86 → 32×43 → 16×22 → 8×11 (mid) → 16×22 → 32×43 → 64×86. The first CrossAttnUpBlock2D (Up 1, where STG hooks act) operates at **16×22×1280ch**. Latent is NOT 64×64 — aspect ratio propagates through the entire network.
 
@@ -82,7 +82,7 @@ Modifications to DDS guidance in `dc.py`. Novelties N1–N5 are done; N6–N9 ar
    * Original contribution. Preserves source branch identity signal.
 
 4. **STG** [DONE] — skip self-attention in `up_blocks` for implicit weak-model guidance. Replaces or augments CFG with a structure-preserving perturbation.
-   * **Config:** `stg_enabled` (default False), `stg_scale` (default 1.0), `stg_skip_layers` (default [1, 2]).
+   * **Config:** `stg_enabled` (default False), `stg_scale` (default 2.0 = paper STG-A default), `stg_skip_layers` (default [2] — single later up_block per paper).
    * **Implementation:** `_run_unet_with_skipped_attn()` registers forward hooks on `unet.up_blocks[i].attentions[j].transformer_blocks[k].attn1` that zero out self-attn output. Runs a second "weak" UNet pass, then blends per paper Eq 13: `eps_stg = eps_full + stg_scale*(eps_full - eps_weak)`. `stg_scale=0` → off, `stg_scale=1.0` → paper default (STG-R). Applied ONLY to `eps_tgt`. Hooks cleaned up in `finally` block.
    * **Based on:** STG (Hyung et al., CVPR 2025, Jaegul Choo's lab @ KAIST).
    * ⚠️ Only works with IP2P (Step 3). Do NOT apply in `run_sdedit`.
