@@ -64,6 +64,22 @@ class DCPipeline(ModifiedVanillaPipeline):
         # Caching source's x0
         self.src_x0s = dict()
         self.current_spot = None
+
+        # Load cached foreground masks for masked Perp-Neg
+        self.cached_masks = {}
+        if self.config.dc.depth_masked_perp_neg and self.config.dc.depth_mask_source == "cached":
+            from pathlib import Path as P
+            mask_dir = P(self.config.dc.cached_mask_dir)
+            if mask_dir.exists():
+                for i, img_path in enumerate(self.datamanager.train_dataparser_outputs.image_filenames):
+                    mask_path = mask_dir / f"{img_path.stem}.png"
+                    if mask_path.exists():
+                        mask = np.array(Image.open(mask_path).convert("L")).astype(np.float32) / 255.0
+                        self.cached_masks[i] = torch.tensor(mask).unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+                print(f"[Masked PN] Loaded {len(self.cached_masks)} cached masks from {mask_dir}")
+            else:
+                print(f"[Masked PN] WARNING: cached_mask_dir '{mask_dir}' not found, falling back to depth")
+                self.config.dc.depth_mask_source = "depth"
         
     def get_current_rendering(self, step):
         if getattr(self, "current_spot", None) is None or step % self.config.change_view_step == 0:
@@ -114,19 +130,25 @@ class DCPipeline(ModifiedVanillaPipeline):
         del original_image_512
         clean_gpu()
 
-        # Build depth mask for masked Perp-Neg (from renderer depth map)
+        # Build foreground mask for masked Perp-Neg
         depth_mask = None
-        if self.config.dc.depth_masked_perp_neg and self.config.dc.perp_neg and depth_map is not None:
-            # Percentile-based normalization: clip to [5th, 95th] to remove outlier Gaussians,
-            # then normalize the meaningful depth range to [0, 1]
-            d_flat = depth_map.reshape(-1)
-            d_lo = torch.quantile(d_flat, 0.05)
-            d_hi = torch.quantile(d_flat, 0.95)
-            depth_clipped = depth_map.clamp(d_lo, d_hi)
-            depth_norm = (depth_clipped - d_lo) / (d_hi - d_lo + 1e-8)
-            mask_pixel = (depth_norm < self.config.dc.depth_mask_threshold).float()  # [1,1,H,W]
-            depth_mask = F.interpolate(mask_pixel, size=(h, w), mode="nearest")
-            depth_mask = depth_mask.to(self.dc_device)
+        if self.config.dc.depth_masked_perp_neg and self.config.dc.perp_neg:
+            source = self.config.dc.depth_mask_source
+            use_cached = source == "cached" and current_spot in self.cached_masks
+            if use_cached:
+                # Precomputed mask (e.g. from Grounded-SAM), resize to 512-space
+                depth_mask = F.interpolate(self.cached_masks[current_spot], size=(h, w), mode="nearest")
+                depth_mask = depth_mask.to(self.dc_device)
+            elif depth_map is not None:
+                # Renderer depth, percentile-normalized
+                d_flat = depth_map.reshape(-1)
+                d_lo = torch.quantile(d_flat, 0.05)
+                d_hi = torch.quantile(d_flat, 0.95)
+                depth_clipped = depth_map.clamp(d_lo, d_hi)
+                depth_norm = (depth_clipped - d_lo) / (d_hi - d_lo + 1e-8)
+                mask_pixel = (depth_norm < self.config.dc.depth_mask_threshold).float()
+                depth_mask = F.interpolate(mask_pixel, size=(h, w), mode="nearest")
+                depth_mask = depth_mask.to(self.dc_device)
 
         dic = self.dc(tgt_x0=x0, src_x0=src_x0, src_emb=src_emb, return_dict=True, step=step, current_spot=current_spot, depth_mask=depth_mask)
         grad = dic["grad"].cpu()

@@ -126,17 +126,22 @@ This project extends DreamCatalyst's DDS guidance with modifications to the nois
 | 3 | **Asymmetric TAG** | `asymmetric_tag=True` | Applies TAG only to the target branch of DDS, leaving the source branch unmodified (`η=1.0`). This amplifies the editing direction without disturbing source reconstruction. Original contribution. | Done |
 | 4 | **STG** | `stg_enabled=True` | Runs a second "weak" UNet pass with self-attention zeroed out in selected up_blocks (STG-A variant), then amplifies per paper Eq 13: `eps = eps_full + stg_scale * (eps_full - eps_weak)`. `stg_scale=0` off, paper default for STG-A is `2.0`. Applied only to target branch. Based on STG (Hyung et al., CVPR 2025). | Done |
 | 5 | **Perpendicular Gradient Projection** | `perp_neg=True` | Gram-Schmidt orthogonalization of `eps_tgt` w.r.t. `eps_src` before the DDS delta, making the two guidance signals perpendicular. Based on PCGrad (Yu et al., NeurIPS 2020) and Perp-Neg (Armandpour et al., ICML 2023). | Done |
+| 6 | **Foreground-Masked Perp-Neg** | `depth_masked_perp_neg=True` | Restricts the Perp-Neg projection to foreground pixels only, preventing background texture destruction. Supports two mask sources: `"cached"` (precomputed via Grounded-SAM/rembg, zero training cost) or `"depth"` (renderer depth, percentile-normalized). Projection computed from foreground pixels only (masked dot products). Generate masks offline: `python scripts/generate_masks.py`. Original contribution. | Done |
 
 ```python
 # nerfstudio/dc/tasd_config.py
 DC_CUSTOM_PARAMS = dict(
-    eta_tag=1.15,         # 1.0 = disabled
-    adaptive_tag=True,    # anneal η with timestep
-    asymmetric_tag=True,  # TAG only on target branch
-    perp_neg=False,       # perpendicular gradient projection (orthogonalize eps_tgt w.r.t. eps_src)
-    stg_enabled=False,    # self-attention skip guidance
-    stg_scale=1.0,        # STG blend strength
-    stg_skip_layers=[1, 2],  # which up_blocks to skip
+    eta_tag=1.15,              # 1.0 = disabled
+    adaptive_tag=True,         # anneal η with timestep
+    asymmetric_tag=True,       # TAG only on target branch
+    perp_neg=False,            # perpendicular gradient projection
+    depth_masked_perp_neg=False,  # restrict PN to foreground pixels
+    depth_mask_source="depth", # "cached" (precomputed) or "depth" (renderer)
+    depth_mask_threshold=0.5,  # for depth source only
+    cached_mask_dir="",        # path to mask PNGs for cached source
+    stg_enabled=False,         # self-attention skip guidance
+    stg_scale=0.5,             # STG blend strength (paper default for STG-A: 2.0)
+    stg_skip_layers=[2],       # which up_blocks to skip
 )
 ```
 

@@ -95,14 +95,18 @@ Modifications to DDS guidance in `dc.py`. Novelties N1–N6 are done; N7–N10 a
    * **Based on:** PCGrad (Yu et al., NeurIPS 2020) — conflicting gradient projection for multi-task learning; adapted to diffusion guidance by Perp-Neg (Armandpour et al., ICML 2023).
    * ⚠️ Previously misattributed to "Devil in Detail" (Jo et al., CVPR 2025), which proposes a different technique (excluding image prompts from negative CFG branch in self-attention KV injection for 2D image prompting — unrelated to DDS gradient projection).
 
-6. **Depth-Masked Perp-Neg** [DONE] — spatially restrict the Gram-Schmidt projection to foreground pixels, preserving background identity.
-   * **Config:** `depth_masked_perp_neg` (default False), `depth_mask_threshold` (default 0.5). Requires `perp_neg=True`.
-   * **Mask source:** renderer depth map, normalized to [0,1] via min-max, then `foreground = norm_depth < threshold`. Works for indoor scenes with solid backgrounds (face dataset: person is close, wall is far). Accumulation was considered but rejected — 3DGS fills the entire scene with Gaussians so accumulation ≈ 1.0 everywhere, even in background.
-   * **Implementation:** `dc_pipeline.py` extracts `camera_outputs["depth"]`, normalizes to [0,1] via percentile clipping (5th–95th to remove outlier Gaussians), binarizes at threshold, resizes to 512-space, passes to `dc.py`. Inside the Perp-Neg block, mask is resized to match `tgt_x0.shape[2:]` (robust to VAE rounding). Projection scalar is computed from **foreground pixels only** (masked dot products), then subtraction is also gated by the mask: `eps_tgt = eps_tgt - projection * eps_src * mask`. Background (mask=0) keeps original `eps_tgt` untouched.
+6. **Foreground-Masked Perp-Neg** [DONE] — spatially restrict the Gram-Schmidt projection to foreground pixels, preserving background identity.
+   * **Config:** `depth_masked_perp_neg` (default False), `depth_mask_source` (`"depth"` or `"cached"`, default `"depth"`), `depth_mask_threshold` (default 0.5, for depth source), `cached_mask_dir` (str, for cached source). Requires `perp_neg=True`.
+   * **Two mask sources:**
+     * `"cached"` (recommended): precomputed per-view masks from Grounded-SAM or rembg, generated offline via `scripts/generate_masks.py`. Sharp object boundaries, zero training cost. Masks loaded at pipeline init by matching image stem names.
+     * `"depth"`: renderer depth map, percentile-normalized (5th–95th to remove outlier Gaussians), binarized at threshold. Works for indoor scenes with depth separation. Noisier boundaries than cached.
+   * **Accumulation rejected:** 3DGS fills the entire scene with Gaussians (even sky/background), so accumulation ≈ 1.0 everywhere — useless for masking.
+   * **Implementation:** `dc_pipeline.py` builds the mask (cached: load + resize to 512-space; depth: extract + normalize + binarize + resize). Inside the Perp-Neg block in `dc.py`, mask is resized to match `tgt_x0.shape[2:]` (robust to VAE rounding). Projection scalar is computed from **foreground pixels only** (masked dot products), then subtraction is also gated by the mask: `eps_tgt = eps_tgt - projection * eps_src * mask`. Background (mask=0) keeps original `eps_tgt` untouched.
    * **Why masked-global (not per-pixel or full-global):** per-pixel projection (`sum over dim=1` = 4 channels) is too noisy — produces salt-and-pepper artifacts. Full-global projection is dominated by background pixels (where `eps_tgt ≈ eps_src`, pushing projection toward 1.0), which over-subtracts in foreground. Masked-global uses only foreground elements (~8K if foreground is 40%) — stable and accurate.
-   * **Based on:** original contribution combining PCGrad/Perp-Neg spatial gating with NeRF/3DGS renderer depth output. Inspired by the masking approach in RoMaP (Kim, Jang & Chun, 2025).
-   * ⚠️ Zero extra model cost — accumulation is already computed every iteration by the renderer.
+   * **Based on:** original contribution combining PCGrad/Perp-Neg spatial gating with offline zero-shot segmentation. Inspired by the masking approach in RoMaP (Kim, Jang & Chun, 2025).
+   * ⚠️ Cached masks: zero training cost. Depth masks: zero model cost (depth already computed by renderer).
    * ⚠️ Mask is `.detach()`ed — no gradients flow through the mask to the NeRF density field.
+   * **Script:** `scripts/generate_masks.py` — supports `grounded-sam` (GroundingDINO + SAM, text-prompted) and `rembg` (U2Net, automatic) backends. Run in a separate env to avoid dependency conflicts.
 
 ---
 

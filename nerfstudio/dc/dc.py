@@ -51,9 +51,11 @@ class DCConfig:
 
     # Perpendicular Gradient Projection (Perp-Neg) — orthogonalize eps_tgt w.r.t. eps_src
     perp_neg: bool = False
-    # Depth-Masked Perp-Neg — restrict projection to foreground using renderer depth map
+    # Depth-Masked Perp-Neg — restrict projection to foreground
     depth_masked_perp_neg: bool = False
-    depth_mask_threshold: float = 0.5  # normalized depth < threshold = foreground
+    depth_mask_source: str = "depth"  # "depth" (renderer depth, percentile-normalized) or "cached" (precomputed masks)
+    depth_mask_threshold: float = 0.5  # for depth source: normalized depth < threshold = foreground
+    cached_mask_dir: str = ""  # path to directory with per-view mask PNGs (for "cached" source)
 
     # STG (Self-attention skip guidance) — replace CFG with structure-preserving perturbation
     stg_enabled: bool = False
