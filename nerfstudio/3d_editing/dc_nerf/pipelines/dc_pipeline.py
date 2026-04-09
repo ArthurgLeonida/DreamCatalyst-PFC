@@ -148,6 +148,12 @@ class DCPipeline(ModifiedVanillaPipeline):
                 "dc_loss": loss.item(),
             }, step=step, commit=False)
 
+        # Save depth mask visualization for debugging
+        if depth_mask is not None and step % self.config.log_step == 0:
+            mask_vis = F.interpolate(depth_mask.cpu(), size=(h, w), mode="nearest")
+            mask_img = Image.fromarray((mask_vis[0, 0].numpy() * 255).astype(np.uint8))
+            mask_img.save(self.base_dir / f"logging/{step}_depth_mask.png")
+
         # logging
         if step % self.config.log_step == 0:
             self.log_images(rendered_image, original_image, grad, step)
