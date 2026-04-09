@@ -117,8 +117,13 @@ class DCPipeline(ModifiedVanillaPipeline):
         # Build depth mask for masked Perp-Neg (from renderer depth map)
         depth_mask = None
         if self.config.dc.depth_masked_perp_neg and self.config.dc.perp_neg and depth_map is not None:
-            d_min, d_max = depth_map.min(), depth_map.max()
-            depth_norm = (depth_map - d_min) / (d_max - d_min + 1e-8)
+            # Percentile-based normalization: clip to [5th, 95th] to remove outlier Gaussians,
+            # then normalize the meaningful depth range to [0, 1]
+            d_flat = depth_map.reshape(-1)
+            d_lo = torch.quantile(d_flat, 0.05)
+            d_hi = torch.quantile(d_flat, 0.95)
+            depth_clipped = depth_map.clamp(d_lo, d_hi)
+            depth_norm = (depth_clipped - d_lo) / (d_hi - d_lo + 1e-8)
             mask_pixel = (depth_norm < self.config.dc.depth_mask_threshold).float()  # [1,1,H,W]
             depth_mask = F.interpolate(mask_pixel, size=(h, w), mode="nearest")
             depth_mask = depth_mask.to(self.dc_device)
