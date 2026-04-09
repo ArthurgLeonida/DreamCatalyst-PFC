@@ -351,16 +351,15 @@ class DC(object):
         # Perpendicular Gradient Projection (Perp-Neg): orthogonalize eps_tgt w.r.t. eps_src
         # ====================================================================================
         if self.config.perp_neg:
+            # Global projection scalar (stable — computed over all 21,952 latent elements)
+            src_norm_sq = (eps["src"] * eps["src"]).sum(dim=(1, 2, 3), keepdim=True).clamp(min=1e-8)
+            projection = (eps["tgt"] * eps["src"]).sum(dim=(1, 2, 3), keepdim=True) / src_norm_sq
             if self.config.depth_masked_perp_neg and depth_mask is not None:
-                # Depth-Masked Perp-Neg: per-pixel projection, only in foreground
+                # Depth-Masked: only subtract in foreground, background keeps original eps_tgt
                 mask = F.interpolate(depth_mask, size=tgt_x0.shape[2:], mode="nearest")
-                src_norm_sq = (eps["src"] * eps["src"]).sum(dim=1, keepdim=True).clamp(min=1e-8)
-                projection = (eps["tgt"] * eps["src"]).sum(dim=1, keepdim=True) / src_norm_sq
                 eps["tgt"] = eps["tgt"] - projection * eps["src"] * mask
             else:
                 # Standard global Perp-Neg
-                src_norm_sq = (eps["src"] * eps["src"]).sum(dim=(1, 2, 3), keepdim=True).clamp(min=1e-8)
-                projection = (eps["tgt"] * eps["src"]).sum(dim=(1, 2, 3), keepdim=True) / src_norm_sq
                 eps["tgt"] = eps["tgt"] - projection * eps["src"]
         # ====================================================================================
 
