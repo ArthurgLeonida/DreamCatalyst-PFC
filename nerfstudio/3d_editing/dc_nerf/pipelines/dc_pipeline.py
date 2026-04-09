@@ -149,6 +149,11 @@ class DCPipeline(ModifiedVanillaPipeline):
                 mask_pixel = (depth_norm < self.config.dc.depth_mask_threshold).float()
                 depth_mask = F.interpolate(mask_pixel, size=(h, w), mode="nearest")
                 depth_mask = depth_mask.to(self.dc_device)
+            # Dilate in image-space (512-space) — gives edits room to grow beyond silhouette
+            if depth_mask is not None:
+                d = self.config.dc.perp_neg_mask_dilate
+                if d > 0:
+                    depth_mask = F.max_pool2d(depth_mask, kernel_size=2*d+1, stride=1, padding=d)
 
         dic = self.dc(tgt_x0=x0, src_x0=src_x0, src_emb=src_emb, return_dict=True, step=step, current_spot=current_spot, depth_mask=depth_mask)
         grad = dic["grad"].cpu()

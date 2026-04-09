@@ -8,12 +8,14 @@ DC_CUSTOM_PARAMS = dict(
     adaptive_tag=False,
     asymmetric_tag=False,
     # Perpendicular Gradient Projection (Perp-Neg) — orthogonalize eps_tgt w.r.t. eps_src
-    perp_neg=False,
-    # Masked Perp-Neg — restrict projection to foreground
-    depth_masked_perp_neg=False,
-    depth_mask_source="depth",       # "depth" or "cached"
+    perp_neg=True,
+    # Foreground-Masked Perp-Neg — restrict PN subtraction to foreground
+    depth_masked_perp_neg=True,
+    depth_mask_source="cached",      # "depth" or "cached"
     depth_mask_threshold=0.5,        # for depth source only
-    cached_mask_dir="",              # for cached source only
+    cached_mask_dir="data/face_processed/masks",  # for cached source only
+    perp_neg_mask_dilate=10,         # dilate mask by N px (room for cloak/ears/hair growth)
+    perp_neg_alpha=1.0,              # PN strength (1.0=full, try 0.5-0.75 if too aggressive)
     # STG (Self-attention skip guidance)
     stg_enabled=False,
     stg_scale=0.5,

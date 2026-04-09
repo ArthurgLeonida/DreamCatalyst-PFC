@@ -51,11 +51,13 @@ class DCConfig:
 
     # Perpendicular Gradient Projection (Perp-Neg) — orthogonalize eps_tgt w.r.t. eps_src
     perp_neg: bool = False
-    # Depth-Masked Perp-Neg — restrict projection to foreground
+    # Foreground-Masked Perp-Neg — restrict PN subtraction to foreground
     depth_masked_perp_neg: bool = False
-    depth_mask_source: str = "depth"  # "depth" (renderer depth, percentile-normalized) or "cached" (precomputed masks)
-    depth_mask_threshold: float = 0.5  # for depth source: normalized depth < threshold = foreground
-    cached_mask_dir: str = ""  # path to directory with per-view mask PNGs (for "cached" source)
+    depth_mask_source: str = "depth"  # "depth" (renderer depth) or "cached" (precomputed masks)
+    depth_mask_threshold: float = 0.5  # for depth source only
+    cached_mask_dir: str = ""  # for cached source only
+    perp_neg_mask_dilate: int = 0  # dilate mask by N pixels before applying (gives edits room to grow)
+    perp_neg_alpha: float = 1.0  # PN subtraction strength (1.0 = full, 0.5 = half)
 
     # STG (Self-attention skip guidance) — replace CFG with structure-preserving perturbation
     stg_enabled: bool = False
@@ -353,21 +355,17 @@ class DC(object):
         # Perpendicular Gradient Projection (Perp-Neg): orthogonalize eps_tgt w.r.t. eps_src
         # ====================================================================================
         if self.config.perp_neg:
+            # Always compute projection globally (keeps creative editing signal)
+            src_norm_sq = (eps["src"] * eps["src"]).sum(dim=(1, 2, 3), keepdim=True).clamp(min=1e-8)
+            projection = (eps["tgt"] * eps["src"]).sum(dim=(1, 2, 3), keepdim=True) / src_norm_sq
+            alpha = self.config.perp_neg_alpha
             if self.config.depth_masked_perp_neg and depth_mask is not None:
-                # Depth-Masked Perp-Neg: compute projection from foreground pixels only,
-                # then subtract only in foreground. Background eps_tgt stays untouched.
+                # Masked application: subtract only in foreground, background keeps eps_tgt
                 mask = F.interpolate(depth_mask, size=tgt_x0.shape[2:], mode="nearest")
-                # Masked dot products — use only foreground statistics for the projection
-                eps_tgt_masked = eps["tgt"] * mask
-                eps_src_masked = eps["src"] * mask
-                src_norm_sq = (eps_src_masked * eps_src_masked).sum(dim=(1, 2, 3), keepdim=True).clamp(min=1e-8)
-                projection = (eps_tgt_masked * eps_src_masked).sum(dim=(1, 2, 3), keepdim=True) / src_norm_sq
-                eps["tgt"] = eps["tgt"] - projection * eps["src"] * mask
+                eps["tgt"] = eps["tgt"] - alpha * projection * eps["src"] * mask
             else:
                 # Standard global Perp-Neg
-                src_norm_sq = (eps["src"] * eps["src"]).sum(dim=(1, 2, 3), keepdim=True).clamp(min=1e-8)
-                projection = (eps["tgt"] * eps["src"]).sum(dim=(1, 2, 3), keepdim=True) / src_norm_sq
-                eps["tgt"] = eps["tgt"] - projection * eps["src"]
+                eps["tgt"] = eps["tgt"] - alpha * projection * eps["src"]
         # ====================================================================================
 
         self.iteration += 1
