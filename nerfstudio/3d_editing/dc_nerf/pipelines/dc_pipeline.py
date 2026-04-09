@@ -65,17 +65,18 @@ class DCPipeline(ModifiedVanillaPipeline):
         self.src_x0s = dict()
         self.current_spot = None
 
-        # Load cached foreground masks for masked Perp-Neg
+        # Load cached foreground masks for masked Perp-Neg, keyed by image stem name
         self.cached_masks = {}
         if self.config.dc.depth_masked_perp_neg and self.config.dc.depth_mask_source == "cached":
             from pathlib import Path as P
             mask_dir = P(self.config.dc.cached_mask_dir)
             if mask_dir.exists():
-                for i, img_path in enumerate(self.datamanager.train_dataparser_outputs.image_filenames):
-                    mask_path = mask_dir / f"{img_path.stem}.png"
+                for img_path in self.datamanager.train_dataparser_outputs.image_filenames:
+                    stem = img_path.stem
+                    mask_path = mask_dir / f"{stem}.png"
                     if mask_path.exists():
                         mask = np.array(Image.open(mask_path).convert("L")).astype(np.float32) / 255.0
-                        self.cached_masks[i] = torch.tensor(mask).unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+                        self.cached_masks[stem] = torch.tensor(mask).unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
                 print(f"[Masked PN] Loaded {len(self.cached_masks)} cached masks from {mask_dir}")
             else:
                 print(f"[Masked PN] WARNING: cached_mask_dir '{mask_dir}' not found, falling back to depth")
@@ -87,6 +88,8 @@ class DCPipeline(ModifiedVanillaPipeline):
         current_spot = self.current_spot
         current_index = self.datamanager.image_batch["image_idx"][current_spot]
         current_camera = self.datamanager.train_dataparser_outputs.cameras[current_index:current_index+1].to(self.device)
+        # Get the image stem for correct cached mask lookup
+        current_stem = self.datamanager.train_dataparser_outputs.image_filenames[current_index].stem
         camera_outputs = self.model.diff_get_outputs_for_camera(current_camera)
         rendered_image = camera_outputs["rgb"].unsqueeze(dim=0).permute(0, 3, 1, 2)  # [B,3,H,W]
         # Extract depth for depth-masked Perp-Neg (free — already computed by renderer)
@@ -99,12 +102,12 @@ class DCPipeline(ModifiedVanillaPipeline):
         del current_camera
         clean_gpu()
 
-        return rendered_image, current_spot, depth_map
+        return rendered_image, current_spot, current_stem, depth_map
 
     def get_train_loss_dict(self, step: int):
         loss_dict = dict()
 
-        rendered_image, current_spot, depth_map = self.get_current_rendering(step)
+        rendered_image, current_spot, current_stem, depth_map = self.get_current_rendering(step)
         # get original image from dataloader
         original_image = self.datamanager.original_image_batch["image"][current_spot].to(self.device)
         original_image = original_image.unsqueeze(dim=0).permute(0, 3, 1, 2)
@@ -134,10 +137,10 @@ class DCPipeline(ModifiedVanillaPipeline):
         depth_mask = None
         if self.config.dc.depth_masked_perp_neg and self.config.dc.perp_neg:
             source = self.config.dc.depth_mask_source
-            use_cached = source == "cached" and current_spot in self.cached_masks
+            use_cached = source == "cached" and current_stem in self.cached_masks
             if use_cached:
                 # Precomputed mask (e.g. from Grounded-SAM), resize to 512-space
-                depth_mask = F.interpolate(self.cached_masks[current_spot], size=(h, w), mode="nearest")
+                depth_mask = F.interpolate(self.cached_masks[current_stem], size=(h, w), mode="nearest")
                 depth_mask = depth_mask.to(self.dc_device)
             elif depth_map is not None:
                 # Renderer depth, percentile-normalized
