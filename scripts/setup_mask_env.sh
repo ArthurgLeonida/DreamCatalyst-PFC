@@ -14,11 +14,14 @@ ENV_NAME="mask_gen"
 echo "Creating conda env '${ENV_NAME}' with Python 3.10..."
 conda create -n "${ENV_NAME}" python=3.10 -y
 
-echo "Installing dependencies..."
+echo "Installing PyTorch (cu118 to match server driver)..."
 conda run -n "${ENV_NAME}" pip install \
-    torch torchvision \
-    transformers>=4.42.0 \
-    segment-anything-py \
+    torch==2.1.2+cu118 torchvision==0.16.2+cu118 \
+    --index-url https://download.pytorch.org/whl/cu118
+
+echo "Installing transformers + SAM..."
+conda run -n "${ENV_NAME}" pip install \
+    "transformers>=4.42.0" \
     pillow \
     numpy
 
