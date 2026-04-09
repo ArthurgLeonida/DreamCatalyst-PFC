@@ -51,6 +51,9 @@ class DCConfig:
 
     # Perpendicular Gradient Projection (Perp-Neg) — orthogonalize eps_tgt w.r.t. eps_src
     perp_neg: bool = False
+    # Depth-Masked Perp-Neg — restrict projection to foreground using renderer depth map
+    depth_masked_perp_neg: bool = False
+    depth_mask_threshold: float = 0.5  # normalized depth < threshold = foreground
 
     # STG (Self-attention skip guidance) — replace CFG with structure-preserving perturbation
     stg_enabled: bool = False
@@ -223,6 +226,7 @@ class DC(object):
         return_dict=False,
         step=0,
         current_spot=0,
+        depth_mask=None,
     ):
         device = self.device
         scheduler = self.scheduler
@@ -347,9 +351,17 @@ class DC(object):
         # Perpendicular Gradient Projection (Perp-Neg): orthogonalize eps_tgt w.r.t. eps_src
         # ====================================================================================
         if self.config.perp_neg:
-            src_norm_sq = (eps["src"] * eps["src"]).sum(dim=(1, 2, 3), keepdim=True).clamp(min=1e-8)
-            projection = (eps["tgt"] * eps["src"]).sum(dim=(1, 2, 3), keepdim=True) / src_norm_sq
-            eps["tgt"] = eps["tgt"] - projection * eps["src"]
+            if self.config.depth_masked_perp_neg and depth_mask is not None:
+                # Depth-Masked Perp-Neg: per-pixel projection, only in foreground
+                mask = F.interpolate(depth_mask, size=tgt_x0.shape[2:], mode="nearest")
+                src_norm_sq = (eps["src"] * eps["src"]).sum(dim=1, keepdim=True).clamp(min=1e-8)
+                projection = (eps["tgt"] * eps["src"]).sum(dim=1, keepdim=True) / src_norm_sq
+                eps["tgt"] = eps["tgt"] - projection * eps["src"] * mask
+            else:
+                # Standard global Perp-Neg
+                src_norm_sq = (eps["src"] * eps["src"]).sum(dim=(1, 2, 3), keepdim=True).clamp(min=1e-8)
+                projection = (eps["tgt"] * eps["src"]).sum(dim=(1, 2, 3), keepdim=True) / src_norm_sq
+                eps["tgt"] = eps["tgt"] - projection * eps["src"]
         # ====================================================================================
 
         self.iteration += 1

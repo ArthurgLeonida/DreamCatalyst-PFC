@@ -73,18 +73,22 @@ class DCPipeline(ModifiedVanillaPipeline):
         current_camera = self.datamanager.train_dataparser_outputs.cameras[current_index:current_index+1].to(self.device)
         camera_outputs = self.model.diff_get_outputs_for_camera(current_camera)
         rendered_image = camera_outputs["rgb"].unsqueeze(dim=0).permute(0, 3, 1, 2)  # [B,3,H,W]
+        # Extract depth for depth-masked Perp-Neg (free — already computed by renderer)
+        depth_map = camera_outputs.get("depth", None)
+        if depth_map is not None:
+            depth_map = depth_map.detach().unsqueeze(dim=0).permute(0, 3, 1, 2)  # [1,1,H,W]
 
         # delete to free up memory
         del camera_outputs
         del current_camera
         clean_gpu()
 
-        return rendered_image, current_spot
+        return rendered_image, current_spot, depth_map
 
     def get_train_loss_dict(self, step: int):
         loss_dict = dict()
 
-        rendered_image, current_spot = self.get_current_rendering(step)
+        rendered_image, current_spot, depth_map = self.get_current_rendering(step)
         # get original image from dataloader
         original_image = self.datamanager.original_image_batch["image"][current_spot].to(self.device)
         original_image = original_image.unsqueeze(dim=0).permute(0, 3, 1, 2)
@@ -110,7 +114,16 @@ class DCPipeline(ModifiedVanillaPipeline):
         del original_image_512
         clean_gpu()
 
-        dic = self.dc(tgt_x0=x0, src_x0=src_x0, src_emb=src_emb, return_dict=True, step=step, current_spot=current_spot)
+        # Build depth mask for masked Perp-Neg (from renderer depth map)
+        depth_mask = None
+        if self.config.dc.depth_masked_perp_neg and self.config.dc.perp_neg and depth_map is not None:
+            d_min, d_max = depth_map.min(), depth_map.max()
+            depth_norm = (depth_map - d_min) / (d_max - d_min + 1e-8)
+            mask_pixel = (depth_norm < self.config.dc.depth_mask_threshold).float()  # [1,1,H,W]
+            depth_mask = F.interpolate(mask_pixel, size=(h, w), mode="nearest")
+            depth_mask = depth_mask.to(self.dc_device)
+
+        dic = self.dc(tgt_x0=x0, src_x0=src_x0, src_emb=src_emb, return_dict=True, step=step, current_spot=current_spot, depth_mask=depth_mask)
         grad = dic["grad"].cpu()
         loss = dic["loss"] * self.config.dc_loss_mult
         loss = loss.to(self.device)

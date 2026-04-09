@@ -61,7 +61,7 @@ Verified changes:
 
 ## Novelties (TASD)
 
-Modifications to DDS guidance in `dc.py`. Novelties N1–N5 are done; N6–N9 are TODO in priority order.
+Modifications to DDS guidance in `dc.py`. Novelties N1–N6 are done; N7–N10 are TODO in priority order.
 
 ---
 
@@ -94,50 +94,59 @@ Modifications to DDS guidance in `dc.py`. Novelties N1–N5 are done; N6–N9 ar
    * **Implementation:** after the tgt/src loop, before gradient computation: `eps_tgt = eps_tgt - (dot(eps_tgt, eps_src) / dot(eps_src, eps_src)) * eps_src`. Applied after TAG (both branches computed first, then projection).
    * **Based on:** PCGrad (Yu et al., NeurIPS 2020) — conflicting gradient projection for multi-task learning; adapted to diffusion guidance by Perp-Neg (Armandpour et al., ICML 2023).
    * ⚠️ Previously misattributed to "Devil in Detail" (Jo et al., CVPR 2025), which proposes a different technique (excluding image prompts from negative CFG branch in self-attention KV injection for 2D image prompting — unrelated to DDS gradient projection).
-   * **Future experiment — Depth-Masked Perp-Neg:** apply the projection only to foreground (target object) pixels using a depth mask from the NeRF renderer. Nerfacto outputs per-pixel expected depth (volume-rendering weighted sum of sample distances). Threshold it (e.g. `mask = depth < threshold`), resize to `[64, 64]` latent space, then: `eps_tgt = eps_tgt - (projection * eps_src) * mask`. Background pixels (mask=0) are untouched, preserving background identity. Zero extra model cost — depth is already computed every iteration.
+
+6. **Depth-Masked Perp-Neg** [DONE] — spatially restrict the Gram-Schmidt projection to foreground pixels, preserving background identity.
+   * **Config:** `depth_masked_perp_neg` (default False), `depth_mask_threshold` (default 0.5). Requires `perp_neg=True`.
+   * **Mask source:** renderer depth map, normalized to [0,1] via min-max, then `foreground = norm_depth < threshold`. Works for indoor scenes with solid backgrounds (face dataset: person is close, wall is far). Accumulation was considered but rejected — 3DGS fills the entire scene with Gaussians so accumulation ≈ 1.0 everywhere, even in background.
+   * **Implementation:** `dc_pipeline.py` extracts `camera_outputs["accumulation"]`, binarizes at threshold, resizes to 512-space, passes to `dc.py`. Inside the Perp-Neg block, mask is resized to match `tgt_x0.shape[2:]` (robust to VAE rounding). Switches to **per-pixel projection** (sum over channels only, `dim=1`) instead of global projection — each pixel gets its own projection coefficient, avoiding global statistics being dominated by background. Subtraction gated by mask: `eps_tgt = eps_tgt - projection * eps_src * mask`. Background (mask=0) keeps original `eps_tgt` untouched.
+   * **Why per-pixel projection:** global projection sums over all pixels. In scenes where background dominates, the scalar projection ≈ 1.0 (since eps_tgt ≈ eps_src in background), which over-subtracts when applied to foreground. Per-pixel projection is independent at each spatial location — more correct.
+   * **Based on:** original contribution combining PCGrad/Perp-Neg spatial gating with NeRF/3DGS renderer accumulation output. Inspired by the masking approach in RoMaP (Kim, Jang & Chun, 2025).
+   * ⚠️ Zero extra model cost — accumulation is already computed every iteration by the renderer.
+   * ⚠️ Mask is `.detach()`ed — no gradients flow through the mask to the NeRF density field.
 
 ---
 
 ### 🟡 TODO — Medium Priority (professor's recommended papers)
 
-6. **Depth Regularization** [TODO] — add a monocular depth consistency loss to the DreamCatalyst loss `L_DC` to anchor Gaussian positions during editing. Prevents floaters introduced by TAG at high η.
+7. **Depth Regularization** [TODO] — add a monocular depth consistency loss to the DreamCatalyst loss `L_DC` to anchor Gaussian positions during editing. Prevents floaters introduced by TAG at high η.
    * **Config:** `depth_reg_weight` (default 0.0), `depth_model` (default `"midas"`).
    * **Implementation:** in `dc.py` loss computation, load MiDaS depth prediction for the current render and add `depth_reg_weight * L1(depth_pred, depth_anchor)` where `depth_anchor` is computed once from the original unedited scene.
    * **Based on:** Depth-Regularized Optimization for 3DGS (Chung et al., CVPRW 2024).
    * ⚠️ Adds ~1.2s per iteration. Use `depth_reg_freq=10` (every 10 iters) to amortize.
 
-7. **3D-GALP Part Masking** [TODO] — restrict DDS gradient to Gaussians that belong to the target semantic region, leaving background untouched.
+8. **3D-GALP Part Masking** [TODO] — restrict DDS gradient to Gaussians that belong to the target semantic region, leaving background untouched.
    * **Config:** `galp_enabled` (default False), `galp_seg_prompt` (str, e.g. `"face"`).
    * **Implementation:** run a zero-shot segmentation (e.g. Grounded-SAM) on the source render to get a 2D mask per camera. Project mask into 3D via splatting opacity weights to identify "target Gaussians". Zero out `∇θ L_DC` for non-target Gaussians before the Adam step.
    * **Based on:** RoMaP (Kim, Jang & Chun, 2025).
    * ⚠️ Requires `groundingdino` + `segment-anything` in the env. Heavy dependency.
    * ⚠️ 200 MB VRAM overhead. Run with `--pipeline.datamanager.train-num-rays-per-batch 2048`.
 
-8. **GAP³D Cross-View Attention Prior** [TODO] — enforce multi-view consistency by injecting cross-attention keys/values from a second camera view into the current view's UNet forward pass during guidance.
+9. **GAP³D Cross-View Attention Prior** [TODO] — enforce multi-view consistency by injecting cross-attention keys/values from a second camera view into the current view's UNet forward pass during guidance.
    * **Config:** `gap3d_enabled` (default False), `gap3d_num_views` (default 4).
    * **Implementation:** at each iteration, sample `gap3d_num_views` additional cameras, render and encode them, then patch `unet.up_blocks` cross-attention to attend over the multi-view feature set. This requires modifying `dc_unet.py` (the one read-only file — make a backup first).
    * **Based on:** InterGSEdit (Wen et al., 2025).
    * ⚠️ 300 MB VRAM overhead per extra view. Start with `gap3d_num_views=2`.
-   * ⚠️ Most complex novelty. Implement AFTER N4–N7 are validated.
+   * ⚠️ Most complex novelty. Implement AFTER N4–N8 are validated.
 
 ---
 
 ### 🟢 TODO — Low Priority (optional, bonus contribution)
 
-9. **Anchor L1 Loss (RoMaP-style)** [TODO] — add a part-level L1 anchor term that penalizes deviation of edited Gaussians from their original positions, preventing over-deformation of geometry during aggressive edits.
-   * **Config:** `anchor_l1_weight` (default 0.0), `anchor_l1_region` (`"full"` or `"background"`).
-   * **Implementation:** cache `theta_0` (original Gaussian positions `mu_i`) before training starts. Add `anchor_l1_weight * mean(|mu_i - mu_i_0|)` to `L_DC`. When `galp_enabled=True`, apply only to non-target Gaussians (background anchor).
-   * **Based on:** RoMaP (Kim, Jang & Chun, 2025).
-   * ⚠️ Much simpler than N7 (3D-GALP). Can be implemented independently in ~20 lines.
+10. **Anchor L1 Loss (RoMaP-style)** [TODO] — add a part-level L1 anchor term that penalizes deviation of edited Gaussians from their original positions, preventing over-deformation of geometry during aggressive edits.
+    * **Config:** `anchor_l1_weight` (default 0.0), `anchor_l1_region` (`"full"` or `"background"`).
+    * **Implementation:** cache `theta_0` (original Gaussian positions `mu_i`) before training starts. Add `anchor_l1_weight * mean(|mu_i - mu_i_0|)` to `L_DC`. When `galp_enabled=True`, apply only to non-target Gaussians (background anchor).
+    * **Based on:** RoMaP (Kim, Jang & Chun, 2025).
+    * ⚠️ Much simpler than N8 (3D-GALP). Can be implemented independently in ~20 lines.
 
 ---
 
 ### Implementation Order Recommendation
 
 1. ~~N4 (STG) + N5 (Perp-Neg)~~ [DONE]
-2. N6 (Depth Reg) + N9 (Anchor L1) [lightweight losses]
-3. N7 (3D-GALP masking) [needs Grounded-SAM setup]
-4. N8 (GAP³D) [most complex, needs dc_unet.py edit]
+2. ~~N6 (Depth-Masked Perp-Neg)~~ [DONE]
+3. N7 (Depth Reg) + N10 (Anchor L1) [lightweight losses]
+4. N8 (3D-GALP masking) [needs Grounded-SAM setup]
+5. N9 (GAP³D) [most complex, needs dc_unet.py edit]
 
 ---
 
