@@ -56,7 +56,8 @@ class DCConfig:
     depth_mask_source: str = "depth"  # "depth" (renderer depth) or "cached" (precomputed masks)
     depth_mask_threshold: float = 0.5  # for depth source only
     cached_mask_dir: str = ""  # for cached source only
-    perp_neg_mask_dilate: int = 0  # dilate mask by N pixels before applying (gives edits room to grow)
+    perp_neg_mask_dilate: int = 0  # dilate binary mask by N image-pixels (hard expansion)
+    perp_neg_mask_blur: float = 0.0  # Gaussian blur sigma in image-pixels (soft falloff; 0=off)
     perp_neg_alpha: float = 1.0  # PN subtraction strength (1.0 = full, 0.5 = half)
 
     # STG (Self-attention skip guidance) — replace CFG with structure-preserving perturbation

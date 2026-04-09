@@ -14,7 +14,8 @@ DC_CUSTOM_PARAMS = dict(
     depth_mask_source="cached",      # "depth" or "cached"
     depth_mask_threshold=0.5,        # for depth source only
     cached_mask_dir="data/face_processed/masks",  # for cached source only
-    perp_neg_mask_dilate=10,         # dilate mask by N px (room for cloak/ears/hair growth)
+    perp_neg_mask_dilate=0,          # hard expansion in image-pixels (0=off)
+    perp_neg_mask_blur=30.0,         # Gaussian blur sigma in image-pixels (soft falloff; 0=off)
     perp_neg_alpha=1.0,              # PN strength (1.0=full, try 0.5-0.75 if too aggressive)
     # STG (Self-attention skip guidance)
     stg_enabled=False,
