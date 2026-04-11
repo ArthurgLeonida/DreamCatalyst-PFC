@@ -65,7 +65,7 @@ CMD=(ns-train "${METHOD}" \
 
 # Add downscale flag if specified
 if [ "${DOWNSCALE}" != "auto" ]; then
-    CMD+=(--pipeline.datamanager.dataparser.downscale-factor "${DOWNSCALE}")
+    CMD+=(--downscale-factor "${DOWNSCALE}")
 fi
 
 # Run training

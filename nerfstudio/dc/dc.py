@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
+import torchvision.transforms.functional as TF
 import torch.fft as fft
 import cv2
 from diffusers import DDIMScheduler, DiffusionPipeline
@@ -65,6 +66,14 @@ class DCConfig:
     stg_scale: float = 0.5
     stg_skip_layers: List[int] = field(default_factory=lambda: [2])
 
+    # Self-derived relevance masking — localize the DDS gradient using the
+    # model's own tgt/src prediction discrepancy.
+    gradient_mask_enabled: bool = False
+    gradient_mask_blur: float = 3.0
+    gradient_mask_ema_beta: float = 0.9
+    gradient_mask_gamma: float = 1.0
+    gradient_mask_warmup: int = 50
+
 
 class DC(object):
     def __init__(self, config: DCConfig, use_wandb=False):
@@ -103,6 +112,7 @@ class DC(object):
         self.w_s = 1.5
         self.iteration = 0
         self.max_iteration = config.max_iteration
+        self.gradient_mask_ema: Dict[int, torch.Tensor] = {}
 
         b1 = self.config.freeu_b1
         b2 = self.config.freeu_b2
@@ -111,6 +121,48 @@ class DC(object):
 
         register_free_upblock2d_in(self.unet, b1, b2, s1, s2)
         register_free_crossattn_upblock2d_in(self.unet, b1, b2, s1, s2)
+
+    def _build_gradient_relevance_mask(self, eps_tgt, eps_src, current_spot):
+        """Build a soft latent-space relevance mask from the DDS delta.
+
+        The mask is:
+        1. derived from ||eps_tgt - eps_src||_2 per spatial location,
+        2. percentile-normalized per sample,
+        3. temporally smoothed via EMA per view,
+        4. optionally sharpened and blurred,
+        5. detached before use so it does not backprop through the mask.
+        """
+        relevance = (eps_tgt - eps_src).norm(dim=1, keepdim=True)
+        flat = relevance.flatten(1)
+        p5 = torch.quantile(flat, 0.05, dim=1, keepdim=True).view(-1, 1, 1, 1)
+        p95 = torch.quantile(flat, 0.95, dim=1, keepdim=True).view(-1, 1, 1, 1)
+        normalized = ((relevance - p5) / (p95 - p5 + 1e-8)).clamp(0.0, 1.0)
+
+        prev_mask = self.gradient_mask_ema.get(current_spot)
+        if prev_mask is None or prev_mask.shape != normalized.shape:
+            ema_mask = normalized.detach()
+        else:
+            beta = self.config.gradient_mask_ema_beta
+            ema_mask = beta * prev_mask + (1.0 - beta) * normalized.detach()
+        self.gradient_mask_ema[current_spot] = ema_mask
+
+        if self.iteration < self.config.gradient_mask_warmup:
+            mask = torch.ones_like(normalized)
+        else:
+            mask = ema_mask
+
+        gamma = self.config.gradient_mask_gamma
+        if gamma != 1.0:
+            mask = mask.clamp_min(0.0).pow(gamma)
+
+        sigma = self.config.gradient_mask_blur
+        if sigma > 0:
+            kernel_size = max(3, int(round(6 * sigma + 1)))
+            if kernel_size % 2 == 0:
+                kernel_size += 1
+            mask = TF.gaussian_blur(mask, kernel_size=[kernel_size, kernel_size], sigma=[sigma, sigma])
+
+        return mask.clamp(0.0, 1.0).detach()
 
         
     def compute_posterior_mean(self, xt, noise_pred, t, t_prev):
@@ -373,6 +425,13 @@ class DC(object):
         
         w_DDS = self.config.delta + self.config.gamma * (t_normalized ** (1/math.e))
         grad = w_DDS * (eps["tgt"] - eps["src"]) + (self.config.psi * (math.exp(t_normalized))) * (tgt_x0 - src_x0)
+
+        if self.config.gradient_mask_enabled:
+            grad_mask = self._build_gradient_relevance_mask(
+                eps["tgt"], eps["src"], current_spot
+            )
+            grad = grad * grad_mask
+
         grad = torch.nan_to_num(grad)
         
         target = (tgt_x0 - grad).detach()

@@ -52,16 +52,30 @@ Verified changes:
 - `--mixed-precision False` is required for Steps 3 and 4 (FP16 corrupts DDS gradients).
 
 ## Editing tips (learned from experiments)
-- **Guidance scale**: Default 7.5 may be too weak. 12.5 worked well for material changes.
+- **Guidance scale is scene-dependent**: there is no single best CFG scale for all scenes.
+- **Face / Tolkien elf**: `guidance_scale=12.5` is currently the best known setting. It gives stronger and better-looking edits than `7.5` on the face scene.
+- **Stormtrooper / full-body person**: `guidance_scale=7.5` is currently the safest known setting. It reduced ghost-subject leakage compared with `12.5`, although the edit became somewhat weaker/softer.
+- **Do NOT force one CFG scale for all experiments**. Current best practice is:
+  - use **12.5** for the face/elf benchmark
+  - use **7.5** as the stormtrooper baseline
+  - treat kitchen/object scenes as unresolved and test around `7.5 -> 10.0 -> 12.5`
+- **Next guidance-scale experiments**:
+  - face/elf: keep `12.5` as the reference; do not lower it unless specifically testing a localization branch
+  - stormtrooper: compare `7.5` vs `10.0`, then test whether self-derived masking makes `10.0` or `12.5` usable without ghosting
+  - kitchen: start from `7.5` or `10.0`; only use `12.5` if localization/masking is active
+- **Interpretation**: higher guidance helps edit strength, but also amplifies the risk of global leakage, duplicate subject emergence, and background smoothing. The point of self-derived masking is not to make CFG arbitrarily large; it is to make mid/high guidance more spatially selective.
 - **TAG novelties**: Can cause floaters. Disable (`eta_tag=1.0`) when debugging other issues. Re-enable gradually (1.05 → 1.10 → 1.15).
 - **NeRF (dc) memory**: NeRF editing needs ~77 GiB VRAM for differentiable full-image rendering + IP2P. Use `--pipeline.dc-device cuda:1` to offload diffusion to a second GPU, or use 3DGS (dc_splat) which is more memory-efficient.
 - **STG**: Adds ~50% per-iteration time. Formula matches paper Eq 13: `ε̃ = ε_full + w·(ε_full − ε_weak)`. `stg_scale=0` = off. Hook zeroes `attn1` output; with residual connection this IS the identity skip (correct STG-A behavior). Paper default `w=2.0` is too aggressive when combined with IP2P 3-way CFG at `guidance_scale=12.5` — start with `stg_scale=0.5` and `stg_skip_layers=[2]`, sweep up. ⚠️ Old formula `ε_weak + λ·(ε_full − ε_weak)` had λ=1 as no-op — all prior STG experiments with `stg_scale=1.0` had zero STG effect.
-- **Perp-Neg**: Zero overhead. Safe to always enable as a first experiment.
+- **Perp-Neg**: Zero overhead. Boosts creative edits (elf cloak) but destroys background. Use Foreground-Masked PN (N6) with cached masks + soft blur for the best tradeoff.
+- **Kitchen scene lesson**: kitchen is a strong localization stress test. Even improved prompts can still leak realism/material changes into table, placemats, and nearby objects. Treat this as a true DDS/IP2P spatial-selectivity problem, not only a prompt-writing issue.
+- **Stormtrooper scene lesson**: this scene can show strong edit capability, but may create a duplicate/ghost stormtrooper in another region. Interpret this as weak instance selectivity / subject duplication, not just “bad generation.” Also note that the previous bug with only 4 images in eval outputs was due to COLMAP and has been solved.
+- **Fine-structure loss**: even when the main subject edit looks good, wall seam lines and floor patterns can get washed out. This is likely low-amplitude global smoothing from repeated DDS optimization, not necessarily a gross localization failure.
 - **Face dataset dimensions (downscale-factor 2)**: Original images in `images_2/` are 497×369 (W×H). Pipeline resizes smallest-side to 512 → `[1, 3, 512, 689]`. VAE encodes (8× spatial compression) → latent `[1, 4, 64, 86]`. UNet spatial progression: 64×86 → 32×43 → 16×22 → 8×11 (mid) → 16×22 → 32×43 → 64×86. The first CrossAttnUpBlock2D (Up 1, where STG hooks act) operates at **16×22×1280ch**. Latent is NOT 64×64 — aspect ratio propagates through the entire network.
 
 ## Novelties (TASD)
 
-Modifications to DDS guidance in `dc.py`. Novelties N1–N6 are done; N7–N10 are TODO in priority order.
+Modifications to DDS guidance in `dc.py`. Novelties N1–N7 are done; N8–N10 are TODO in priority order.
 
 ---
 
@@ -108,24 +122,31 @@ Modifications to DDS guidance in `dc.py`. Novelties N1–N6 are done; N7–N10 a
    * ⚠️ Mask is `.detach()`ed — no gradients flow through the mask to the NeRF density field.
    * **Script:** `scripts/generate_masks.py` — supports `grounded-sam` (GroundingDINO + SAM, text-prompted) and `rembg` (U2Net, automatic) backends. Run in a separate env to avoid dependency conflicts.
 
+7. **Self-Derived Relevance Masking** [DONE / exploratory] — localize the final DDS gradient using the model's own tgt/src discrepancy.
+   * **Config:** `gradient_mask_enabled`, `gradient_mask_blur`, `gradient_mask_ema_beta`, `gradient_mask_gamma`, `gradient_mask_warmup`.
+   * **Implementation:** after computing `grad`, derive `R = ||eps_tgt - eps_src||_2` per spatial location, percentile-normalize it (5th/95th), smooth it with EMA per `current_spot`, optionally sharpen with `gamma`, optionally blur in latent space, and multiply the final DDS gradient by the resulting soft mask.
+   * **Why it exists:** recent kitchen and stormtrooper failures suggest the biggest remaining issue is spatial selectivity. Kitchen leaks into nearby surfaces/objects; stormtrooper can instantiate a duplicate "ghost" subject even when the main edit works.
+   * **Based on:** inspired by **LatentEditor** (delta-score localization), conceptually aligned with **LENeRF** (3D-localized editing), and complementary to **CustomNeRF** (local-global editing schedule).
+   * **Important caution:** this is **LatentEditor-inspired**, not literally the same signal as LatentEditor's conditional-vs-empty delta. Here the relevance comes from `eps_tgt - eps_src` in DreamCatalyst's asymmetric DDS setup.
+
 ---
 
 ### 🟡 TODO — Medium Priority (professor's recommended papers)
 
-7. **Depth Regularization** [TODO] — add a monocular depth consistency loss to the DreamCatalyst loss `L_DC` to anchor Gaussian positions during editing. Prevents floaters introduced by TAG at high η.
+8. **Depth Regularization** [TODO] — add a monocular depth consistency loss to the DreamCatalyst loss `L_DC` to anchor Gaussian positions during editing. Prevents floaters introduced by TAG at high η.
    * **Config:** `depth_reg_weight` (default 0.0), `depth_model` (default `"midas"`).
    * **Implementation:** in `dc.py` loss computation, load MiDaS depth prediction for the current render and add `depth_reg_weight * L1(depth_pred, depth_anchor)` where `depth_anchor` is computed once from the original unedited scene.
    * **Based on:** Depth-Regularized Optimization for 3DGS (Chung et al., CVPRW 2024).
    * ⚠️ Adds ~1.2s per iteration. Use `depth_reg_freq=10` (every 10 iters) to amortize.
 
-8. **3D-GALP Part Masking** [TODO] — restrict DDS gradient to Gaussians that belong to the target semantic region, leaving background untouched.
+9. **3D-GALP Part Masking** [TODO] — restrict DDS gradient to Gaussians that belong to the target semantic region, leaving background untouched.
    * **Config:** `galp_enabled` (default False), `galp_seg_prompt` (str, e.g. `"face"`).
    * **Implementation:** run a zero-shot segmentation (e.g. Grounded-SAM) on the source render to get a 2D mask per camera. Project mask into 3D via splatting opacity weights to identify "target Gaussians". Zero out `∇θ L_DC` for non-target Gaussians before the Adam step.
    * **Based on:** RoMaP (Kim, Jang & Chun, 2025).
    * ⚠️ Requires `groundingdino` + `segment-anything` in the env. Heavy dependency.
    * ⚠️ 200 MB VRAM overhead. Run with `--pipeline.datamanager.train-num-rays-per-batch 2048`.
 
-9. **GAP³D Cross-View Attention Prior** [TODO] — enforce multi-view consistency by injecting cross-attention keys/values from a second camera view into the current view's UNet forward pass during guidance.
+10. **GAP³D Cross-View Attention Prior** [TODO] — enforce multi-view consistency by injecting cross-attention keys/values from a second camera view into the current view's UNet forward pass during guidance.
    * **Config:** `gap3d_enabled` (default False), `gap3d_num_views` (default 4).
    * **Implementation:** at each iteration, sample `gap3d_num_views` additional cameras, render and encode them, then patch `unet.up_blocks` cross-attention to attend over the multi-view feature set. This requires modifying `dc_unet.py` (the one read-only file — make a backup first).
    * **Based on:** InterGSEdit (Wen et al., 2025).
@@ -136,7 +157,7 @@ Modifications to DDS guidance in `dc.py`. Novelties N1–N6 are done; N7–N10 a
 
 ### 🟢 TODO — Low Priority (optional, bonus contribution)
 
-10. **Anchor L1 Loss (RoMaP-style)** [TODO] — add a part-level L1 anchor term that penalizes deviation of edited Gaussians from their original positions, preventing over-deformation of geometry during aggressive edits.
+11. **Anchor L1 Loss (RoMaP-style)** [TODO] — add a part-level L1 anchor term that penalizes deviation of edited Gaussians from their original positions, preventing over-deformation of geometry during aggressive edits.
     * **Config:** `anchor_l1_weight` (default 0.0), `anchor_l1_region` (`"full"` or `"background"`).
     * **Implementation:** cache `theta_0` (original Gaussian positions `mu_i`) before training starts. Add `anchor_l1_weight * mean(|mu_i - mu_i_0|)` to `L_DC`. When `galp_enabled=True`, apply only to non-target Gaussians (background anchor).
     * **Based on:** RoMaP (Kim, Jang & Chun, 2025).
@@ -148,9 +169,23 @@ Modifications to DDS guidance in `dc.py`. Novelties N1–N6 are done; N7–N10 a
 
 1. ~~N4 (STG) + N5 (Perp-Neg)~~ [DONE]
 2. ~~N6 (Depth-Masked Perp-Neg)~~ [DONE]
-3. N7 (Depth Reg) + N10 (Anchor L1) [lightweight losses]
-4. N8 (3D-GALP masking) [needs Grounded-SAM setup]
-5. N9 (GAP³D) [most complex, needs dc_unet.py edit]
+3. ~~N7 (Self-Derived Relevance Masking)~~ [DONE / exploratory]
+4. N8 (Depth Reg) + N11 (Anchor L1) [lightweight preservation losses]
+5. N9 (3D-GALP masking) [needs Grounded-SAM setup]
+6. N10 (GAP³D) [most complex, needs dc_unet.py edit]
+
+### Current Best Interpretation Of Failures
+
+- **Face**: best success case; subject dominance hides much of the global leakage.
+- **Kitchen**: strongest evidence of localized editability failure; realism/material changes leak into table, placemats, and nearby objects.
+- **Stormtrooper**: main subject edit can work well, but duplicate/ghost subject emergence reveals weak instance selectivity.
+- **Wall/floor line loss**: even without obvious ghosting, repeated DDS optimization can wash out fine non-target structure via low-amplitude global smoothing.
+
+So the main remaining bottleneck is:
+
+> strong but spatially under-constrained editing
+
+not simply "stronger guidance needed."
 
 ---
 
@@ -167,6 +202,36 @@ Cite in: Chapter 2 (Related Work §2.1), Chapter 7 (Future Work — 360° captur
 What it is: Compact 3DGS using only 2K learnable query tokens instead of per-pixel Gaussians. 65× fewer Gaussians, lower VRAM, competitive reconstruction quality. Includes C3G-F for view-invariant feature lifting without autoencoder compression. Relevance to your project: NOT applicable as a dc.py novelty, but highly relevant as a future pipeline evolution. Running DDS editing on 2K compact Gaussians instead of millions would: (a) reduce floater risk, (b) make N9 Anchor L1 trivial, (c) make N8 GAP³D unnecessary since C3G-F already provides view-invariant features. Same lab as TAG (N1) — strengthens the KAIST-connection narrative of your thesis.
 
 Cite in: Chapter 2 (Related Work §2.1), Chapter 7 (Future Work — compact base repr).
+
+**LatentEditor** (Khalid et al., 2024)
+
+What it is: 2D instruction-based image editing that derives a localization signal from the model's own conditional-vs-empty prediction delta. Relevance to your project: the cleanest inspiration for self-derived relevance masking in DreamCatalyst, especially for kitchen/stormtrooper-style leakage.
+
+Cite in: Chapter 2 (Related Work §2.2), Chapter 5 (new localization branch).
+
+**LENeRF** (KAIST, Jaegul Choo's group, 2023)
+
+What it is: localized NeRF editing via a learned 3D attention field distilled from CLIP-style masks. Relevance to your project: strongest conceptual support for interpreting kitchen as a localized-editability failure and stormtrooper as a weak instance-selectivity problem.
+
+Cite in: Chapter 2 (Related Work §2.2), Chapter 7 (Future Work — learned 3D attention).
+
+**CustomNeRF** (He et al., CVPR 2024)
+
+What it is: adaptive source-driven 3D scene editing with Local-Global Iterative Editing (LGIE). Relevance to your project: excellent next-step inspiration if self-derived masking helps but remains too conservative; suggests alternating localized and global editing instead of only masking.
+
+Cite in: Chapter 2 (Related Work §2.2), Chapter 7 (Future Work — local-global scheduling).
+
+**ED-NeRF** (KAIST, 2024)
+
+What it is: latent-space NeRF editing that argues DDS is better suited for editing than SDS. Relevance to your project: supports staying in a latent-space/DDS editing framework rather than switching immediately to a different backbone.
+
+Cite in: Chapter 2 (Related Work §2.2), Chapter 7 (Future Work — NeRF-focused editing extensions).
+
+**Blending-NeRF** (SNU, 2024)
+
+What it is: localized NeRF editing with support for structural additions/replacements. Relevance to your project: especially relevant to kitchen-like object replacement and cloak-like localized structural edits, but more invasive than the current timeline allows.
+
+Cite in: Chapter 2 (Related Work §2.2), Chapter 7 (Future Work — localized structural editing).
 
 ## Build gotchas
 - System nvcc 12.4 vs PyTorch CUDA 11.8 → CUDA_HOME must point to conda env.

@@ -3,9 +3,10 @@
 #  DreamCatalyst-NS — Editing script (Step 3: DDS guidance)
 # ==============================================================================
 #  Usage:
-#    bash scripts/edit.sh <scene> <src_prompt> <tgt_prompt> <load_dir> [max_iters] [rep]
+#    bash scripts/edit.sh <scene> <src_prompt> <tgt_prompt> <load_dir> [max_iters] [rep] [downscale]
 #
 #  rep: splat (default) or nerf
+#  downscale: must match Step 2 training downscale (default: 2)
 #
 #  For NeRF, two GPUs are auto-selected (NeRF model + diffusion model)
 #  since nerfacto + IP2P exceeds single-GPU memory.
@@ -92,11 +93,11 @@ CMD=(ns-train "${METHOD}" \
     --pipeline.dc.src-prompt "${SRC_PROMPT}" \
     --pipeline.dc.tgt-prompt "${TGT_PROMPT}" \
     --pipeline.dc.max-iteration "${MAX_ITERS}" \
-    --pipeline.dc.guidance-scale 12.5 \
+    --pipeline.dc.guidance-scale 7.5 \
     --pipeline.dc-device "cuda:0" \
     --pipeline.dc.sd-pretrained-model-or-path timbrooks/instruct-pix2pix \
     pipeline.datamanager:"${DM_CONFIG}" \
-    --pipeline.datamanager.dataparser.downscale-factor 2)
+    --pipeline.datamanager.dataparser.downscale-factor 1)
 
 # For NeRF: offload diffusion model to second GPU if available
 # Count how many GPUs are actually visible (comma-separated list)

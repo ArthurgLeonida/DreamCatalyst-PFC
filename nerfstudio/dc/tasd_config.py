@@ -21,4 +21,11 @@ DC_CUSTOM_PARAMS = dict(
     stg_enabled=False,
     stg_scale=0.5,
     stg_skip_layers=[2],
+    # Self-derived relevance masking — localize the final DDS gradient using
+    # the model's own tgt/src discrepancy. Off by default to preserve current behavior.
+    gradient_mask_enabled=False,
+    gradient_mask_blur=3.0,          # latent-space Gaussian blur sigma
+    gradient_mask_ema_beta=0.9,      # temporal smoothing across iterations
+    gradient_mask_gamma=1.0,         # >1 sharpens the mask
+    gradient_mask_warmup=50,         # wait N steps before applying the EMA mask
 )
