@@ -166,6 +166,7 @@ class DCPipeline(ModifiedVanillaPipeline):
 
         dic = self.dc(tgt_x0=x0, src_x0=src_x0, src_emb=src_emb, return_dict=True, step=step, current_spot=current_spot, depth_mask=depth_mask)
         grad = dic["grad"].cpu()
+        grad_mask = dic.get("grad_mask", None)
         loss = dic["loss"] * self.config.dc_loss_mult
         loss = loss.to(self.device)
         loss_dict["dc_loss"] = loss
@@ -194,6 +195,12 @@ class DCPipeline(ModifiedVanillaPipeline):
             mask_vis = F.interpolate(depth_mask.cpu(), size=(h, w), mode="nearest")
             mask_img = Image.fromarray((mask_vis[0, 0].numpy() * 255).astype(np.uint8))
             mask_img.save(self.base_dir / f"logging/{step}_depth_mask.png")
+
+        # Save self-derived relevance mask visualization for debugging
+        if grad_mask is not None and step % self.config.log_step == 0:
+            grad_mask_vis = F.interpolate(grad_mask.cpu(), size=(h, w), mode="bilinear", align_corners=False)
+            grad_mask_img = Image.fromarray((grad_mask_vis[0, 0].clamp(0, 1).numpy() * 255).astype(np.uint8))
+            grad_mask_img.save(self.base_dir / f"logging/{step}_gradient_mask.png")
 
         # logging
         if step % self.config.log_step == 0:
