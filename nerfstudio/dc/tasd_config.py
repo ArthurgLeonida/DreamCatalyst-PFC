@@ -8,7 +8,7 @@ DC_CUSTOM_PARAMS = dict(
     adaptive_tag=False,
     asymmetric_tag=False,
     # Perpendicular Gradient Projection (Perp-Neg) — orthogonalize eps_tgt w.r.t. eps_src
-    perp_neg=True,
+    perp_neg=False,
     # Foreground-Masked Perp-Neg — restrict PN subtraction to foreground
     depth_masked_perp_neg=True,
     depth_mask_source="cached",      # "depth" or "cached"
@@ -28,4 +28,5 @@ DC_CUSTOM_PARAMS = dict(
     gradient_mask_ema_beta=0.9,      # temporal smoothing across iterations
     gradient_mask_gamma=1.0,         # >1 sharpens the mask
     gradient_mask_warmup=50,         # wait N steps before applying the EMA mask
+    source_blend_localization_enabled=True,  # blend eps_tgt toward eps_src outside the relevance mask
 )

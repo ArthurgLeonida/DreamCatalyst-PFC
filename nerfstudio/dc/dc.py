@@ -73,6 +73,7 @@ class DCConfig:
     gradient_mask_ema_beta: float = 0.9
     gradient_mask_gamma: float = 1.0
     gradient_mask_warmup: int = 50
+    source_blend_localization_enabled: bool = False
 
 
 class DC(object):
@@ -132,8 +133,8 @@ class DC(object):
         4. optionally sharpened and blurred,
         5. detached before use so it does not backprop through the mask.
         """
-        relevance = (eps_tgt - eps_src).norm(dim=1, keepdim=True)
-        flat = relevance.flatten(1)
+        relevance = (eps_tgt - eps_src).norm(dim=1, keepdim=True) # B, 1, H, W
+        flat = relevance.flatten(1) # B, H*W
         p5 = torch.quantile(flat, 0.05, dim=1, keepdim=True).view(-1, 1, 1, 1)
         p95 = torch.quantile(flat, 0.95, dim=1, keepdim=True).view(-1, 1, 1, 1)
         normalized = ((relevance - p5) / (p95 - p5 + 1e-8)).clamp(0.0, 1.0)
@@ -344,18 +345,18 @@ class DC(object):
 
             src_encoded = src_emb.latent_dist.mode()
             
-            # STARTING SHAPES: [1, 4, 64, 64]
+            # STARTING SHAPES: [1, 4, H, W]
             uncond_image_latent = torch.zeros_like(src_encoded)
-            # SHAPE: [1, 4, 64, 64] (But filled entirely with 0s)
+            # SHAPE: [1, 4, H, W] (But filled entirely with 0s)
             
             latent_image = torch.cat([src_encoded, src_encoded, uncond_image_latent], dim=0)
-            # SHAPE: [3, 4, 64, 64] (Stack of 3 condition images)
+            # SHAPE: [3, 4, H, W] (Stack of 3 condition images)
             
             latent_model_input = torch.cat([latents_noisy] * 3, dim=0) 
-            # SHAPE: [3, 4, 64, 64] (Stack of 3 noisy images)
+            # SHAPE: [3, 4, H, W] (Stack of 3 noisy images)
             
             latent_model_input = torch.cat([latent_model_input, latent_image], dim=1)
-            # FINAL SHAPE: [3, 8, 64, 64] (The mutant InstructPix2Pix tensor ready for the U-Net!) 
+            # FINAL SHAPE: [3, 8, H, W] (The mutant InstructPix2Pix tensor ready for the U-Net!) 
 
             unet_outputs = self.unet.forward(
                 latent_model_input,
@@ -423,14 +424,23 @@ class DC(object):
 
         self.iteration += 1
         
-        w_DDS = self.config.delta + self.config.gamma * (t_normalized ** (1/math.e))
-        grad = w_DDS * (eps["tgt"] - eps["src"]) + (self.config.psi * (math.exp(t_normalized))) * (tgt_x0 - src_x0)
         grad_mask = None
-
-        if self.config.gradient_mask_enabled:
+        if self.config.gradient_mask_enabled or self.config.source_blend_localization_enabled:
             grad_mask = self._build_gradient_relevance_mask(
                 eps["tgt"], eps["src"], current_spot
             )
+
+        eps_tgt_for_grad = eps["tgt"]
+        if self.config.source_blend_localization_enabled and grad_mask is not None:
+            # Source-blended localization:
+            # low-mask regions naturally fall back toward the source branch,
+            # reducing DDS pressure on background / non-target structure.
+            eps_tgt_for_grad = eps["src"] + grad_mask * (eps["tgt"] - eps["src"])
+
+        w_DDS = self.config.delta + self.config.gamma * (t_normalized ** (1/math.e))
+        grad = w_DDS * (eps_tgt_for_grad - eps["src"]) + (self.config.psi * (math.exp(t_normalized))) * (tgt_x0 - src_x0)
+
+        if self.config.gradient_mask_enabled and grad_mask is not None:
             grad = grad * grad_mask
 
         grad = torch.nan_to_num(grad)

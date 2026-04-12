@@ -64,6 +64,7 @@ Verified changes:
   - stormtrooper: compare `7.5` vs `10.0`, then test whether self-derived masking makes `10.0` or `12.5` usable without ghosting
   - kitchen: start from `7.5` or `10.0`; only use `12.5` if localization/masking is active
 - **Interpretation**: higher guidance helps edit strength, but also amplifies the risk of global leakage, duplicate subject emergence, and background smoothing. The point of self-derived masking is not to make CFG arbitrarily large; it is to make mid/high guidance more spatially selective.
+- **Current preferred localization variant**: the self-derived mask branch now supports both direct gradient masking and **source-blended localization**. Prefer `source_blend_localization_enabled=True` as the first serious experiment; keep pure `gradient_mask_enabled=True` as the ablation/baseline. Source blending is more principled because low-mask regions naturally fall back toward `eps_src` instead of only getting their final gradient attenuated.
 - **TAG novelties**: Can cause floaters. Disable (`eta_tag=1.0`) when debugging other issues. Re-enable gradually (1.05 → 1.10 → 1.15).
 - **NeRF (dc) memory**: NeRF editing needs ~77 GiB VRAM for differentiable full-image rendering + IP2P. Use `--pipeline.dc-device cuda:1` to offload diffusion to a second GPU, or use 3DGS (dc_splat) which is more memory-efficient.
 - **STG**: Adds ~50% per-iteration time. Formula matches paper Eq 13: `ε̃ = ε_full + w·(ε_full − ε_weak)`. `stg_scale=0` = off. Hook zeroes `attn1` output; with residual connection this IS the identity skip (correct STG-A behavior). Paper default `w=2.0` is too aggressive when combined with IP2P 3-way CFG at `guidance_scale=12.5` — start with `stg_scale=0.5` and `stg_skip_layers=[2]`, sweep up. ⚠️ Old formula `ε_weak + λ·(ε_full − ε_weak)` had λ=1 as no-op — all prior STG experiments with `stg_scale=1.0` had zero STG effect.
@@ -123,8 +124,11 @@ Modifications to DDS guidance in `dc.py`. Novelties N1–N7 are done; N8–N10 a
    * **Script:** `scripts/generate_masks.py` — supports `grounded-sam` (GroundingDINO + SAM, text-prompted) and `rembg` (U2Net, automatic) backends. Run in a separate env to avoid dependency conflicts.
 
 7. **Self-Derived Relevance Masking** [DONE / exploratory] — localize the final DDS gradient using the model's own tgt/src discrepancy.
-   * **Config:** `gradient_mask_enabled`, `gradient_mask_blur`, `gradient_mask_ema_beta`, `gradient_mask_gamma`, `gradient_mask_warmup`.
-   * **Implementation:** after computing `grad`, derive `R = ||eps_tgt - eps_src||_2` per spatial location, percentile-normalize it (5th/95th), smooth it with EMA per `current_spot`, optionally sharpen with `gamma`, optionally blur in latent space, and multiply the final DDS gradient by the resulting soft mask.
+   * **Config:** `gradient_mask_enabled`, `gradient_mask_blur`, `gradient_mask_ema_beta`, `gradient_mask_gamma`, `gradient_mask_warmup`, `source_blend_localization_enabled`.
+   * **Implementation:** derive `R = ||eps_tgt - eps_src||_2` per spatial location, percentile-normalize it (5th/95th), smooth it with EMA per `current_spot`, optionally sharpen it with `gamma`, optionally blur it in latent space, and then use the resulting soft mask in one of two ways:
+     * **Ablation / direct masking:** `grad_masked = grad * M`
+     * **Preferred current form:** `eps_tgt_loc = eps_src + M * (eps_tgt - eps_src)`
+   * **Why source blending is preferred:** low-mask regions naturally fall back toward the source branch, which is a cleaner way to reduce floor/wall/background drift than only attenuating the already-computed final DDS gradient.
    * **Why it exists:** recent kitchen and stormtrooper failures suggest the biggest remaining issue is spatial selectivity. Kitchen leaks into nearby surfaces/objects; stormtrooper can instantiate a duplicate "ghost" subject even when the main edit works.
    * **Based on:** inspired by **LatentEditor** (delta-score localization), conceptually aligned with **LENeRF** (3D-localized editing), and complementary to **CustomNeRF** (local-global editing schedule).
    * **Important caution:** this is **LatentEditor-inspired**, not literally the same signal as LatentEditor's conditional-vs-empty delta. Here the relevance comes from `eps_tgt - eps_src` in DreamCatalyst's asymmetric DDS setup.
@@ -169,7 +173,7 @@ Modifications to DDS guidance in `dc.py`. Novelties N1–N7 are done; N8–N10 a
 
 1. ~~N4 (STG) + N5 (Perp-Neg)~~ [DONE]
 2. ~~N6 (Depth-Masked Perp-Neg)~~ [DONE]
-3. ~~N7 (Self-Derived Relevance Masking)~~ [DONE / exploratory]
+3. ~~N7 (Self-Derived Relevance Masking)~~ [DONE / exploratory; prefer source-blended localization before bigger branches]
 4. N8 (Depth Reg) + N11 (Anchor L1) [lightweight preservation losses]
 5. N9 (3D-GALP masking) [needs Grounded-SAM setup]
 6. N10 (GAP³D) [most complex, needs dc_unet.py edit]
