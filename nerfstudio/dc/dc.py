@@ -74,6 +74,7 @@ class DCConfig:
     gradient_mask_gamma: float = 1.0
     gradient_mask_warmup: int = 50
     source_blend_localization_enabled: bool = False
+    outside_mask_anchor_weight: float = 0.0
 
 
 class DC(object):
@@ -425,7 +426,11 @@ class DC(object):
         self.iteration += 1
         
         grad_mask = None
-        if self.config.gradient_mask_enabled or self.config.source_blend_localization_enabled:
+        if (
+            self.config.gradient_mask_enabled
+            or self.config.source_blend_localization_enabled
+            or self.config.outside_mask_anchor_weight > 0
+        ):
             grad_mask = self._build_gradient_relevance_mask(
                 eps["tgt"], eps["src"], current_spot
             )
@@ -437,8 +442,17 @@ class DC(object):
             # reducing DDS pressure on background / non-target structure.
             eps_tgt_for_grad = eps["src"] + grad_mask * (eps["tgt"] - eps["src"])
 
+        preserve_weight = self.config.psi
+        if grad_mask is not None and self.config.outside_mask_anchor_weight > 0:
+            # Strengthen x0/source anchoring outside the edit region so smooth
+            # backgrounds (walls, floors) remain closer to the original scene.
+            preserve_weight = preserve_weight + self.config.outside_mask_anchor_weight * (1.0 - grad_mask)
+
         w_DDS = self.config.delta + self.config.gamma * (t_normalized ** (1/math.e))
-        grad = w_DDS * (eps_tgt_for_grad - eps["src"]) + (self.config.psi * (math.exp(t_normalized))) * (tgt_x0 - src_x0)
+        grad = (
+            w_DDS * (eps_tgt_for_grad - eps["src"])
+            + math.exp(t_normalized) * preserve_weight * (tgt_x0 - src_x0)
+        )
 
         if self.config.gradient_mask_enabled and grad_mask is not None:
             grad = grad * grad_mask

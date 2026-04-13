@@ -29,4 +29,5 @@ DC_CUSTOM_PARAMS = dict(
     gradient_mask_gamma=1.0,         # >1 sharpens the mask
     gradient_mask_warmup=50,         # wait N steps before applying the EMA mask
     source_blend_localization_enabled=True,  # blend eps_tgt toward eps_src outside the relevance mask
+    outside_mask_anchor_weight=0.0,  # extra x0/source anchoring outside the relevance mask
 )
