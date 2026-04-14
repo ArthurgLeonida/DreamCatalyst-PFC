@@ -32,7 +32,7 @@ class DCConfig:
     device: torch.device = torch.device("cuda")
     image_guidance_scale: float = 1.5
 
-    psi = 0.075
+    psi: float = 0.075
     chi = math.log(0.1)
     delta = 0.2
     gamma = 0.8
