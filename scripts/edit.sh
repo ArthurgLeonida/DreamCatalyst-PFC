@@ -86,8 +86,9 @@ CMD=(ns-train "${METHOD}" \
     --machine.seed 42 \
     --max-num-iterations "${MAX_ITERS}" \
     --mixed-precision False \
-    --vis tensorboard \
-    --experiment-name "${SCENE}" \
+    --vis viewer+wandb \
+    --project-name dreamcatalyst-pfc \
+    --experiment-name "${SCENE}"_fulltag115_srcblend_b2g12 \
     --data "${DATA_DIR}" \
     --load-dir "${LOAD_DIR}" \
     --pipeline.dc.src-prompt "${SRC_PROMPT}" \

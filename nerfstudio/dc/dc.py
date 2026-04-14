@@ -2,12 +2,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
-import torch.fft as fft
-import cv2
 from diffusers import DDIMScheduler, DiffusionPipeline
 from jaxtyping import Float
 from PIL import Image
@@ -15,6 +11,64 @@ from typing import List, Dict
 from dc.dc_unet import CustomUNet2DConditionModel
 from dc.utils.free_lunch import register_free_upblock2d_in, register_free_crossattn_upblock2d_in
 import math
+
+
+class STGIdentityValueAttnProcessor:
+    """Paper-faithful STG-A processor.
+
+    The STG paper describes attention skip by replacing the attention matrix
+    A with the identity I so that SA'(Q, K, V) = IV = V. This processor
+    implements that directly in diffusers' attention path by skipping the
+    query/key attention-score computation while preserving the value and output
+    projections.
+    """
+
+    def __call__(
+        self,
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        temb=None,
+        *args,
+        **kwargs,
+    ):
+        residual = hidden_states
+
+        if getattr(attn, "spatial_norm", None) is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+
+        input_ndim = hidden_states.ndim
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
+        if getattr(attn, "group_norm", None) is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif getattr(attn, "norm_cross", False):
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        # STG-A: replace A with I so the branch output becomes the projected
+        # value path rather than A @ V.
+        value = attn.to_v(encoder_hidden_states)
+        value = attn.head_to_batch_dim(value)
+        hidden_states = attn.batch_to_head_dim(value)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+        if getattr(attn, "residual_connection", False):
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / getattr(attn, "rescale_output_factor", 1.0)
+        return hidden_states
+
 
 @dataclass
 class DCConfig:
@@ -49,6 +103,8 @@ class DCConfig:
     eta_tag: float = 1.0
     adaptive_tag: bool = False
     asymmetric_tag: bool = False
+    tag_negative_prompt: str = ""
+    tag_negative_strength: float = 0.0
 
     # Perpendicular Gradient Projection (Perp-Neg) — orthogonalize eps_tgt w.r.t. eps_src
     perp_neg: bool = False
@@ -103,15 +159,16 @@ class DC(object):
         ## construct text features beforehand.
         self.src_prompt = self.config.src_prompt
         self.tgt_prompt = self.config.tgt_prompt
+        self.tag_negative_prompt = self.config.tag_negative_prompt
 
         self.update_text_features(src_prompt=self.src_prompt, tgt_prompt=self.tgt_prompt)
         self.null_text_feature = self.encode_text("")
+        self.tag_negative_text_feature = (
+            self.encode_text(self.tag_negative_prompt) if self.tag_negative_prompt else None
+        )
     
         self.use_wandb = use_wandb
 
-        self.threshold = 0.2
-        self.check = 0
-        self.w_s = 1.5
         self.iteration = 0
         self.max_iteration = config.max_iteration
         self.gradient_mask_ema: Dict[int, torch.Tensor] = {}
@@ -229,11 +286,28 @@ class DC(object):
                 self.tgt_prompt = tgt_prompt
                 self.tgt_text_feature = self.encode_text(tgt_prompt)
 
+    def get_tag_negative_text_embedding(self):
+        """Return the cached text embedding for the post-TAG negative regularizer."""
+        return self.tag_negative_text_feature
+
     def _run_unet_with_skipped_attn(self, latent_model_input, t, text_embeddings):
-        """Run UNet forward pass with self-attention zeroed out in selected up_blocks.
-        This produces the 'weak model' prediction for STG.
-        Hooks are always removed in finally block."""
+        """Run UNet forward pass with STG-A attention skip in selected up_blocks.
+
+        Preferred path: temporarily swap attn1's processor with a paper-faithful
+        processor that replaces the attention map A with I so SA'(Q,K,V)=IV=V.
+
+        Fallback path: if processor swapping is unavailable, zero the branch
+        output so the surrounding transformer residual behaves like an identity
+        skip at the block level.
+        """
         hooks = []
+        original_processors = []
+        stg_processor = STGIdentityValueAttnProcessor()
+
+        def _zero_attn_branch_output(module, inputs, output):
+            """Approximate STG-A when a processor-level override is unavailable."""
+            return torch.zeros_like(output)
+
         try:
             for layer_idx in self.config.stg_skip_layers:
                 block = self.unet.up_blocks[layer_idx]
@@ -241,10 +315,16 @@ class DC(object):
                     continue
                 for attn_module in block.attentions:
                     for transformer_block in attn_module.transformer_blocks:
-                        hook = transformer_block.attn1.register_forward_hook(
-                            lambda m, inp, out: torch.zeros_like(out)
-                        )
-                        hooks.append(hook)
+                        attn = transformer_block.attn1
+                        if hasattr(attn, "processor"):
+                            original_processors.append((attn, attn.processor))
+                            if hasattr(attn, "set_processor"):
+                                attn.set_processor(stg_processor)
+                            else:
+                                attn.processor = stg_processor
+                        else:
+                            hook = attn.register_forward_hook(_zero_attn_branch_output)
+                            hooks.append(hook)
 
             with torch.no_grad():
                 output = self.unet.forward(
@@ -254,6 +334,11 @@ class DC(object):
                 )
             return output.sample
         finally:
+            for attn, processor in original_processors:
+                if hasattr(attn, "set_processor"):
+                    attn.set_processor(processor)
+                else:
+                    attn.processor = processor
             for hook in hooks:
                 hook.remove()
 
@@ -309,29 +394,7 @@ class DC(object):
             eta_tag_current = self.config.eta_tag
         # ====================================================================================
 
-        beta_t = scheduler.betas[t].to(device)
-        alpha_t = scheduler.alphas[t].to(device)
-        alpha_bar_t = scheduler.alphas_cumprod[t].to(device)
-        alpha_bar_t_prev = scheduler.alphas_cumprod[t_prev].to(device)
-        
-        '''
-        beta_t_tau = scheduler.betas[t_tau].to(device)
-        alpha_t_tau = scheduler.alphas[t_tau].to(device)
-        alpha_bar_t_tau = scheduler.alphas_cumprod[t_tau].to(device)      
-        '''
-        
         noise = torch.randn_like(tgt_x0)
-        noise_t_prev = torch.randn_like(tgt_x0)
-        '''h_t_tau = 0.3 * torch.sqrt(1 - alpha_t_tau) * noise
-        with torch.no_grad():
-            #DDIM inversion
-                latents_noisy = scheduler.add_noise
-                src_encoded = src_emb.latent_dist.mode()
-                unet_outputs = self.unet.forward(
-                    latent_model_input,
-                    torch.cat([t] * 3).to(device),
-                    encoder_hidden_states=text_embeddings,
-                )'''
         
         eps = dict()
         pred_x0s = dict()
@@ -341,36 +404,54 @@ class DC(object):
             [tgt_x0, src_x0], [tgt_text_embedding, src_text_embedding], ["tgt", "src"]
         ):
             latents_noisy = scheduler.add_noise(latent, noise, t)
-            text_embeddings = torch.cat([cond_text_embedding, uncond_embedding, uncond_embedding], dim=0)
-            text_embeddings = torch.cat([text_embeddings, text_embeddings], dim=1)
-
             src_encoded = src_emb.latent_dist.mode()
             
-            # STARTING SHAPES: [1, 4, H, W]
             uncond_image_latent = torch.zeros_like(src_encoded)
-            # SHAPE: [1, 4, H, W] (But filled entirely with 0s)
+            base_text_embeddings = torch.cat([cond_text_embedding, uncond_embedding, uncond_embedding], dim=0)
+            base_text_embeddings = torch.cat([base_text_embeddings, base_text_embeddings], dim=1)
+            base_latent_image = torch.cat([src_encoded, src_encoded, uncond_image_latent], dim=0)
+            base_latent_model_input = torch.cat([latents_noisy] * 3, dim=0)
+            base_latent_model_input = torch.cat([base_latent_model_input, base_latent_image], dim=1)
             
-            latent_image = torch.cat([src_encoded, src_encoded, uncond_image_latent], dim=0)
-            # SHAPE: [3, 4, H, W] (Stack of 3 condition images)
-            
-            latent_model_input = torch.cat([latents_noisy] * 3, dim=0) 
-            # SHAPE: [3, 4, H, W] (Stack of 3 noisy images)
-            
-            latent_model_input = torch.cat([latent_model_input, latent_image], dim=1)
-            # FINAL SHAPE: [3, 8, H, W] (The mutant InstructPix2Pix tensor ready for the U-Net!) 
-
-            unet_outputs = self.unet.forward(
-                latent_model_input,
-                torch.cat([t] * 3).to(device),
-                encoder_hidden_states=text_embeddings,
-            )
-            noise_pred = unet_outputs.sample
-            unet_feats = unet_outputs.features
-
-            noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
             if name == "tgt":
-                noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_image) + \
-                    self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
+                tag_negative_correction = None
+                if self.config.tag_negative_strength > 0 and self.get_tag_negative_text_embedding() is not None:
+                    neg_text_embedding = self.get_tag_negative_text_embedding()
+                    text_embeddings = torch.cat(
+                        [cond_text_embedding, neg_text_embedding, uncond_embedding, uncond_embedding], dim=0
+                    )
+                    text_embeddings = torch.cat([text_embeddings, text_embeddings], dim=1)
+                    latent_image = torch.cat([src_encoded, src_encoded, src_encoded, uncond_image_latent], dim=0)
+                    latent_model_input = torch.cat([latents_noisy] * 4, dim=0)
+                    latent_model_input = torch.cat([latent_model_input, latent_image], dim=1)
+
+                    noise_pred = self.unet.forward(
+                        latent_model_input,
+                        torch.cat([t] * 4).to(device),
+                        encoder_hidden_states=text_embeddings,
+                    ).sample
+
+                    noise_pred_text, neg_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(4)
+                    
+                    noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_image) + \
+                        self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
+                    
+                    noise_pred_neg_cfg = noise_pred_uncond + self.config.guidance_scale * (neg_text - noise_pred_image) + \
+                        self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
+                    
+                    tag_negative_correction = noise_pred_neg_cfg - noise_pred
+                else:
+                    text_embeddings = base_text_embeddings
+                    latent_model_input = base_latent_model_input
+
+                    noise_pred = self.unet.forward(
+                        latent_model_input,
+                        torch.cat([t] * 3).to(device),
+                        encoder_hidden_states=text_embeddings,
+                    ).sample
+                    noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
+                    noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_image) + \
+                        self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
 
                 # STG: amplify structural signal beyond full model (paper Eq 13)
                 # eps_stg = eps_full + stg_scale * (eps_full - eps_weak)
@@ -378,7 +459,7 @@ class DC(object):
                 # ==============================================================================
                 if self.config.stg_enabled:
                     weak_pred = self._run_unet_with_skipped_attn(
-                        latent_model_input, t, text_embeddings
+                        base_latent_model_input, t, base_text_embeddings
                     )
                     weak_text, weak_image, weak_uncond = weak_pred.chunk(3)
                     noise_pred_weak = weak_uncond + self.config.guidance_scale * (weak_text - weak_image) + \
@@ -386,6 +467,15 @@ class DC(object):
                     noise_pred = noise_pred + self.config.stg_scale * (noise_pred - noise_pred_weak)
                 # ==============================================================================
             else:
+                text_embeddings = base_text_embeddings
+                latent_model_input = base_latent_model_input
+
+                noise_pred = self.unet.forward(
+                    latent_model_input,
+                    torch.cat([t] * 3).to(device),
+                    encoder_hidden_states=text_embeddings,
+                ).sample
+                noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
                 noise_pred = noise_pred_uncond + self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
 
             # TAG: amplify tangential component of noise prediction
@@ -399,9 +489,13 @@ class DC(object):
             noise_parallel = (noise_pred * v).sum(dim=(1, 2, 3), keepdim=True) * v
             noise_tangential = noise_pred - noise_parallel
             noise_pred = noise_parallel + eta_current * noise_tangential
+
+            # Post-TAG negative-prompt regularizer
+            if name == "tgt" and self.config.tag_negative_strength > 0 and tag_negative_correction is not None:
+                noise_pred = noise_pred - self.config.tag_negative_strength * tag_negative_correction
             # ====================================================================================
-            
-            mu, pred_x0 = self.compute_posterior_mean(latents_noisy, noise_pred, t, t_prev)
+
+            _, pred_x0 = self.compute_posterior_mean(latents_noisy, noise_pred, t, t_prev)
 
             eps[name] = noise_pred
             pred_x0s[name] = pred_x0

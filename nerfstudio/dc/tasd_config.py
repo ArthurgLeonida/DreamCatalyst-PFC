@@ -31,6 +31,10 @@ DC_CUSTOM_PARAMS = dict(
     eta_tag=1.0,
     adaptive_tag=False,
     asymmetric_tag=False,
+    # Optional post-TAG negative-prompt regularizer. This does not change CFG;
+    # it subtracts a negative semantic direction after TAG is applied.
+    tag_negative_prompt="",
+    tag_negative_strength=0.0,
 
     # ---------------------------------------------------------------------
     # 3. STG branch
