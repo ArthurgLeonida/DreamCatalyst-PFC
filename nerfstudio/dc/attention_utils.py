@@ -62,10 +62,43 @@ class STGIdentityValueAttnProcessor:
 class CrossAttentionMapRecorder:
     """Collect token-conditioned cross-attention maps from selected UNet layers."""
 
-    def __init__(self, token_indices: List[int], conditioned_batch_size: int):
+    def __init__(
+        self,
+        token_indices: List[int],
+        conditioned_batch_size: int,
+        reference_spatial_shape: Optional[Tuple[int, int]] = None,
+    ):
         self.token_indices = sorted(set(token_indices))
         self.conditioned_batch_size = conditioned_batch_size
+        self.reference_spatial_shape = reference_spatial_shape
         self.maps: List[torch.Tensor] = []
+
+    def _infer_spatial_shape(self, query_tokens: int) -> Optional[Tuple[int, int]]:
+        """Infer a non-square spatial shape using the latent aspect ratio."""
+        if self.reference_spatial_shape is None:
+            side = int(round(math.sqrt(query_tokens)))
+            if side * side != query_tokens:
+                return None
+            return (side, side)
+
+        ref_h, ref_w = self.reference_spatial_shape
+        if ref_h <= 0 or ref_w <= 0:
+            return None
+
+        target_ratio = ref_w / ref_h
+        best_shape = None
+        best_error = None
+
+        for height in range(1, int(math.sqrt(query_tokens)) + 1):
+            if query_tokens % height != 0:
+                continue
+            width = query_tokens // height
+            ratio_error = abs(math.log((width / height) / target_ratio))
+            if best_error is None or ratio_error < best_error:
+                best_error = ratio_error
+                best_shape = (height, width)
+
+        return best_shape
 
     def record(
         self,
@@ -93,10 +126,9 @@ class CrossAttentionMapRecorder:
         token_map = attn[..., valid_token_indices].mean(dim=-1).mean(dim=1)
 
         if spatial_shape is None:
-            side = int(round(math.sqrt(query_tokens)))
-            if side * side != query_tokens:
+            spatial_shape = self._infer_spatial_shape(query_tokens)
+            if spatial_shape is None:
                 return
-            spatial_shape = (side, side)
 
         token_map = token_map.view(self.conditioned_batch_size, 1, *spatial_shape)
         self.maps.append(token_map.detach())
@@ -238,6 +270,7 @@ def run_unet_with_cross_attention_capture(
     recorder = CrossAttentionMapRecorder(
         token_indices=token_indices,
         conditioned_batch_size=conditioned_batch_size,
+        reference_spatial_shape=latent_model_input.shape[-2:],
     )
     capture_processor = CrossAttentionCaptureProcessor(recorder)
     original_processors = []

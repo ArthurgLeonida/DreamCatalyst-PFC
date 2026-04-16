@@ -378,6 +378,7 @@ class DC(object):
                                 maps,
                                 gamma=self.config.cross_attention_mask_gamma,
                                 sigma=self.config.cross_attention_mask_blur,
+                                target_shape=latents_noisy.shape[-2:],
                             ),
                         )
                     else:
@@ -413,6 +414,7 @@ class DC(object):
                                 maps,
                                 gamma=self.config.cross_attention_mask_gamma,
                                 sigma=self.config.cross_attention_mask_blur,
+                                target_shape=latents_noisy.shape[-2:],
                             ),
                         )
                     else:
@@ -509,6 +511,14 @@ class DC(object):
             grad_mask = self_grad_mask
 
         if cross_attention_mask is not None:
+            target_shape = grad_mask.shape[-2:] if grad_mask is not None else eps["tgt"].shape[-2:]
+            if cross_attention_mask.shape[-2:] != target_shape:
+                cross_attention_mask = F.interpolate(
+                    cross_attention_mask,
+                    size=target_shape,
+                    mode="bilinear",
+                    align_corners=False,
+                )
             if grad_mask is None:
                 grad_mask = cross_attention_mask
             else:

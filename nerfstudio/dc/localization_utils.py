@@ -122,6 +122,7 @@ def build_cross_attention_relevance_mask(
     attention_maps: List[torch.Tensor],
     gamma: float,
     sigma: float,
+    target_shape=None,
 ):
     if not attention_maps:
         return None
@@ -141,4 +142,6 @@ def build_cross_attention_relevance_mask(
         gamma=gamma,
         sigma=sigma,
     )
+    if target_shape is not None and mask.shape[-2:] != tuple(target_shape):
+        mask = F.interpolate(mask, size=target_shape, mode="bilinear", align_corners=False)
     return mask.detach()

@@ -26,6 +26,11 @@ def summarize_mask(mask: torch.Tensor):
     }
 
 
+def batch_l2_norm_mean(tensor: torch.Tensor) -> float:
+    """Return the mean L2 norm across the batch for arbitrary-shaped tensors."""
+    return tensor.detach().float().flatten(1).norm(dim=1).mean().item()
+
+
 def log_dc_debug_to_wandb(
     *,
     step: int,
@@ -55,9 +60,9 @@ def log_dc_debug_to_wandb(
         f"step={step} | spot={current_spot} | "
         f"t={t.item()} | t_norm={t_normalized:.3f}"
     )
-    raw_eps_delta = (eps_tgt - eps_src).norm(dim=(1, 2, 3)).mean().item()
-    effective_eps_delta = (eps_tgt_for_grad - eps_src).norm(dim=(1, 2, 3)).mean().item()
-    grad_norm = grad.norm(dim=(1, 2, 3)).mean().item()
+    raw_eps_delta = batch_l2_norm_mean(eps_tgt - eps_src)
+    effective_eps_delta = batch_l2_norm_mean(eps_tgt_for_grad - eps_src)
+    grad_norm = batch_l2_norm_mean(grad)
     preserve_weight_mean = (
         preserve_weight.mean().item()
         if isinstance(preserve_weight, torch.Tensor)
