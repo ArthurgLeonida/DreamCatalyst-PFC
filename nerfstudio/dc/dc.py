@@ -328,6 +328,7 @@ class DC(object):
         noise = torch.randn_like(tgt_x0)
         
         eps = dict()
+        eps_raw = dict()  # post-CFG snapshot, pre-STG/TAG/PN, used only for mask construction
         pred_x0s = dict()
         noisy_latents = dict()
         cross_attention_mask = None
@@ -427,6 +428,9 @@ class DC(object):
                     noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_image) + \
                         self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
 
+                # Pre-STG, pre-TAG, pre-PN snapshot used downstream for clean mask construction.
+                eps_raw["tgt"] = noise_pred.detach().clone()
+
                 # STG: amplify structural signal beyond full model (paper Eq 13)
                 # ==============================================================================
                 current_stg_scale = self._get_current_stg_scale()
@@ -455,6 +459,7 @@ class DC(object):
                 ).sample
                 noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
                 noise_pred = noise_pred_uncond + self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
+                eps_raw["src"] = noise_pred.detach().clone()
 
             # TAG: amplify tangential component of noise prediction
             # ====================================================================================
@@ -506,7 +511,7 @@ class DC(object):
             or self.config.cross_attention_mask_enabled
         ):
             self_grad_mask = self._build_gradient_relevance_mask(
-                eps["tgt"], eps["src"], current_spot
+                eps_raw["tgt"], eps_raw["src"], current_spot
             )
             grad_mask = self_grad_mask
 
