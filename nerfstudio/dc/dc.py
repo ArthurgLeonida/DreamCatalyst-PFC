@@ -524,7 +524,8 @@ class DC(object):
             else:
                 weight = float(self.config.cross_attention_mask_weight)
                 weight = min(max(weight, 0.0), 1.0)
-                grad_mask = grad_mask * ((1.0 - weight) + weight * cross_attention_mask)
+                self_mask = grad_mask
+                grad_mask = self_mask * ((1.0 - weight) + weight * cross_attention_mask)
             grad_mask = grad_mask.clamp(0.0, 1.0)
 
         eps_tgt_for_grad = eps["tgt"]
@@ -540,7 +541,7 @@ class DC(object):
             w_DDS * (eps_tgt_for_grad - eps["src"])
             + math.exp(t_normalized) * preserve_weight * (tgt_x0 - src_x0)
         )
-
+    
         if self.config.gradient_mask_enabled and grad_mask is not None:
             grad = grad * grad_mask
 
