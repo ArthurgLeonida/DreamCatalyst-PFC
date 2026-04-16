@@ -11,16 +11,33 @@ Pipeline: COLMAP → Nerfstudio splatfacto → DreamCatalyst (DDS editing) → R
 - Server has NVIDIA H100 80GB HBM3.
 
 ## Key files
-- `nerfstudio/dc/dc.py` — all guidance logic, DDS loss, novelties. This is THE file to edit.
-- `nerfstudio/dc/dc_unet.py` — CustomUNet2DConditionModel (read-only). STG hooks are registered dynamically from dc.py, no modification needed.
-- `nerfstudio/dc/tasd_config.py` — TASD novelty params (eta_tag, adaptive_tag, asymmetric_tag, perp_neg, stg_enabled, stg_scale, stg_skip_layers). Unpacked into DCConfig via `**DC_CUSTOM_PARAMS`.
+- `nerfstudio/dc/dc.py` — main guidance/orchestration file. Core DDS loss and novelty composition still live here. This is still the first file to inspect.
+- `nerfstudio/dc/attention_utils.py` — STG attention-skip helpers and cross-attention capture processors. Use this for `STGIdentityValueAttnProcessor`, weak-pass plumbing, and attention recording internals.
+- `nerfstudio/dc/localization_utils.py` — self-mask normalization/postprocessing, token selection, and cross-attention mask construction.
+- `nerfstudio/dc/utils/logging_utils.py` — WandB debug image/scalar payload construction for DDS runs.
+- `nerfstudio/dc/dc_unet.py` — CustomUNet2DConditionModel (read-only). STG and cross-attention-mask capture are handled via helper processors/hooks; no direct modification usually needed.
+- `nerfstudio/dc/tasd_config.py` — TASD novelty params (eta_tag, adaptive_tag, asymmetric_tag, perp_neg, stg_enabled, stg_scale, stg_skip_layers, stg_schedule_*, cross_attention_mask_*). Unpacked into DCConfig via `**DC_CUSTOM_PARAMS`.
 - `nerfstudio/dc/utils/free_lunch.py` — FreeU registration.
 - `nerfstudio/3d_editing/dc_nerf/dc_config.py` — all method configs (dc_splat, dc_splat_refinement, etc). Imports DC_CUSTOM_PARAMS.
 - `nerfstudio/3d_editing/dc_nerf/pipelines/dc_pipeline.py` — Step 3 editing pipeline.
 - `nerfstudio/3d_editing/dc_nerf/pipelines/refinement_pipeline.py` — Step 4 refinement pipeline.
-- `scripts/edit.sh` — Step 3 wrapper. Passes `--pipeline.dc.max-iteration` synced to `--max-num-iterations`.
-- `scripts/refine.sh` — Step 4 wrapper.
-- There is NO separate `guidance/` folder. Everything is in dc.py.
+- `scripts/edit.sh` — Step 3 wrapper. Passes `--pipeline.dc.max-iteration` synced to `--max-num-iterations`. Now also supports automatic post-edit evaluation into the run folder.
+- `scripts/refine.sh` — Step 4 wrapper. Safer now: infers `nerf` vs `splat` from `LOAD_DIR` when `rep=auto`, supports explicit downscale.
+- `scripts/evaluate.py` — offline evaluation. Recently patched to load the edited checkpoint directly from `<run_dir>/nerfstudio_models` instead of relying on `eval_setup`.
+- `docs/research_summary/research_summary.tex` — professor-facing summary; already updated with stormtrooper localization results and concise framing.
+- `AGENTS.md` — current short handoff summary for fresh threads.
+- There is still NO separate `guidance/` folder. The code is now split across `dc.py` plus small helper modules in `nerfstudio/dc/`.
+
+## Current Internal Structure
+- `dc.py` should stay focused on the actual DDS flow:
+  - text/image preparation
+  - tgt/src branch execution
+  - TAG / STG / Perp-Neg composition
+  - mask application
+  - final loss/grad construction
+- `attention_utils.py` owns the attention processor classes and temporary UNet processor swaps.
+- `localization_utils.py` owns reusable mask/token helper functions.
+- `utils/logging_utils.py` owns WandB-specific formatting so `dc.py` does not get overwhelmed by logging code.
 
 ## Two-model architecture (CRITICAL)
 The original DreamCatalyst uses TWO different diffusion models:
@@ -65,14 +82,32 @@ Verified changes:
   - kitchen: start from `7.5` or `10.0`; only use `12.5` if localization/masking is active
 - **Interpretation**: higher guidance helps edit strength, but also amplifies the risk of global leakage, duplicate subject emergence, and background smoothing. The point of self-derived masking is not to make CFG arbitrarily large; it is to make mid/high guidance more spatially selective.
 - **Current preferred localization variant**: the self-derived mask branch now supports both direct gradient masking and **source-blended localization**. Prefer `source_blend_localization_enabled=True` as the first serious experiment; keep pure `gradient_mask_enabled=True` as the ablation/baseline. Source blending is more principled because low-mask regions naturally fall back toward `eps_src` instead of only getting their final gradient attenuated.
+- **Cross-attention mask branch**: a new semantic prior can now be enabled with `cross_attention_mask_enabled=True`. It records target-token cross-attention maps from selected `attn2` modules, aggregates them into a latent mask, and uses that mask to tighten the self-derived localization mask. This is intended specifically for failure modes where STG or Perp-Neg make `||eps_tgt - eps_src||` spread across the whole image.
+- **Current scene split**:
+  - stormtrooper/person: source-blended localization is the strongest current result and clearly improves both editability and preservation.
+  - face/elf: source-blended localization is NOT a clean winner; TAG-only variants remain the safest face results after fixing the downscale mismatch.
 - **TAG novelties**: Can cause floaters. Disable (`eta_tag=1.0`) when debugging other issues. Re-enable gradually (1.05 → 1.10 → 1.15).
 - **NeRF (dc) memory**: NeRF editing needs ~77 GiB VRAM for differentiable full-image rendering + IP2P. Use `--pipeline.dc-device cuda:1` to offload diffusion to a second GPU, or use 3DGS (dc_splat) which is more memory-efficient.
-- **STG**: Adds ~50% per-iteration time. Formula matches paper Eq 13: `ε̃ = ε_full + w·(ε_full − ε_weak)`. `stg_scale=0` = off. Hook zeroes `attn1` output; with residual connection this IS the identity skip (correct STG-A behavior). Paper default `w=2.0` is too aggressive when combined with IP2P 3-way CFG at `guidance_scale=12.5` — start with `stg_scale=0.5` and `stg_skip_layers=[2]`, sweep up. ⚠️ Old formula `ε_weak + λ·(ε_full − ε_weak)` had λ=1 as no-op — all prior STG experiments with `stg_scale=1.0` had zero STG effect.
+- **STG**: Adds ~50% per-iteration time. Formula matches paper Eq 13: `ε̃ = ε_full + w·(ε_full − ε_weak)`. `stg_scale=0` = off. The current implementation is more paper-faithful than the older hook-only approximation: it uses `STGIdentityValueAttnProcessor` to implement the paper's `A = I` idea for self-attention, with the old zero-output trick kept only as a fallback. Paper default `w=2.0` is too aggressive when combined with IP2P 3-way CFG at `guidance_scale=12.5` — start with `stg_scale=0.5` and `stg_skip_layers=[2]`, sweep up. ⚠️ Old formula `ε_weak + λ·(ε_full − ε_weak)` had λ=1 as no-op — all prior STG experiments with `stg_scale=1.0` had zero STG effect.
 - **Perp-Neg**: Zero overhead. Boosts creative edits (elf cloak) but destroys background. Use Foreground-Masked PN (N6) with cached masks + soft blur for the best tradeoff.
+- **Post-TAG negative prompt branch**: exploratory only. It is applied after TAG (not inside CFG), and so far has NOT convincingly fixed the TAG brightness / saturation artifact. Larger values can create color spill (e.g. green stain on clothes). Do not assume this branch is validated.
 - **Kitchen scene lesson**: kitchen is a strong localization stress test. Even improved prompts can still leak realism/material changes into table, placemats, and nearby objects. Treat this as a true DDS/IP2P spatial-selectivity problem, not only a prompt-writing issue.
 - **Stormtrooper scene lesson**: this scene can show strong edit capability, but may create a duplicate/ghost stormtrooper in another region. Interpret this as weak instance selectivity / subject duplication, not just “bad generation.” Also note that the previous bug with only 4 images in eval outputs was due to COLMAP and has been solved.
 - **Fine-structure loss**: even when the main subject edit looks good, wall seam lines and floor patterns can get washed out. This is likely low-amplitude global smoothing from repeated DDS optimization, not necessarily a gross localization failure.
 - **Face dataset dimensions (downscale-factor 2)**: Original images in `images_2/` are 497×369 (W×H). Pipeline resizes smallest-side to 512 → `[1, 3, 512, 689]`. VAE encodes (8× spatial compression) → latent `[1, 4, 64, 86]`. UNet spatial progression: 64×86 → 32×43 → 16×22 → 8×11 (mid) → 16×22 → 32×43 → 64×86. The first CrossAttnUpBlock2D (Up 1, where STG hooks act) operates at **16×22×1280ch**. Latent is NOT 64×64 — aspect ratio propagates through the entire network.
+
+## Current Practical Status (April 2026)
+- **Best stormtrooper / person result (pure localization branch):**
+  - `src_blend_loc`
+  - `blur=2, ema=0, gamma=1.2, warmup=0, GS=7.5`
+  - improved all main metrics vs baseline and removed the ghost-subject failure at higher guidance.
+- **Best practical combined stormtrooper run:**
+  - `Full TAG 1.15 + src_blend_loc + outside_mask_anchor_weight=0.05`
+- **Best face takeaway:**
+  - Full TAG / TAG-only variants remain the best face results.
+  - Source-blended localization on face is still informative, but currently acts more like a hard-scene localization contribution than a universal improvement.
+- **Evaluation gotcha:**
+  - if automatic evaluation appears to "train again", inspect `scripts/evaluate.py` first. The intended behavior is to load the edited checkpoint directly from the finished run folder.
 
 ## Novelties (TASD)
 
@@ -98,7 +133,7 @@ Modifications to DDS guidance in `dc.py`. Novelties N1–N7 are done; N8–N10 a
 
 4. **STG** [DONE] — skip self-attention in `up_blocks` for implicit weak-model guidance. Replaces or augments CFG with a structure-preserving perturbation.
    * **Config:** `stg_enabled` (default False), `stg_scale` (default 2.0 = paper STG-A default), `stg_skip_layers` (default [2] — single later up_block per paper).
-   * **Implementation:** `_run_unet_with_skipped_attn()` registers forward hooks on `unet.up_blocks[i].attentions[j].transformer_blocks[k].attn1` that zero out self-attn output. Runs a second "weak" UNet pass, then blends per paper Eq 13: `eps_stg = eps_full + stg_scale*(eps_full - eps_weak)`. `stg_scale=0` → off, `stg_scale=1.0` → paper default (STG-R). Applied ONLY to `eps_tgt`. Hooks cleaned up in `finally` block.
+   * **Implementation:** `_run_unet_with_skipped_attn()` now uses a paper-faithful `STGIdentityValueAttnProcessor` that replaces the attention matrix with the identity (`A = I`, so the branch becomes `IV = V`) in selected `attn1` modules. If processor swap is unavailable for a module, the older zero-output trick is used only as a fallback. Runs a second "weak" UNet pass, then blends per paper Eq 13: `eps_stg = eps_full + stg_scale*(eps_full - eps_weak)`. `stg_scale=0` → off. Applied ONLY to `eps_tgt`. Processors/hooks are restored in `finally`.
    * **Based on:** STG (Hyung et al., CVPR 2025, Jaegul Choo's lab @ KAIST).
    * ⚠️ Only works with IP2P (Step 3). Do NOT apply in `run_sdedit`.
    * ⚠️ Adds ~50% per-iteration time (extra UNet forward pass, but `torch.no_grad()`).
@@ -124,14 +159,22 @@ Modifications to DDS guidance in `dc.py`. Novelties N1–N7 are done; N8–N10 a
    * **Script:** `scripts/generate_masks.py` — supports `grounded-sam` (GroundingDINO + SAM, text-prompted) and `rembg` (U2Net, automatic) backends. Run in a separate env to avoid dependency conflicts.
 
 7. **Self-Derived Relevance Masking** [DONE / exploratory] — localize the final DDS gradient using the model's own tgt/src discrepancy.
-   * **Config:** `gradient_mask_enabled`, `gradient_mask_blur`, `gradient_mask_ema_beta`, `gradient_mask_gamma`, `gradient_mask_warmup`, `source_blend_localization_enabled`.
+   * **Config:** `gradient_mask_enabled`, `gradient_mask_blur`, `gradient_mask_ema_beta`, `gradient_mask_gamma`, `gradient_mask_warmup`, `source_blend_localization_enabled`, `outside_mask_anchor_weight`, `psi`.
    * **Implementation:** derive `R = ||eps_tgt - eps_src||_2` per spatial location, percentile-normalize it (5th/95th), smooth it with EMA per `current_spot`, optionally sharpen it with `gamma`, optionally blur it in latent space, and then use the resulting soft mask in one of two ways:
      * **Ablation / direct masking:** `grad_masked = grad * M`
      * **Preferred current form:** `eps_tgt_loc = eps_src + M * (eps_tgt - eps_src)`
+     * **Preservation extension:** add an outside-mask background anchor through the existing `x0` preservation term using `outside_mask_anchor_weight * (1 - M)`.
    * **Why source blending is preferred:** low-mask regions naturally fall back toward the source branch, which is a cleaner way to reduce floor/wall/background drift than only attenuating the already-computed final DDS gradient.
    * **Why it exists:** recent kitchen and stormtrooper failures suggest the biggest remaining issue is spatial selectivity. Kitchen leaks into nearby surfaces/objects; stormtrooper can instantiate a duplicate "ghost" subject even when the main edit works.
-   * **Based on:** inspired by **LatentEditor** (delta-score localization), conceptually aligned with **LENeRF** (3D-localized editing), and complementary to **CustomNeRF** (local-global editing schedule).
+   * **Based on:** inspired by **LatentEditor** (delta-score localization), conceptually aligned with **LENeRF** (3D-localized editing), **FoI** / **ZONE** (bringing localization inside the editing process rather than only post-filtering it), and complementary to **CustomNeRF** (local-global editing schedule).
    * **Important caution:** this is **LatentEditor-inspired**, not literally the same signal as LatentEditor's conditional-vs-empty delta. Here the relevance comes from `eps_tgt - eps_src` in DreamCatalyst's asymmetric DDS setup.
+
+7.5. **Cross-Attention Semantic Mask** [DONE / exploratory] — derive a semantic prior from target-token diffusion cross-attention and use it to shrink the self-mask when upstream guidance branches contaminate `eps_tgt`.
+   * **Config:** `cross_attention_mask_enabled`, `cross_attention_mask_keywords`, `cross_attention_mask_prompt`, `cross_attention_mask_layers`, `cross_attention_mask_weight`, `cross_attention_mask_blur`, `cross_attention_mask_gamma`.
+   * **Implementation:** during the main tgt-branch UNet pass, selected `attn2` processors in chosen up-blocks are temporarily replaced with a recording processor that keeps the normal attention computation but stores target-token attention maps. Those maps are aggregated into `M_attn` and combined with the self-mask as `M_hybrid = M_self * ((1 - w) + w * M_attn)`. If no self-mask is active, the attention mask can be used directly.
+   * **Why it exists:** STG and Perp-Neg can inflate `eps_tgt` globally; because the self-mask is built from `||eps_tgt - eps_src||`, that contamination can spread the mask to the wall/floor/background. The cross-attention prior is meant to decouple semantic localization from raw edit magnitude.
+   * **Based on:** **Prompt-to-Prompt** (cross-attention as the main word-to-region layout signal), **What the DAAM** (diffusion attention aggregation / attribution), and **From Text to Mask** (extracting localization masks directly from diffusion attention).
+   * **Current status:** implemented, logged to `logging/*_cross_attention_mask.png`, but not yet validated experimentally.
 
 ---
 

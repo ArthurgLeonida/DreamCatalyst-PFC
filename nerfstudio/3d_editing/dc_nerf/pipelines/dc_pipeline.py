@@ -167,6 +167,8 @@ class DCPipeline(ModifiedVanillaPipeline):
         dic = self.dc(tgt_x0=x0, src_x0=src_x0, src_emb=src_emb, return_dict=True, step=step, current_spot=current_spot, depth_mask=depth_mask)
         grad = dic["grad"].cpu()
         grad_mask = dic.get("grad_mask", None)
+        self_grad_mask = dic.get("self_grad_mask", None)
+        cross_attention_mask = dic.get("cross_attention_mask", None)
         loss = dic["loss"] * self.config.dc_loss_mult
         loss = loss.to(self.device)
         loss_dict["dc_loss"] = loss
@@ -201,6 +203,16 @@ class DCPipeline(ModifiedVanillaPipeline):
             grad_mask_vis = F.interpolate(grad_mask.cpu(), size=(h, w), mode="bilinear", align_corners=False)
             grad_mask_img = Image.fromarray((grad_mask_vis[0, 0].clamp(0, 1).numpy() * 255).astype(np.uint8))
             grad_mask_img.save(self.base_dir / f"logging/{step}_gradient_mask.png")
+
+        if self_grad_mask is not None and step % self.config.log_step == 0:
+            self_grad_mask_vis = F.interpolate(self_grad_mask.cpu(), size=(h, w), mode="bilinear", align_corners=False)
+            self_grad_mask_img = Image.fromarray((self_grad_mask_vis[0, 0].clamp(0, 1).numpy() * 255).astype(np.uint8))
+            self_grad_mask_img.save(self.base_dir / f"logging/{step}_self_mask.png")
+
+        if cross_attention_mask is not None and step % self.config.log_step == 0:
+            cross_attention_mask_vis = F.interpolate(cross_attention_mask.cpu(), size=(h, w), mode="bilinear", align_corners=False)
+            cross_attention_mask_img = Image.fromarray((cross_attention_mask_vis[0, 0].clamp(0, 1).numpy() * 255).astype(np.uint8))
+            cross_attention_mask_img.save(self.base_dir / f"logging/{step}_cross_attention_mask.png")
 
         # logging
         if step % self.config.log_step == 0:

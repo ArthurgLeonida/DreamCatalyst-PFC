@@ -1,5 +1,6 @@
 # Data
 /data/
+exports/
 dream_catalyst_ns.egg-info/
 
 # Claude

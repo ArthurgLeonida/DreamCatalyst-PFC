@@ -1,4 +1,5 @@
 import dataclasses
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Type
@@ -21,6 +22,32 @@ class DCTrainer(Trainer):
     def __init__(self, config: TrainerConfig, local_rank: int = 0, world_size: int = 1):
         super().__init__(config, local_rank, world_size)
         self.base_dir: Path = config.get_base_dir()
+
+    def _write_wandb_run_metadata(self) -> None:
+        """Persist the active WandB run info beside the experiment config.
+
+        This gives post-processing scripts a stable, per-run pointer they can
+        use to resume the exact training run and append evaluation metrics.
+        """
+        if not self.config.is_wandb_enabled() or self.local_rank != 0:
+            return
+
+        try:
+            import wandb
+        except Exception:
+            return
+
+        if wandb.run is None:
+            return
+
+        metadata = {
+            "run_id": wandb.run.id,
+            "run_name": wandb.run.name,
+            "project": wandb.run.project,
+            "entity": wandb.run.entity,
+            "url": wandb.run.url,
+        }
+        (self.base_dir / "wandb_run.json").write_text(json.dumps(metadata, indent=2))
 
     def setup(self, test_mode: Literal["test", "val", "inference"] = "val"):
         self.pipeline = self.config.pipeline.setup(
@@ -93,6 +120,7 @@ class DCTrainer(Trainer):
             experiment_name=self.config.experiment_name,
             project_name=self.config.project_name,
         )
+        self._write_wandb_run_metadata()
         writer.setup_local_writer(
             self.config.logging, max_iter=self.config.max_num_iterations, banner_messages=banner_messages
         )

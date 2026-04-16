@@ -14,33 +14,40 @@ Metrics:
   - Multi-view consistency: std of per-view CLIP embeddings (lower = more consistent)
 
 Usage:
-  python scripts/evaluate.py \
+  python scripts/evaluate.py eval \
       --config outputs/bicycle/dc_splat/<timestamp>/config.yml \
       --src-prompt "a photo of a bicycle" \
       --tgt-prompt "a photo of a motorcycle" \
       [--output-dir eval_results/bicycle_exp001]
 
-  # Compare multiple experiments:
-  python scripts/evaluate.py --compare eval_results/exp1 eval_results/exp2 ...
+  # Attach the metrics to the original WandB run if available:
+  python scripts/evaluate.py eval ... --log-wandb
 """
 
 import argparse
+from contextlib import contextmanager
 import json
-import sys
+import os
 from pathlib import Path
+import re
 
-import torch
-import torch.nn.functional as F
 import numpy as np
 from PIL import Image
+import torch
+import torch.nn.functional as F
+import yaml
+
+
+WANDB_RUN_DIR_RE = re.compile(r"(?:offline-)?run-\d{8}_\d{6}-([a-z0-9]+)", re.IGNORECASE)
+WANDB_RUN_FILE_RE = re.compile(r"(?:offline-)?run-([a-z0-9]+)\.wandb$", re.IGNORECASE)
 
 
 def load_clip_model(device):
     """Load CLIP model for text-image similarity."""
     import clip
-    model, preprocess = clip.load("ViT-L/14", device=device)
+    model, _ = clip.load("ViT-L/14", device=device)
     model.eval()
-    return model, preprocess
+    return model
 
 
 def clip_encode_image(model, images, device):
@@ -76,23 +83,245 @@ def compute_lpips(img1_tensor, img2_tensor, lpips_model):
         return lpips_model(img1_tensor * 2 - 1, img2_tensor * 2 - 1).item()
 
 
-def render_all_views(config_path, device):
-    """Load a nerfstudio checkpoint and render all training views.
+@contextmanager
+def temporary_env_var(name, value):
+    """Temporarily set an environment variable for the duration of a context."""
+    previous = os.environ.get(name)
+    if value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
+
+
+def load_experiment_config(config_path):
+    """Load the serialized Nerfstudio config object for an experiment."""
+    return yaml.load(Path(config_path).read_text(), Loader=yaml.Loader)
+
+
+def infer_experiment_name(config_path, config=None):
+    """Best-effort experiment name, preferring the serialized config."""
+    if config is not None:
+        experiment_name = getattr(config, "experiment_name", None)
+        if experiment_name:
+            return experiment_name
+
+    config_path = Path(config_path)
+    if len(config_path.parents) >= 3:
+        return config_path.parents[2].name
+    return config_path.parent.name
+
+
+def infer_project_name(config=None, default="dreamcatalyst-pfc"):
+    """Best-effort WandB project name, preferring the serialized config."""
+    if config is not None:
+        project_name = getattr(config, "project_name", None)
+        if project_name:
+            return project_name
+    return default
+
+
+def load_wandb_run_metadata(config_path):
+    """Load per-run WandB metadata written during training, when available."""
+    metadata_path = Path(config_path).parent / "wandb_run.json"
+    if not metadata_path.exists():
+        return None
+    try:
+        return json.loads(metadata_path.read_text())
+    except Exception as exc:
+        print(f"WARNING: Failed to parse {metadata_path}: {exc}")
+        return None
+
+
+def extract_wandb_run_id_from_path(path):
+    """Parse a WandB run id from common local directory/file naming schemes."""
+    path = Path(path)
+    for candidate in (str(path), path.name):
+        match = WANDB_RUN_DIR_RE.search(candidate)
+        if match:
+            return match.group(1)
+        match = WANDB_RUN_FILE_RE.search(candidate)
+        if match:
+            return match.group(1)
+    return None
+
+
+def discover_wandb_run_id(wandb_dir):
+    """Best-effort local WandB run id discovery from a run storage directory."""
+    if wandb_dir is None:
+        return None
+
+    wandb_dir = Path(wandb_dir)
+    if not wandb_dir.exists():
+        return None
+
+    candidate_paths = []
+    if wandb_dir.is_file():
+        candidate_paths.append(wandb_dir)
+    else:
+        patterns = [
+            "latest-run",
+            "run-*",
+            "offline-run-*",
+            "**/run-*.wandb",
+            "**/offline-run-*.wandb",
+            "**/wandb-metadata.json",
+            "**/wandb-settings.json",
+        ]
+        for pattern in patterns:
+            candidate_paths.extend(wandb_dir.glob(pattern))
+
+    candidate_paths = sorted(
+        {path.resolve() if path.exists() else path for path in candidate_paths},
+        key=lambda path: path.stat().st_mtime if path.exists() else 0,
+        reverse=True,
+    )
+
+    for path in candidate_paths:
+        run_id = extract_wandb_run_id_from_path(path)
+        if run_id:
+            return run_id
+        if path.suffix == ".json":
+            try:
+                payload = json.loads(path.read_text())
+            except Exception:
+                continue
+            run_id = payload.get("run_id") or payload.get("id")
+            if run_id:
+                return run_id
+
+    return None
+
+
+def infer_wandb_dir(config_path):
+    """Infer the method-level WandB directory used by edit.sh for this run."""
+    candidate = Path(config_path).parent.parent / "wandb"
+    return candidate if candidate.exists() else None
+
+
+def flatten_wandb_metrics(metrics, num_views):
+    """Flatten nested metrics into WandB-friendly scalar keys."""
+    flattened = {"eval/num_views": num_views}
+    for key, value in metrics.items():
+        if isinstance(value, dict) and "mean" in value:
+            flattened[f"eval/{key}"] = value["mean"]
+            if "std" in value:
+                flattened[f"eval/{key}_std"] = value["std"]
+        else:
+            flattened[f"eval/{key}"] = value
+    return flattened
+
+
+def log_results_to_wandb(results, config_path, config, metrics_path, run_id=None, wandb_project=None):
+    """Log evaluation metrics into an existing WandB run when possible."""
+    try:
+        import wandb
+    except Exception as exc:
+        print(f"WARNING: Failed to import wandb: {exc}")
+        return
+
+    project_name = wandb_project or infer_project_name(config)
+    experiment_name = infer_experiment_name(config_path, config)
+    flattened_metrics = flatten_wandb_metrics(results["metrics"], results["num_views"])
+
+    run = None
+    attached = False
+    if run_id:
+        try:
+            print(f"Attaching evaluation metrics to WandB run {run_id}...")
+            run = wandb.init(
+                project=project_name,
+                id=run_id,
+                resume="must",
+                job_type="evaluation",
+            )
+            attached = True
+        except Exception as exc:
+            print(f"WARNING: Failed to attach to WandB run {run_id}: {exc}")
+
+    if run is None:
+        run_name = f"{experiment_name}_eval"
+        print(f"Logging evaluation metrics to a new WandB run: {run_name}")
+        run = wandb.init(
+            project=project_name,
+            name=run_name,
+            job_type="evaluation",
+        )
+
+    run.summary["eval/config"] = str(config_path)
+    run.summary["eval/metrics_path"] = str(metrics_path)
+    run.summary["eval/attached_to_existing_run"] = attached
+    for key, value in flattened_metrics.items():
+        run.summary[key] = value
+
+    wandb.finish()
+
+
+def load_pipeline_from_experiment(config_path, device, disable_wandb_during_load=True):
+    """Load the edited checkpoint directly from the experiment folder.
+
+    This intentionally avoids Nerfstudio's eval_setup helper because some
+    installed versions may reuse the original training load_dir and spin up a
+    fresh trainer/W&B session instead of loading the edited run checkpoint.
+    """
+    from nerfstudio.configs.method_configs import all_methods
+
+    config_path = Path(config_path)
+    config = load_experiment_config(config_path)
+
+    # Restore the datamanager target in the same way Nerfstudio eval_setup does.
+    config.pipeline.datamanager._target = all_methods[config.method_name].pipeline.datamanager._target
+
+    # Force evaluation to load the checkpoint produced by this edited run.
+    checkpoint_dir = config_path.parent / "nerfstudio_models"
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
+    config.load_dir = checkpoint_dir
+
+    # Be extra defensive about side effects during evaluation.
+    if hasattr(config, "vis"):
+        config.vis = "tensorboard"
+
+    env_value = "disabled" if disable_wandb_during_load else None
+    with temporary_env_var("WANDB_MODE", env_value):
+        pipeline = config.pipeline.setup(device=device, test_mode="test")
+        pipeline.eval()
+
+        checkpoint_steps = sorted(
+            int(path.stem.split("-")[1]) for path in checkpoint_dir.glob("step-*.ckpt")
+        )
+        if not checkpoint_steps:
+            raise FileNotFoundError(f"No checkpoint files found in {checkpoint_dir}")
+
+        load_step = checkpoint_steps[-1]
+        load_path = checkpoint_dir / f"step-{load_step:09d}.ckpt"
+        loaded_state = torch.load(load_path, map_location="cpu")
+        pipeline.load_pipeline(loaded_state["pipeline"], loaded_state["step"])
+    return pipeline, load_path, load_step, config
+
+
+def render_all_views(config_path, device, disable_wandb_during_load=True):
+    """Load an edited nerfstudio checkpoint and render all training views.
     Returns list of (rendered_image_tensor, gt_image_tensor) pairs.
     rendered images are [1,C,H,W] in [0,1].
     """
-    from nerfstudio.utils.eval_utils import eval_setup
-    _, pipeline, _, _ = eval_setup(Path(config_path))
-    pipeline.eval()
+    pipeline, checkpoint_path, load_step, config = load_pipeline_from_experiment(
+        config_path,
+        device,
+        disable_wandb_during_load=disable_wandb_during_load,
+    )
+    print(f"Loaded edited checkpoint from {checkpoint_path} (step {load_step}).")
 
     rendered_images = []
     gt_images = []
     image_names = []
 
-    # Get all cameras from the datamanager
-    dataparser_outputs = pipeline.datamanager.dataparser.get_dataparser_outputs(
-        split="train"
-    )
     dataset = pipeline.datamanager.train_dataset
 
     for i in range(len(dataset)):
@@ -116,18 +345,32 @@ def render_all_views(config_path, device):
         fname = Path(dataset.image_filenames[i]).stem if hasattr(dataset, "image_filenames") else f"view_{i:04d}"
         image_names.append(fname)
 
-    pipeline.train()
-    return rendered_images, gt_images, image_names, pipeline
+    return rendered_images, gt_images, image_names, config
 
 
-def evaluate_experiment(config_path, src_prompt, tgt_prompt, output_dir, device="cuda"):
+def evaluate_experiment(
+    config_path,
+    src_prompt,
+    tgt_prompt,
+    output_dir,
+    device="cuda",
+    log_wandb=False,
+    wandb_run_id=None,
+    wandb_dir=None,
+    wandb_project=None,
+):
     """Run full evaluation on a single experiment."""
+    config_path = Path(config_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "rendered").mkdir(exist_ok=True)
 
     print(f"Loading checkpoint from {config_path}...")
-    rendered_images, gt_images, image_names, pipeline = render_all_views(config_path, device)
+    rendered_images, gt_images, image_names, config = render_all_views(
+        config_path,
+        device,
+        disable_wandb_during_load=True,
+    )
     num_views = len(rendered_images)
     print(f"Rendered {num_views} views.")
 
@@ -162,7 +405,7 @@ def evaluate_experiment(config_path, src_prompt, tgt_prompt, output_dir, device=
 
     # ── CLIP metrics ──
     print("Computing CLIP metrics...")
-    clip_model, _ = load_clip_model(device)
+    clip_model = load_clip_model(device)
 
     # Encode text prompts
     src_text_feat = clip_encode_text(clip_model, [src_prompt], device)
@@ -265,9 +508,24 @@ def evaluate_experiment(config_path, src_prompt, tgt_prompt, output_dir, device=
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
 
+    # ── W&B Logging ──
+    if log_wandb:
+        metadata = load_wandb_run_metadata(config_path) or {}
+        resolved_wandb_dir = Path(wandb_dir) if wandb_dir else infer_wandb_dir(config_path)
+        resolved_run_id = wandb_run_id or metadata.get("run_id") or discover_wandb_run_id(resolved_wandb_dir)
+        resolved_project_name = wandb_project or metadata.get("project") or infer_project_name(config)
+        log_results_to_wandb(
+            results,
+            config_path,
+            config,
+            results_path,
+            run_id=resolved_run_id,
+            wandb_project=resolved_project_name,
+        )
+
     # Print summary
     print("\n" + "=" * 60)
-    print(f"  Evaluation: {Path(config_path).parent.parent.name}")
+    print(f"  Evaluation: {infer_experiment_name(config_path, config)}")
     print("=" * 60)
     m = results["metrics"]
     print(f"  CLIP text sim (edit quality):  {m['CLIP_text_sim']['mean']:.4f} +/- {m['CLIP_text_sim']['std']:.4f}")
@@ -281,43 +539,6 @@ def evaluate_experiment(config_path, src_prompt, tgt_prompt, output_dir, device=
     print(f"  Results saved to: {results_path}")
 
     return results
-
-
-def compare_experiments(dirs):
-    """Load and compare metrics from multiple experiment directories."""
-    all_results = []
-    for d in dirs:
-        metrics_path = Path(d) / "metrics.json"
-        if not metrics_path.exists():
-            print(f"WARNING: {metrics_path} not found, skipping.")
-            continue
-        with open(metrics_path) as f:
-            all_results.append(json.load(f))
-
-    if not all_results:
-        print("No results to compare.")
-        return
-
-    # Print comparison table
-    header = f"{'Experiment':<30} {'CLIP_txt':>9} {'CLIP_dir':>9} {'CLIP_img':>9} {'SSIM':>7} {'LPIPS':>7} {'MV_cos':>7}"
-    print("\n" + "=" * len(header))
-    print(header)
-    print("-" * len(header))
-    for r in all_results:
-        name = Path(r["config"]).parent.parent.name
-        m = r["metrics"]
-        print(
-            f"{name:<30} "
-            f"{m['CLIP_text_sim']['mean']:>9.4f} "
-            f"{m['CLIP_direction']['mean']:>9.4f} "
-            f"{m['CLIP_img_sim']['mean']:>9.4f} "
-            f"{m['SSIM']['mean']:>7.4f} "
-            f"{m['LPIPS']['mean']:>7.4f} "
-            f"{m['MultiView_pairwise_cos_sim']:>7.4f}"
-        )
-    print("=" * len(header))
-
-
 def main():
     parser = argparse.ArgumentParser(description="Evaluate DreamCatalyst editing experiments")
     subparsers = parser.add_subparsers(dest="command")
@@ -329,17 +550,25 @@ def main():
     eval_parser.add_argument("--tgt-prompt", type=str, required=True, help="Target prompt")
     eval_parser.add_argument("--output-dir", type=str, required=True, help="Output directory for results")
     eval_parser.add_argument("--device", type=str, default="cuda", help="Device to use")
-
-    # Compare multiple experiments
-    cmp_parser = subparsers.add_parser("compare", help="Compare multiple experiments")
-    cmp_parser.add_argument("dirs", nargs="+", help="Directories containing metrics.json")
+    eval_parser.add_argument("--log-wandb", action="store_true", help="Log evaluation metrics to Weights & Biases")
+    eval_parser.add_argument("--wandb-run-id", type=str, default=None, help="Attach metrics to an existing WandB run id")
+    eval_parser.add_argument("--wandb-dir", type=str, default=None, help="Directory containing local WandB run files")
+    eval_parser.add_argument("--wandb-project", type=str, default=None, help="Override the WandB project name")
 
     args = parser.parse_args()
 
     if args.command == "eval":
-        evaluate_experiment(args.config, args.src_prompt, args.tgt_prompt, args.output_dir, args.device)
-    elif args.command == "compare":
-        compare_experiments(args.dirs)
+        evaluate_experiment(
+            args.config,
+            args.src_prompt,
+            args.tgt_prompt,
+            args.output_dir,
+            args.device,
+            log_wandb=args.log_wandb,
+            wandb_run_id=args.wandb_run_id,
+            wandb_dir=args.wandb_dir,
+            wandb_project=args.wandb_project,
+        )
     else:
         parser.print_help()
 

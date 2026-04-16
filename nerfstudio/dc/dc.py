@@ -3,71 +3,24 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torchvision.transforms.functional as TF
 from diffusers import DDIMScheduler, DiffusionPipeline
 from jaxtyping import Float
 from PIL import Image
 from typing import List, Dict
+from dc.attention_utils import (
+    run_unet_with_cross_attention_capture,
+    run_unet_with_skipped_attn,
+)
 from dc.dc_unet import CustomUNet2DConditionModel
+from dc.localization_utils import (
+    apply_mask_postprocessing,
+    build_cross_attention_relevance_mask,
+    get_cross_attention_token_indices,
+    normalize_relevance_map,
+)
 from dc.utils.free_lunch import register_free_upblock2d_in, register_free_crossattn_upblock2d_in
+from dc.utils.logging_utils import log_dc_debug_to_wandb
 import math
-
-
-class STGIdentityValueAttnProcessor:
-    """Paper-faithful STG-A processor.
-
-    The STG paper describes attention skip by replacing the attention matrix
-    A with the identity I so that SA'(Q, K, V) = IV = V. This processor
-    implements that directly in diffusers' attention path by skipping the
-    query/key attention-score computation while preserving the value and output
-    projections.
-    """
-
-    def __call__(
-        self,
-        attn,
-        hidden_states,
-        encoder_hidden_states=None,
-        attention_mask=None,
-        temb=None,
-        *args,
-        **kwargs,
-    ):
-        residual = hidden_states
-
-        if getattr(attn, "spatial_norm", None) is not None:
-            hidden_states = attn.spatial_norm(hidden_states, temb)
-
-        input_ndim = hidden_states.ndim
-        if input_ndim == 4:
-            batch_size, channel, height, width = hidden_states.shape
-            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
-
-        if getattr(attn, "group_norm", None) is not None:
-            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
-
-        if encoder_hidden_states is None:
-            encoder_hidden_states = hidden_states
-        elif getattr(attn, "norm_cross", False):
-            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
-
-        # STG-A: replace A with I so the branch output becomes the projected
-        # value path rather than A @ V.
-        value = attn.to_v(encoder_hidden_states)
-        value = attn.head_to_batch_dim(value)
-        hidden_states = attn.batch_to_head_dim(value)
-
-        hidden_states = attn.to_out[0](hidden_states)
-        hidden_states = attn.to_out[1](hidden_states)
-
-        if input_ndim == 4:
-            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
-
-        if getattr(attn, "residual_connection", False):
-            hidden_states = hidden_states + residual
-
-        hidden_states = hidden_states / getattr(attn, "rescale_output_factor", 1.0)
-        return hidden_states
 
 
 @dataclass
@@ -117,10 +70,13 @@ class DCConfig:
     perp_neg_mask_blur: float = 0.0  # Gaussian blur sigma in image-pixels (soft falloff; 0=off)
     perp_neg_alpha: float = 1.0  # PN subtraction strength (1.0 = full, 0.5 = half)
 
-    # STG (Self-attention skip guidance) — replace CFG with structure-preserving perturbation
+    # STG (Spatiotemporal Skip Guidance) — replace CFG with structure-preserving perturbation
     stg_enabled: bool = False
     stg_scale: float = 0.5
     stg_skip_layers: List[int] = field(default_factory=lambda: [2])
+    stg_schedule_enabled: bool = False
+    stg_decay_start_ratio: float = 0.0
+    stg_decay_end_ratio: float = 1.0
 
     # Self-derived relevance masking — localize the DDS gradient using the
     # model's own tgt/src prediction discrepancy.
@@ -131,6 +87,15 @@ class DCConfig:
     gradient_mask_warmup: int = 50
     source_blend_localization_enabled: bool = False
     outside_mask_anchor_weight: float = 0.0
+
+    # Cross-attention-based relevance masking — use cross-attention maps
+    cross_attention_mask_enabled: bool = False
+    cross_attention_mask_keywords: str = ""
+    cross_attention_mask_prompt: str = ""
+    cross_attention_mask_layers: List[int] = field(default_factory=lambda: [1, 2])
+    cross_attention_mask_weight: float = 1.0
+    cross_attention_mask_blur: float = 0.0
+    cross_attention_mask_gamma: float = 1.0
 
 
 class DC(object):
@@ -192,10 +157,7 @@ class DC(object):
         5. detached before use so it does not backprop through the mask.
         """
         relevance = (eps_tgt - eps_src).norm(dim=1, keepdim=True) # B, 1, H, W
-        flat = relevance.flatten(1) # B, H*W
-        p5 = torch.quantile(flat, 0.05, dim=1, keepdim=True).view(-1, 1, 1, 1)
-        p95 = torch.quantile(flat, 0.95, dim=1, keepdim=True).view(-1, 1, 1, 1)
-        normalized = ((relevance - p5) / (p95 - p5 + 1e-8)).clamp(0.0, 1.0)
+        normalized = normalize_relevance_map(relevance)
 
         prev_mask = self.gradient_mask_ema.get(current_spot)
         if prev_mask is None or prev_mask.shape != normalized.shape:
@@ -210,18 +172,13 @@ class DC(object):
         else:
             mask = ema_mask
 
-        gamma = self.config.gradient_mask_gamma
-        if gamma != 1.0:
-            mask = mask.clamp_min(0.0).pow(gamma)
+        mask = apply_mask_postprocessing(
+            mask,
+            gamma=self.config.gradient_mask_gamma,
+            sigma=self.config.gradient_mask_blur,
+        )
 
-        sigma = self.config.gradient_mask_blur
-        if sigma > 0:
-            kernel_size = max(3, int(round(6 * sigma + 1)))
-            if kernel_size % 2 == 0:
-                kernel_size += 1
-            mask = TF.gaussian_blur(mask, kernel_size=[kernel_size, kernel_size], sigma=[sigma, sigma])
-
-        return mask.clamp(0.0, 1.0).detach()
+        return mask.detach()
 
         
     def compute_posterior_mean(self, xt, noise_pred, t, t_prev):
@@ -290,57 +247,31 @@ class DC(object):
         """Return the cached text embedding for the post-TAG negative regularizer."""
         return self.tag_negative_text_feature
 
-    def _run_unet_with_skipped_attn(self, latent_model_input, t, text_embeddings):
-        """Run UNet forward pass with STG-A attention skip in selected up_blocks.
+    def _get_current_stg_scale(self) -> float:
+        """Return the STG scale for the current edit iteration.
 
-        Preferred path: temporarily swap attn1's processor with a paper-faithful
-        processor that replaces the attention map A with I so SA'(Q,K,V)=IV=V.
-
-        Fallback path: if processor swapping is unavailable, zero the branch
-        output so the surrounding transformer residual behaves like an identity
-        skip at the block level.
+        By default STG stays constant for the whole run. When the schedule is
+        enabled, it linearly decays from stg_scale to 0 between
+        stg_decay_start_ratio and stg_decay_end_ratio of the total edit budget.
         """
-        hooks = []
-        original_processors = []
-        stg_processor = STGIdentityValueAttnProcessor()
+        base_scale = self.config.stg_scale
+        if not self.config.stg_schedule_enabled:
+            return base_scale
 
-        def _zero_attn_branch_output(module, inputs, output):
-            """Approximate STG-A when a processor-level override is unavailable."""
-            return torch.zeros_like(output)
+        max_iteration = max(int(self.max_iteration), 1)
+        progress = min(max(self.iteration / max_iteration, 0.0), 1.0)
+        decay_start = float(self.config.stg_decay_start_ratio)
+        decay_end = float(self.config.stg_decay_end_ratio)
 
-        try:
-            for layer_idx in self.config.stg_skip_layers:
-                block = self.unet.up_blocks[layer_idx]
-                if not hasattr(block, "attentions"):
-                    continue
-                for attn_module in block.attentions:
-                    for transformer_block in attn_module.transformer_blocks:
-                        attn = transformer_block.attn1
-                        if hasattr(attn, "processor"):
-                            original_processors.append((attn, attn.processor))
-                            if hasattr(attn, "set_processor"):
-                                attn.set_processor(stg_processor)
-                            else:
-                                attn.processor = stg_processor
-                        else:
-                            hook = attn.register_forward_hook(_zero_attn_branch_output)
-                            hooks.append(hook)
+        if decay_end <= decay_start:
+            return base_scale if progress < decay_end else 0.0
+        if progress <= decay_start:
+            return base_scale
+        if progress >= decay_end:
+            return 0.0
 
-            with torch.no_grad():
-                output = self.unet.forward(
-                    latent_model_input,
-                    torch.cat([t] * 3).to(self.device),
-                    encoder_hidden_states=text_embeddings,
-                )
-            return output.sample
-        finally:
-            for attn, processor in original_processors:
-                if hasattr(attn, "set_processor"):
-                    attn.set_processor(processor)
-                else:
-                    attn.processor = processor
-            for hook in hooks:
-                hook.remove()
+        decay_progress = (progress - decay_start) / (decay_end - decay_start)
+        return base_scale * (1.0 - decay_progress)
 
     def dc_timestep_sampling(self, batch_size):
         self.scheduler.set_timesteps(self.config.num_inference_steps)
@@ -399,7 +330,17 @@ class DC(object):
         eps = dict()
         pred_x0s = dict()
         noisy_latents = dict()
-        
+        cross_attention_mask = None
+        cross_attention_token_indices = None
+        if self.config.cross_attention_mask_enabled:
+            cross_attention_token_indices = get_cross_attention_token_indices(
+                self.tokenizer,
+                self.tgt_prompt,
+                explicit_keywords=self.config.cross_attention_mask_keywords,
+                cross_attention_prompt=self.config.cross_attention_mask_prompt,
+                src_prompt=self.src_prompt,
+            )
+         
         for latent, cond_text_embedding, name in zip(
             [tgt_x0, src_x0], [tgt_text_embedding, src_text_embedding], ["tgt", "src"]
         ):
@@ -417,19 +358,34 @@ class DC(object):
                 tag_negative_correction = None
                 if self.config.tag_negative_strength > 0 and self.get_tag_negative_text_embedding() is not None:
                     neg_text_embedding = self.get_tag_negative_text_embedding()
-                    text_embeddings = torch.cat(
-                        [cond_text_embedding, neg_text_embedding, uncond_embedding, uncond_embedding], dim=0
-                    )
+                    text_embeddings = torch.cat([cond_text_embedding, neg_text_embedding, uncond_embedding, uncond_embedding], dim=0)
                     text_embeddings = torch.cat([text_embeddings, text_embeddings], dim=1)
                     latent_image = torch.cat([src_encoded, src_encoded, src_encoded, uncond_image_latent], dim=0)
                     latent_model_input = torch.cat([latents_noisy] * 4, dim=0)
                     latent_model_input = torch.cat([latent_model_input, latent_image], dim=1)
+                    timestep_input = torch.cat([t] * 4).to(device)
 
-                    noise_pred = self.unet.forward(
-                        latent_model_input,
-                        torch.cat([t] * 4).to(device),
-                        encoder_hidden_states=text_embeddings,
-                    ).sample
+                    if self.config.cross_attention_mask_enabled:
+                        noise_pred, cross_attention_mask = run_unet_with_cross_attention_capture(
+                            self.unet,
+                            self.config.cross_attention_mask_layers,
+                            cross_attention_token_indices,
+                            latent_model_input,
+                            timestep_input,
+                            text_embeddings,
+                            conditioned_batch_size=batch_size,
+                            build_attention_mask_fn=lambda maps: build_cross_attention_relevance_mask(
+                                maps,
+                                gamma=self.config.cross_attention_mask_gamma,
+                                sigma=self.config.cross_attention_mask_blur,
+                            ),
+                        )
+                    else:
+                        noise_pred = self.unet.forward(
+                            latent_model_input,
+                            timestep_input,
+                            encoder_hidden_states=text_embeddings,
+                        ).sample
 
                     noise_pred_text, neg_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(4)
                     
@@ -443,28 +399,48 @@ class DC(object):
                 else:
                     text_embeddings = base_text_embeddings
                     latent_model_input = base_latent_model_input
-
-                    noise_pred = self.unet.forward(
-                        latent_model_input,
-                        torch.cat([t] * 3).to(device),
-                        encoder_hidden_states=text_embeddings,
-                    ).sample
+                    timestep_input = torch.cat([t] * 3).to(device)
+                    if self.config.cross_attention_mask_enabled:
+                        noise_pred, cross_attention_mask = run_unet_with_cross_attention_capture(
+                            self.unet,
+                            self.config.cross_attention_mask_layers,
+                            cross_attention_token_indices,
+                            latent_model_input,
+                            timestep_input,
+                            text_embeddings,
+                            conditioned_batch_size=batch_size,
+                            build_attention_mask_fn=lambda maps: build_cross_attention_relevance_mask(
+                                maps,
+                                gamma=self.config.cross_attention_mask_gamma,
+                                sigma=self.config.cross_attention_mask_blur,
+                            ),
+                        )
+                    else:
+                        noise_pred = self.unet.forward(
+                            latent_model_input,
+                            timestep_input,
+                            encoder_hidden_states=text_embeddings,
+                        ).sample
                     noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
                     noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_image) + \
                         self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
 
                 # STG: amplify structural signal beyond full model (paper Eq 13)
-                # eps_stg = eps_full + stg_scale * (eps_full - eps_weak)
-                # stg_scale=0 → no effect, stg_scale=1.0 → paper default (STG-R)
                 # ==============================================================================
-                if self.config.stg_enabled:
-                    weak_pred = self._run_unet_with_skipped_attn(
-                        base_latent_model_input, t, base_text_embeddings
+                current_stg_scale = self._get_current_stg_scale()
+                if self.config.stg_enabled and current_stg_scale > 0:
+                    weak_pred = run_unet_with_skipped_attn(
+                        self.unet,
+                        self.device,
+                        self.config.stg_skip_layers,
+                        base_latent_model_input,
+                        t,
+                        base_text_embeddings,
                     )
                     weak_text, weak_image, weak_uncond = weak_pred.chunk(3)
                     noise_pred_weak = weak_uncond + self.config.guidance_scale * (weak_text - weak_image) + \
                         self.config.image_guidance_scale * (weak_image - weak_uncond)
-                    noise_pred = noise_pred + self.config.stg_scale * (noise_pred - noise_pred_weak)
+                    noise_pred = noise_pred + current_stg_scale * (noise_pred - noise_pred_weak)
                 # ==============================================================================
             else:
                 text_embeddings = base_text_embeddings
@@ -520,26 +496,33 @@ class DC(object):
         self.iteration += 1
         
         grad_mask = None
+        self_grad_mask = None
         if (
             self.config.gradient_mask_enabled
             or self.config.source_blend_localization_enabled
             or self.config.outside_mask_anchor_weight > 0
+            or self.config.cross_attention_mask_enabled
         ):
-            grad_mask = self._build_gradient_relevance_mask(
+            self_grad_mask = self._build_gradient_relevance_mask(
                 eps["tgt"], eps["src"], current_spot
             )
+            grad_mask = self_grad_mask
+
+        if cross_attention_mask is not None:
+            if grad_mask is None:
+                grad_mask = cross_attention_mask
+            else:
+                weight = float(self.config.cross_attention_mask_weight)
+                weight = min(max(weight, 0.0), 1.0)
+                grad_mask = grad_mask * ((1.0 - weight) + weight * cross_attention_mask)
+            grad_mask = grad_mask.clamp(0.0, 1.0)
 
         eps_tgt_for_grad = eps["tgt"]
         if self.config.source_blend_localization_enabled and grad_mask is not None:
-            # Source-blended localization:
-            # low-mask regions naturally fall back toward the source branch,
-            # reducing DDS pressure on background / non-target structure.
             eps_tgt_for_grad = eps["src"] + grad_mask * (eps["tgt"] - eps["src"])
 
         preserve_weight = self.config.psi
         if grad_mask is not None and self.config.outside_mask_anchor_weight > 0:
-            # Strengthen x0/source anchoring outside the edit region so smooth
-            # backgrounds (walls, floors) remain closer to the original scene.
             preserve_weight = preserve_weight + self.config.outside_mask_anchor_weight * (1.0 - grad_mask)
 
         w_DDS = self.config.delta + self.config.gamma * (t_normalized ** (1/math.e))
@@ -557,19 +540,38 @@ class DC(object):
         loss = 0.5 * F.mse_loss(tgt_x0, target, reduction=reduction) / batch_size 
         
         
-        if self.use_wandb:
-            import wandb
-            wandb.log({
-                f"target_prediction_x0_{current_spot}": wandb.Image(resize_image(tensor_to_pil(self.decode_latent(pred_x0s["tgt"])), min_size=256), caption=f"{t.item()}"),
-                f"source_prediction_x0_{current_spot}": wandb.Image(resize_image(tensor_to_pil(self.decode_latent(pred_x0s["src"])), min_size=256), caption=f"{t.item()}"),
-                f"target_noise_prediction_{current_spot}": wandb.Image(resize_image(tensor_to_pil(self.decode_latent(eps["tgt"])), min_size=256), caption=f"{t.item()}"),
-                f"source_noise_prediction_{current_spot}": wandb.Image(resize_image(tensor_to_pil(self.decode_latent(eps["src"])), min_size=256), caption=f"{t.item()}"),
-                f"target_noisy_latents_{current_spot}": wandb.Image(resize_image(tensor_to_pil(self.decode_latent(noisy_latents["tgt"])), min_size=256), caption=f"{t.item()}"),
-                f"source_noisy_latents_{current_spot}": wandb.Image(resize_image(tensor_to_pil(self.decode_latent(noisy_latents["src"])), min_size=256), caption=f"{t.item()}"),
-            }, step=step, commit=False) if step % self.config.log_step == 0 else None
+        if self.use_wandb and step % self.config.log_step == 0:
+            log_dc_debug_to_wandb(
+                step=step,
+                current_spot=current_spot,
+                t=t,
+                t_normalized=t_normalized,
+                eta_tag_current=eta_tag_current,
+                current_stg_scale=current_stg_scale if self.config.stg_enabled else 0.0,
+                w_dds=w_DDS,
+                preserve_weight=preserve_weight,
+                eps_tgt=eps["tgt"],
+                eps_src=eps["src"],
+                eps_tgt_for_grad=eps_tgt_for_grad,
+                grad=grad,
+                pred_x0_tgt=self.decode_latent(pred_x0s["tgt"]),
+                pred_x0_src=self.decode_latent(pred_x0s["src"]),
+                grad_mask=grad_mask,
+                self_grad_mask=self_grad_mask,
+                cross_attention_mask=cross_attention_mask,
+                tensor_to_pil_fn=tensor_to_pil,
+                resize_image_fn=resize_image,
+            )
         
         if return_dict:
-            dic = {"loss": loss, "grad": grad, "t": t, "grad_mask": grad_mask}
+            dic = {
+                "loss": loss,
+                "grad": grad,
+                "t": t,
+                "grad_mask": grad_mask,
+                "self_grad_mask": self_grad_mask,
+                "cross_attention_mask": cross_attention_mask,
+            }
             return dic
         else:
             return loss

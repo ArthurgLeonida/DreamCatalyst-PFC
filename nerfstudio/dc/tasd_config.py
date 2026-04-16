@@ -23,6 +23,16 @@ DC_CUSTOM_PARAMS = dict(
     gradient_mask_gamma=1.2,     # >1 = tighter mask, <1 = broader mask
     gradient_mask_ema_beta=0,  # temporal smoothing per view; 0 disables EMA
     gradient_mask_warmup=0,     # during warmup the mask is all ones
+    # Optional semantic prior from target-token cross-attention. This is meant
+    # to tighten the self-mask when methods like STG / Perp-Neg spread the
+    # raw eps_tgt - eps_src delta across the whole image.
+    cross_attention_mask_enabled=False,
+    cross_attention_mask_keywords="",
+    cross_attention_mask_prompt="",
+    cross_attention_mask_layers=[1, 2],
+    cross_attention_mask_weight=1.0,
+    cross_attention_mask_blur=0.0,
+    cross_attention_mask_gamma=1.0,
 
     # ---------------------------------------------------------------------
     # 2. TAG branch
@@ -42,6 +52,9 @@ DC_CUSTOM_PARAMS = dict(
     stg_enabled=False,
     stg_scale=0.5,
     stg_skip_layers=[2],
+    stg_schedule_enabled=False,
+    stg_decay_start_ratio=0.0,
+    stg_decay_end_ratio=0.35,
 
     # ---------------------------------------------------------------------
     # 4. Perp-Neg branch

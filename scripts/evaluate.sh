@@ -3,10 +3,7 @@
 #  DreamCatalyst-NS — Evaluation script
 # ==============================================================================
 #  Usage:
-#    bash scripts/evaluate.sh <config_yml> <src_prompt> <tgt_prompt> [output_dir]
-#
-#  Compare:
-#    bash scripts/evaluate.sh --compare eval_results/exp1 eval_results/exp2 ...
+#    bash scripts/evaluate.sh <config_yml> <src_prompt> <tgt_prompt> [output_dir] [extra evaluate.py args...]
 #
 #  Examples:
 #    bash scripts/evaluate.sh \
@@ -14,32 +11,29 @@
 #        "a photo of a face" \
 #        "Turn him into the Tolkien Elf" \
 #        eval_results/face_fulltag_1.1
-#
-#    bash scripts/evaluate.sh --compare \
-#        eval_results/bicycle_fulltag_1.1 \
-#        eval_results/bicycle_adatag_1.1 \
-#        eval_results/bicycle_cfgfree
 # ==============================================================================
 
 set -euo pipefail
-
-if [ "${1:-}" = "--compare" ]; then
-    shift
-    python scripts/evaluate.py compare "$@"
-    exit 0
-fi
 
 CONFIG="${1:?Usage: $0 <config_yml> <src_prompt> <tgt_prompt> [output_dir]}"
 SRC_PROMPT="${2:?Missing src_prompt}"
 TGT_PROMPT="${3:?Missing tgt_prompt}"
 
-# Auto-generate output dir from config path if not provided
-if [ -n "${4:-}" ]; then
+# Auto-generate output dir from config path if not provided.
+# If arg 4 starts with "--", treat it as an extra evaluate.py flag instead.
+EXTRA_ARGS=()
+if [ -n "${4:-}" ] && [[ "${4}" != --* ]]; then
     OUTPUT_DIR="$4"
+    if [ "$#" -gt 4 ]; then
+        EXTRA_ARGS=("${@:5}")
+    fi
 else
     # Extract: outputs/<scene>/<method>/<timestamp> -> eval_results/<scene>_<method>_<timestamp>
     REL_PATH=$(dirname "$(dirname "${CONFIG}")")
     OUTPUT_DIR="eval_results/$(echo "${REL_PATH}" | sed 's|outputs/||' | tr '/' '_')"
+    if [ "$#" -gt 3 ]; then
+        EXTRA_ARGS=("${@:4}")
+    fi
 fi
 
 # Auto-select GPU
@@ -60,4 +54,5 @@ python scripts/evaluate.py eval \
     --config "${CONFIG}" \
     --src-prompt "${SRC_PROMPT}" \
     --tgt-prompt "${TGT_PROMPT}" \
-    --output-dir "${OUTPUT_DIR}"
+    --output-dir "${OUTPUT_DIR}" \
+    "${EXTRA_ARGS[@]}"

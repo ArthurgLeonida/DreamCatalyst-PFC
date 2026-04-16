@@ -6,11 +6,13 @@
 #    bash scripts/edit.sh <scene> <src_prompt> <tgt_prompt> <load_dir> [max_iters] [rep] [downscale]
 #
 #  rep: splat (default) or nerf
-#  downscale: must match Step 2 training downscale (default: 2)
+#  downscale: must match Step 2 training downscale (default: 1)
+#  After editing, metrics are automatically evaluated and saved inside the
+#  experiment folder as metrics.json. Disable with: EVAL_AFTER_EDIT=0 bash ...
 #
-#  For NeRF, two GPUs are auto-selected (NeRF model + diffusion model)
-#  since nerfacto + IP2P exceeds single-GPU memory.
-#  Override with: CUDA_VISIBLE_DEVICES=5,7 bash scripts/edit.sh ...
+#  WandB-aware auto-eval:
+#  when VIS_MODE=wandb, edit.sh stores WandB files under the method folder and
+#  evaluate.py resumes the same training run to attach eval metrics to it.
 #
 #  Examples:
 #    bash scripts/edit.sh bicycle \
@@ -25,13 +27,21 @@
 
 set -euo pipefail
 
-SCENE="${1:?Usage: $0 <scene> <src_prompt> <tgt_prompt> <load_dir> [max_iters] [rep]}"
+SCENE="${1:?Usage: $0 <scene> <src_prompt> <tgt_prompt> <load_dir> [max_iters] [rep] [downscale]}"
 SRC_PROMPT="${2:?Missing src_prompt}"
 TGT_PROMPT="${3:?Missing tgt_prompt}"
 LOAD_DIR="${4:?Missing load_dir (path to init model nerfstudio_models/)}"
 MAX_ITERS="${5:-3000}"
-REP="${6:-splat}"        # splat | nerf
+REP="${6:-nerf}"        # splat | nerf
+DOWN_SCALE="${7:-1}"
 DATA_DIR="data/${SCENE}_processed"
+VIS_MODE="${VIS_MODE:-wandb}"
+PROJECT_NAME="${PROJECT_NAME:-dreamcatalyst-pfc}"
+EXPERIMENT_NAME="${RUN_NAME:-${SCENE}_elf_fulltag1.15_neg-prompt0.2_instructSat_PN_SBL}"
+EVAL_AFTER_EDIT="${EVAL_AFTER_EDIT:-1}"
+EVAL_DEVICE="${EVAL_DEVICE:-cuda}"
+RUN_DIR=""
+TRAIN_LOG=""
 
 # ── Resolve method from representation ────────────────────────────────────────
 case "${REP}" in
@@ -51,6 +61,37 @@ case "${REP}" in
         ;;
 esac
 
+BASE_OUTPUT_DIR="outputs/${EXPERIMENT_NAME}/${METHOD}"
+TRAIN_WANDB_DIR=""
+if [ "${VIS_MODE}" = "wandb" ]; then
+    TRAIN_WANDB_DIR="${WANDB_DIR:-${BASE_OUTPUT_DIR}/wandb}"
+    mkdir -p "${TRAIN_WANDB_DIR}"
+fi
+
+extract_run_dir_from_train_log() {
+    local log_path="$1"
+    local config_path=""
+
+    if [ ! -f "${log_path}" ]; then
+        return 0
+    fi
+
+    config_path="$(grep -oE 'outputs/[^[:space:]]+/config\.yml' "${log_path}" | tail -n 1 || true)"
+    if [ -z "${config_path}" ]; then
+        return 0
+    fi
+
+    dirname "${config_path}"
+}
+
+run_training() {
+    if [ -n "${TRAIN_WANDB_DIR}" ]; then
+        env WANDB_DIR="${TRAIN_WANDB_DIR}" "${CMD[@]}"
+    else
+        "${CMD[@]}"
+    fi
+}
+
 # ── Auto-select GPU(s) unless CUDA_VISIBLE_DEVICES is already set ────────────
 if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
     echo "[edit.sh] Selecting ${NUM_GPUS} best available GPU(s)..."
@@ -63,6 +104,7 @@ echo " Editing:   ${METHOD}"
 echo " Scene:     ${SCENE}"
 echo " Data:      ${DATA_DIR}"
 echo " Iters:     ${MAX_ITERS}"
+echo " Downscale: ${DOWN_SCALE}"
 echo " Src:       ${SRC_PROMPT}"
 echo " Tgt:       ${TGT_PROMPT}"
 echo " Load from: ${LOAD_DIR}"
@@ -86,9 +128,9 @@ CMD=(ns-train "${METHOD}" \
     --machine.seed 42 \
     --max-num-iterations "${MAX_ITERS}" \
     --mixed-precision False \
-    --vis viewer+wandb \
-    --project-name dreamcatalyst-pfc \
-    --experiment-name "${SCENE}"_fulltag115_srcblend_b2g12 \
+    --vis "${VIS_MODE}" \
+    --project-name "${PROJECT_NAME}" \
+    --experiment-name "${EXPERIMENT_NAME}" \
     --data "${DATA_DIR}" \
     --load-dir "${LOAD_DIR}" \
     --pipeline.dc.src-prompt "${SRC_PROMPT}" \
@@ -98,23 +140,67 @@ CMD=(ns-train "${METHOD}" \
     --pipeline.dc-device "cuda:0" \
     --pipeline.dc.sd-pretrained-model-or-path timbrooks/instruct-pix2pix \
     pipeline.datamanager:"${DM_CONFIG}" \
-    --pipeline.datamanager.dataparser.downscale-factor 1)
+    --pipeline.datamanager.dataparser.downscale-factor "${DOWN_SCALE}")
 
-# For NeRF: offload diffusion model to second GPU if available
-# Count how many GPUs are actually visible (comma-separated list)
-ACTUAL_GPUS=$(echo "${CUDA_VISIBLE_DEVICES}" | tr ',' '\n' | wc -l)
-if [ "${NUM_GPUS}" -ge 2 ] && [ "${ACTUAL_GPUS}" -ge 2 ]; then
-    CMD+=(--pipeline.dc-device cuda:1)
-elif [ "${NUM_GPUS}" -ge 2 ] && [ "${ACTUAL_GPUS}" -lt 2 ]; then
-    echo "WARNING: NeRF editing needs 2 GPUs but only ${ACTUAL_GPUS} available."
-    echo "         This will likely OOM. Set CUDA_VISIBLE_DEVICES=X,Y manually."
-    echo "         Proceeding on single GPU anyway..."
+TRAIN_LOG="$(mktemp -t edit-train-XXXXXX.log)"
+echo "[edit.sh] Capturing training log to ${TRAIN_LOG}"
+
+run_training 2>&1 | tee "${TRAIN_LOG}"
+
+RUN_DIR="$(extract_run_dir_from_train_log "${TRAIN_LOG}")"
+if [ -n "${RUN_DIR}" ]; then
+    echo "[edit.sh] Resolved run directory: ${RUN_DIR}"
 fi
 
-"${CMD[@]}"
+if [ "${EVAL_AFTER_EDIT}" = "1" ]; then
+    echo ""
+    echo "============================================"
+    echo " Running evaluation..."
+    echo "============================================"
+
+    if [ -z "${RUN_DIR}" ] || [ ! -f "${RUN_DIR}/config.yml" ]; then
+        echo "WARNING: Could not locate the new experiment directory for evaluation."
+        echo "         Expected under: ${BASE_OUTPUT_DIR}/<timestamp>/config.yml"
+        echo "         Training log: ${TRAIN_LOG}"
+    else
+        EVAL_CMD=(python scripts/evaluate.py eval \
+            --config "${RUN_DIR}/config.yml" \
+            --src-prompt "${SRC_PROMPT}" \
+            --tgt-prompt "${TGT_PROMPT}" \
+            --output-dir "${RUN_DIR}" \
+            --device "${EVAL_DEVICE}")
+
+        if [ "${VIS_MODE}" = "wandb" ]; then
+            EVAL_CMD+=(--log-wandb)
+            if [ -n "${TRAIN_WANDB_DIR}" ]; then
+                EVAL_CMD+=(--wandb-dir "${TRAIN_WANDB_DIR}")
+            fi
+        fi
+
+        if env -u WANDB_MODE "${EVAL_CMD[@]}"; then
+            if [ "${VIS_MODE}" = "wandb" ]; then
+                echo " Metrics saved to: ${RUN_DIR}/metrics.json. WandB logging attempted."
+            else
+                echo " Metrics saved to: ${RUN_DIR}/metrics.json."
+            fi
+        else
+            echo "WARNING: Evaluation failed, but the edit run completed successfully."
+            echo "         You can retry manually with:"
+            printf '         bash scripts/evaluate.sh %q %q %q %q\n' \
+                "${RUN_DIR}/config.yml" \
+                "${SRC_PROMPT}" \
+                "${TGT_PROMPT}" \
+                "${RUN_DIR}"
+        fi
+    fi
+fi
 
 echo ""
 echo "============================================"
 echo " Editing complete!"
-echo " Outputs in: outputs/${SCENE}/${METHOD}/<timestamp>/"
+if [ -n "${RUN_DIR}" ]; then
+    echo " Outputs in: ${RUN_DIR}"
+else
+    echo " Outputs in: ${BASE_OUTPUT_DIR}/<timestamp>/"
+fi
 echo "============================================"
