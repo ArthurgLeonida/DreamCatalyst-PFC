@@ -1,15 +1,26 @@
 # DreamCatalyst-PFC
 
-Text-driven 3D scene editing using **3D Gaussian Splatting** + **DreamCatalyst** (DDS guidance).
+Text-driven 3D scene editing built on top of **DreamCatalyst** (DDS-based score distillation). This undergraduate thesis project (UFSC, PFC) focuses on **NeRF-based** reconstructions — the 3D Gaussian Splatting path is supported for completeness but is not the primary target.
 
 > Kim et al. *"DreamCatalyst: Fast and High-Quality 3D Editing via Controlling Editability and Identity Preservation"*. ICLR 2025. [arXiv:2407.11394](https://arxiv.org/abs/2407.11394)
 
-## Pipeline overview
+## Pipeline
 
 ```
-Photos/Video ──► COLMAP ──► Splatfacto (3DGS) ──► DreamCatalyst (edit) ──► Refinement (SDEdit)
-                  Step 1        Step 2                  Step 3                  Step 4
+Photos/Video ──► COLMAP ──► Nerfacto (NeRF) ──► DreamCatalyst (edit) ──► Refinement (optional, not evaluated)
+                  Step 1       Step 2                 Step 3                      Step 4
 ```
+
+3DGS alternative: substitute `splatfacto` in Step 2 and `dc_splat` / `dc_splat_refinement` in Steps 3–4.
+
+## Research scope
+
+The contributions of this work are concentrated in **Step 3**. Extensions target:
+- stronger DDS guidance (TAG family, STG, Perp-Neg, post-TAG negative prompt),
+- better localization / background preservation (self-derived relevance mask, source-blended localization, cross-attention semantic mask, outside-mask background anchor),
+- cleaner multi-scene evaluation.
+
+Stormtrooper / person is the strongest localization showcase; face / elf is the naturalness and preservation stress test.
 
 ## Setup
 
@@ -21,117 +32,154 @@ conda activate dreamcatalyst_ns
 ## Step 1 — Process data (COLMAP)
 
 ```bash
-# From images (place them in data/<scene>/images/)
-bash scripts/process_data.sh <scene>
-
-# From video
-bash scripts/process_data.sh <scene> video
+bash scripts/process_data.sh <scene>            # from images in data/<scene>/images/
+bash scripts/process_data.sh <scene> video      # from video
 ```
 
 Output: `data/<scene>_processed/` with `transforms.json`.
 
-## Step 2 — Train 3DGS reconstruction
+## Step 2 — Train NeRF reconstruction
 
 ```bash
-bash scripts/train.sh <scene> 30000
-# equivalent to: ns-train splatfacto ... nerfstudio-data --data data/<scene>_processed
+bash scripts/train.sh <scene> 30000 nerf
+# equivalent to: ns-train nerfacto ... nerfstudio-data --data data/<scene>_processed
 ```
 
-Output: `outputs/<scene>/splatfacto/<timestamp>/`
+Output: `outputs/<scene>/nerfacto/<timestamp>/`
+
+> For the 3DGS path, pass `splat` instead of `nerf`.
 
 ## Step 3 — Edit with DreamCatalyst (DDS)
 
 ```bash
-bash scripts/edit.sh bicycle \
-    "a photo of a bicycle leaning against a bench" \
-    "a photo of a motorcycle leaning against a bench" \
-    outputs/bicycle/splatfacto/<timestamp>/nerfstudio_models/ \
-    3000
+RUN_NAME=my_edit bash scripts/edit.sh <scene> \
+    "a photo of a sks man" \
+    "a photo of a Tolkien elf" \
+    outputs/<scene>/nerfacto/<timestamp>/nerfstudio_models/ \
+    3000 nerf
 # Usage: bash scripts/edit.sh <scene> <src_prompt> <tgt_prompt> <load_dir> [max_iters] [rep]
-# rep: splat (default) or nerf
-# Default: 3000 iterations
+# rep: nerf (default for this project) or splat
 ```
 
-Loads the reconstruction from Step 2 and optimizes the Gaussians toward the target prompt using DDS guidance. Each iteration renders a view, computes guidance loss, and backprops into the splat parameters.
+Loads the reconstruction from Step 2 and optimizes the NeRF (or Gaussians) toward the target prompt using DDS guidance with the extensions listed in [Novelties](#novelties).
 
-The `max_iters` argument is synced to `--pipeline.dc.max-iteration` so the timestep schedule covers the full training range.
+`max_iters` is forwarded to `--pipeline.dc.max-iteration` so the timestep schedule covers the full training budget. `EVAL_AFTER_EDIT=true` automatically invokes `scripts/evaluate.py` on the finished run.
 
 **Prompt guidelines:**
-- Describe the **full scene**, not just the object: `"a photo of a bicycle leaning against a bench"` not `"a bicycle"`.
-- Keep the source and target prompts as similar as possible — only change the edited element.
+- Describe the **full scene**, not just the object.
+- Keep source and target prompts as close as possible — only change the edited element.
 - Prefix with `"a photo of"` to anchor the diffusion model to photorealistic outputs.
 
-Output: `outputs/<scene>/dc_splat/<timestamp>/`
+**IP2P model:** Step 3 uses `timbrooks/instruct-pix2pix` via a CLI override in `scripts/edit.sh`. The `DCConfig.sd_pretrained_model_or_path` default stays at `runwayml/stable-diffusion-v1-5` — do not change it (refinement depends on SD 1.5).
 
-### Render after editing (check before refinement)
+Output: `outputs/<scene>/dc/<timestamp>/`
+
+### Render after editing
 
 ```bash
 ns-render interpolate \
-    --load-config outputs/<scene>/dc_splat/<timestamp>/config.yml \
+    --load-config outputs/<scene>/dc/<timestamp>/config.yml \
     --output-path renders/<scene>_edited.mp4
 ```
 
-## Step 4 — Refinement
+## Step 4 — Refinement (supported, not evaluated in this thesis)
 
 ```bash
-bash scripts/refine.sh bicycle \
-    "a photo of a motorcycle leaning against a bench" \
-    outputs/bicycle/dc_splat/<timestamp>/nerfstudio_models/ \
+RUN_NAME=my_refine bash scripts/refine.sh <scene> \
+    "a photo of a Tolkien elf" \
+    outputs/<scene>/dc/<timestamp>/nerfstudio_models/ \
     30000
-# Usage: bash scripts/refine.sh <scene> <tgt_prompt> <load_dir> [max_iters]
-# Default: 30000 iterations
 ```
 
-Uses SDEdit to produce edited 2D images, then retrains the Gaussians against them. Cleans up floater artifacts from Step 3. **Do not skip this step** — it significantly improves output quality.
-
-### Render after refinement
-
-```bash
-ns-render interpolate \
-    --load-config outputs/<scene>/dc_splat_refinement/<timestamp>/config.yml \
-    --output-path renders/<scene>_refined.mp4
-```
-
-## Export & monitor
-
-```bash
-ns-export gaussian-splat \
-    --load-config outputs/<scene>/dc_splat_refinement/<timestamp>/config.yml \
-    --output-dir exports/<scene>
-
-# Monitor training in real time
-tensorboard --logdir outputs/ --port 6006 --bind_all
-```
+Uses SDEdit (SD 1.5, 20 denoising steps with `skip=7`) to produce edited 2D images and retrains the NeRF against them. This step was part of the original DreamCatalyst pipeline and is kept here for completeness, but it is **not part of the current experimental evaluation**. The reasoning matches the original paper's evaluation protocol: Step 3 is where the contributions live, and refinement adds significant runtime without altering the scientific claim. The option remains available for anyone who wants to produce polished final renders.
 
 ## Novelties
 
-This project extends DreamCatalyst's DDS guidance with modifications to the noise prediction step. All are configured in `nerfstudio/dc/tasd_config.py` and applied to every method config automatically.
+All extensions live in `nerfstudio/dc/dc.py` and are configured centrally in `nerfstudio/dc/tasd_config.py` (`DC_CUSTOM_PARAMS`). Every novelty defaults to *off*, so enabling it produces a clean ablation.
 
-| # | Novelty | Config | Description | Status |
-|---|---|---|---|---|
-| 1 | **TAG** | `eta_tag=1.15` | Amplifies the tangential component of the noise prediction relative to the noisy latent, improving detail and reducing oversaturation. Based on TAG (Cho et al., 2024). `eta_tag=1.0` disables it. | Done |
-| 2 | **Adaptive TAG** | `adaptive_tag=True` | Anneals η from `eta_tag` at high noise to 1.0 at low noise: `η(t) = 1 + (eta_tag - 1) * t_normalized`. Stronger amplification when the signal is noisiest, tapering off as denoising progresses. Original contribution. | Done |
-| 3 | **Asymmetric TAG** | `asymmetric_tag=True` | Applies TAG only to the target branch of DDS, leaving the source branch unmodified (`η=1.0`). This amplifies the editing direction without disturbing source reconstruction. Original contribution. | Done |
-| 4 | **STG** | `stg_enabled=True` | Runs a second "weak" UNet pass with self-attention zeroed out in selected up_blocks (STG-A variant), then amplifies per paper Eq 13: `eps = eps_full + stg_scale * (eps_full - eps_weak)`. `stg_scale=0` off, paper default for STG-A is `2.0`. Applied only to target branch. Based on STG (Hyung et al., CVPR 2025). | Done |
-| 5 | **Perpendicular Gradient Projection** | `perp_neg=True` | Gram-Schmidt orthogonalization of `eps_tgt` w.r.t. `eps_src` before the DDS delta, making the two guidance signals perpendicular. Based on PCGrad (Yu et al., NeurIPS 2020) and Perp-Neg (Armandpour et al., ICML 2023). | Done |
-| 6 | **Foreground-Masked Perp-Neg** | `depth_masked_perp_neg=True` | Restricts the Perp-Neg projection to foreground pixels only, preventing background texture destruction. Supports two mask sources: `"cached"` (precomputed via Grounded-SAM/rembg, zero training cost) or `"depth"` (renderer depth, percentile-normalized). Projection computed from foreground pixels only (masked dot products). Generate masks offline: `python scripts/generate_masks.py`. Original contribution. | Done |
+### Localization branch (main research direction)
+
+| Novelty | Config | Description |
+|---|---|---|
+| **Self-derived relevance mask** | `gradient_mask_enabled` | Builds a soft mask `M` from the per-pixel norm of `eps_tgt − eps_src` (pre-TAG / pre-STG / pre-PN snapshot). Inspired by LatentEditor. |
+| **Source-blended localization** | `source_blend_localization_enabled` | Replaces the DDS target with `eps_src + M·(eps_tgt − eps_src)`, so the edit signal vanishes outside the mask. Motivated by LatentEditor / FoI / ZONE. |
+| **Outside-mask background anchor** | `outside_mask_anchor_weight` | Strengthens the preservation term by `w_out · (1 − M)`, tightening `x0` outside the mask. |
+| **Cross-attention semantic mask** | `cross_attention_mask_enabled` + `cross_attention_mask_{keywords,layers,weight,gamma,blur}` | Aggregates target-token cross-attention from selected UNet up-blocks, fuses with the self-mask as `M_hybrid = M_self · ((1 − w) + w · M_attn)`. Based on Prompt-to-Prompt, What the DAAM, DiffEdit, LEDITS++. |
+
+### TAG branch (edit strength)
+
+| Novelty | Config | Description |
+|---|---|---|
+| **TAG** | `eta_tag` | Amplifies the tangential component of `noise_pred` with respect to the noisy latent. `eta_tag=1.0` disables. Based on TAG (Cho et al., 2024). |
+| **Adaptive TAG** | `adaptive_tag` | Anneals `η(t) = 1 + (eta_tag − 1) · t_norm^(1/e)` so amplification is strongest at high noise and decays toward 1.0 near the clean regime. |
+| **Asymmetric TAG** | `asymmetric_tag` | Applies TAG only to the target branch, leaving `eps_src` at `η = 1.0`. |
+| **Post-TAG negative prompt** | `tag_negative_prompt`, `tag_negative_strength` | Subtracts a negative-prompt CFG direction after TAG. Exploratory — does not yet convincingly beat non-neg runs. |
+
+### STG branch (structural amplification)
+
+| Novelty | Config | Description |
+|---|---|---|
+| **STG** | `stg_enabled`, `stg_scale`, `stg_skip_layers` | Runs a weak UNet pass via `STGIdentityValueAttnProcessor` on selected up-blocks and amplifies `eps = eps_full + s · (eps_full − eps_weak)`. Based on STG (Hyung et al., CVPR 2025). Target-branch only. |
+| **STG schedule** | `stg_schedule_enabled`, `stg_decay_{start,end}_ratio` | Linearly decays `stg_scale` to 0 between two fractions of the training budget, so structural amplification is used mainly in the creative stage. |
+
+### Perp-Neg branch (creative direction separation)
+
+| Novelty | Config | Description |
+|---|---|---|
+| **Perpendicular Gradient Projection** | `perp_neg` | Orthogonalizes `eps_tgt` with respect to `eps_src` via Gram-Schmidt. Based on PCGrad (Yu et al., NeurIPS 2020) and Perp-Neg (Armandpour et al., ICML 2023). |
+| **Foreground-masked Perp-Neg** | `depth_masked_perp_neg` + `depth_mask_source`, `cached_mask_dir`, `perp_neg_mask_{dilate,blur}`, `perp_neg_alpha` | Restricts the projection to a foreground region. Mask sources: `"cached"` (precomputed via Grounded-SAM / rembg) or `"depth"` (renderer depth, percentile-normalized). |
+
+### Central config
 
 ```python
 # nerfstudio/dc/tasd_config.py
 DC_CUSTOM_PARAMS = dict(
-    eta_tag=1.15,              # 1.0 = disabled
-    adaptive_tag=True,         # anneal η with timestep
-    asymmetric_tag=True,       # TAG only on target branch
-    perp_neg=False,            # perpendicular gradient projection
-    depth_masked_perp_neg=False,  # restrict PN to foreground pixels
-    depth_mask_source="depth", # "cached" (precomputed) or "depth" (renderer)
-    depth_mask_threshold=0.5,  # for depth source only
-    cached_mask_dir="",        # path to mask PNGs for cached source
-    stg_enabled=False,         # self-attention skip guidance
-    stg_scale=0.5,             # STG blend strength (paper default for STG-A: 2.0)
-    stg_skip_layers=[2],       # which up_blocks to skip
+    # Localization
+    psi=0.075,
+    source_blend_localization_enabled=True,
+    gradient_mask_enabled=False,
+    outside_mask_anchor_weight=0.05,
+    gradient_mask_blur=2.0,
+    gradient_mask_gamma=1.2,
+    gradient_mask_ema_beta=0,
+    gradient_mask_warmup=0,
+    cross_attention_mask_enabled=False,
+    cross_attention_mask_weight=1.0,
+    cross_attention_mask_layers=[1, 2],
+
+    # TAG
+    eta_tag=1.0,
+    adaptive_tag=False,
+    asymmetric_tag=False,
+    tag_negative_prompt="",
+    tag_negative_strength=0.0,
+
+    # STG
+    stg_enabled=False,
+    stg_scale=0.5,
+    stg_skip_layers=[2],
+    stg_schedule_enabled=False,
+    stg_decay_end_ratio=0.35,
+
+    # Perp-Neg
+    perp_neg=False,
+    depth_masked_perp_neg=True,
+    depth_mask_source="cached",
+    perp_neg_alpha=1.0,
 )
 ```
+
+## Evaluation
+
+`scripts/evaluate.py` loads the finished edited checkpoint from `<run_dir>/nerfstudio_models`, renders the evaluation views, computes metrics, and writes `metrics.json` into the same run folder. Reported metrics:
+
+- `CLIP_direction` (↑) — editability
+- `CLIP_img_sim` (↑) — content preservation
+- `SSIM` (↑) — identity preservation
+- `LPIPS` (↓) — perceptual distance
+- `MultiView_pairwise_cos_sim` (↑) — multi-view consistency
+
+Comparisons across runs must use the **same `downscale`** for reconstruction, edit, and (when run) refinement; inconsistent downscales have produced spurious qualitative differences in the past.
 
 ## Environment
 
@@ -163,7 +211,7 @@ DC_CUSTOM_PARAMS = dict(
 }
 
 @inproceedings{hyung2025stg,
-  title     = {Self-Guidance: Improve Deep Diffusion Model via Self-Guidance},
+  title     = {Spatiotemporal Skip Guidance for Enhanced Video Diffusion Sampling},
   author    = {Minyoung Hyung and Jaegul Choo},
   booktitle = {CVPR},
   year      = {2025},
@@ -181,5 +229,35 @@ DC_CUSTOM_PARAMS = dict(
   author    = {Mohammadreza Armandpour and Ali Sadeghian and Huangjie Zheng and Amir Sadeghian and Mingyuan Zhou},
   booktitle = {ICML},
   year      = {2023},
+}
+
+@inproceedings{hertz2023p2p,
+  title     = {Prompt-to-Prompt Image Editing with Cross-Attention Control},
+  author    = {Amir Hertz and Ron Mokady and Jay Tenenbaum and Kfir Aberman and Yael Pritch and Daniel Cohen-Or},
+  booktitle = {ICLR},
+  year      = {2023},
+}
+
+@inproceedings{tang2023daam,
+  title     = {What the DAAM: Interpreting Stable Diffusion Using Cross Attention},
+  author    = {Raphael Tang and Linqing Liu and Akshat Pandey and Zhiying Jiang and Gefei Yang and Karun Kumar and Pontus Stenetorp and Jimmy Lin and Ferhan Ture},
+  booktitle = {ACL},
+  year      = {2023},
+}
+
+@inproceedings{couairon2023diffedit,
+  title     = {DiffEdit: Diffusion-based Semantic Image Editing with Mask Guidance},
+  author    = {Guillaume Couairon and Jakob Verbeek and Holger Schwenk and Matthieu Cord},
+  booktitle = {ICLR},
+  year      = {2023},
+  url       = {https://arxiv.org/abs/2210.11427},
+}
+
+@inproceedings{brack2024leditspp,
+  title     = {{LEDITS++}: Limitless Image Editing using Text-to-Image Models},
+  author    = {Manuel Brack and Felix Friedrich and Katharina Kornmeier and Linoy Tsaban and Patrick Schramowski and Kristian Kersting and Apolinario Passos},
+  booktitle = {CVPR},
+  year      = {2024},
+  url       = {https://arxiv.org/abs/2311.16711},
 }
 ```
