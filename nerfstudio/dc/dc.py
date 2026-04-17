@@ -105,6 +105,17 @@ class DCConfig:
     # (often NOT the edit target); inverting reframes M_self as a "model-agreement" mask.
     invert_self_mask: bool = False
 
+    # DaCapo-inspired ψ schedule (Huang et al., CVPR 2025).
+    # preserve_weight = psi * (1 + (psi_late_multiplier - 1) * (1 - t_normalized))
+    # psi_late_multiplier=1.0 disables the schedule (current behavior).
+    # >1 grows preservation as t decreases: coarse/edit early, fine/preserve late.
+    psi_late_multiplier: float = 1.0
+
+    # N2: latent-mean anchor. Adds λ · (mean(tgt_x0) - mean(src_x0)) to the final grad,
+    # minimizing channel-mean drift in VAE latent space. Targets the TAG brightness /
+    # saturation artifact without relying on text-semantic negative prompts.
+    latent_mean_anchor_weight: float = 0.0
+
 
 class DC(object):
     def __init__(self, config: DCConfig, use_wandb=False):
@@ -558,7 +569,10 @@ class DC(object):
         if self.config.source_blend_localization_enabled and grad_mask is not None:
             eps_tgt_for_grad = eps["src"] + grad_mask * (eps["tgt"] - eps["src"])
 
-        preserve_weight = self.config.psi
+        # DaCapo-inspired temporal schedule on ψ: coarse/edit at high t, fine/preserve at low t.
+        # psi_late_multiplier=1.0 (default) → no change from DreamCatalyst behavior.
+        psi_schedule_factor = 1.0 + (self.config.psi_late_multiplier - 1.0) * (1.0 - t_normalized)
+        preserve_weight = self.config.psi * psi_schedule_factor
         if grad_mask is not None and self.config.outside_mask_anchor_weight > 0:
             preserve_weight = preserve_weight + self.config.outside_mask_anchor_weight * (1.0 - grad_mask)
 
@@ -567,9 +581,16 @@ class DC(object):
             w_DDS * (eps_tgt_for_grad - eps["src"])
             + math.exp(t_normalized) * preserve_weight * (tgt_x0 - src_x0)
         )
-    
+
         if self.config.gradient_mask_enabled and grad_mask is not None:
             grad = grad * grad_mask
+
+        # N2: latent-mean anchor. Adds a bias that drives mean(tgt_x0) toward mean(src_x0) per
+        # channel, counteracting TAG/CFG-driven brightness & saturation drift in VAE latent space.
+        if self.config.latent_mean_anchor_weight > 0:
+            tgt_mean = tgt_x0.mean(dim=(2, 3), keepdim=True)
+            src_mean = src_x0.mean(dim=(2, 3), keepdim=True)
+            grad = grad + self.config.latent_mean_anchor_weight * (tgt_mean - src_mean).expand_as(grad)
 
         grad = torch.nan_to_num(grad)
         

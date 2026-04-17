@@ -35,9 +35,21 @@ DC_CUSTOM_PARAMS = dict(
     cross_attention_mask_gamma=1.0,
     # M1: ignore M_self and use M_attn alone (use when ||eps_tgt - eps_src|| anti-localizes the edit,
     # e.g. IP2P on face scenes where image conditioning collapses the delta on the target).
+    # Note: on IP2P face scenes tested so far, M1 underperforms W — use only when diagnostic says so.
     cross_attention_mask_only=False,
     # M2: treat (1 - M_self) as the "model-agreement" mask and intersect with M_attn.
+    # Note: catastrophically failed on face/elf (CLIPd -0.02); kept as an ablation switch.
     invert_self_mask=False,
+
+    # DaCapo-inspired ψ schedule (Huang et al., CVPR 2025).
+    # psi_late_multiplier=1.0 disables the schedule (current DreamCatalyst behavior).
+    # >1 grows preservation as t decreases: edit commits early, preservation tightens late.
+    psi_late_multiplier=1.0,
+
+    # N2: latent-mean anchor. Adds λ·(mean(tgt_x0) - mean(src_x0)) to the final grad,
+    # counteracting TAG-driven brightness/saturation drift without a text negative prompt.
+    # 0.0 disables. Start around 0.005-0.02.
+    latent_mean_anchor_weight=0.0,
 
     # ---------------------------------------------------------------------
     # 2. TAG branch

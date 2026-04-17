@@ -103,8 +103,10 @@ All extensions live in `nerfstudio/dc/dc.py` and are configured centrally in `ne
 |---|---|---|
 | **Self-derived relevance mask** | `gradient_mask_enabled` | Builds a soft mask `M` from the per-pixel norm of `eps_tgt − eps_src` (pre-TAG / pre-STG / pre-PN snapshot). Inspired by LatentEditor. |
 | **Source-blended localization** | `source_blend_localization_enabled` | Replaces the DDS target with `eps_src + M·(eps_tgt − eps_src)`, so the edit signal vanishes outside the mask. Motivated by LatentEditor / FoI / ZONE. |
-| **Outside-mask background anchor** | `outside_mask_anchor_weight` | Strengthens the preservation term by `w_out · (1 − M)`, tightening `x0` outside the mask. |
+| **Outside-mask background anchor** | `outside_mask_anchor_weight` | Strengthens the preservation term by `w_out · (1 − M)`, tightening `x0` outside the mask. Conceptually aligned with RoMaP. |
 | **Cross-attention semantic mask** | `cross_attention_mask_enabled` + `cross_attention_mask_{keywords,layers,weight,gamma,blur}` | Aggregates target-token cross-attention from selected UNet up-blocks, fuses with the self-mask as `M_hybrid = M_self · ((1 − w) + w · M_attn)`. Based on Prompt-to-Prompt, What the DAAM, DiffEdit, LEDITS++. |
+| **ψ schedule** | `psi_late_multiplier` | Temporal schedule on the preservation weight: `preserve_weight = ψ · (1 + (psi_late_multiplier − 1) · (1 − t_norm))`. Edit commits early, preservation tightens late. `=1.0` disables. Based on DaCapo (Huang et al., CVPR 2025). |
+| **Latent-mean anchor (N2)** | `latent_mean_anchor_weight` | Adds `λ · (mean(tgt_x0) − mean(src_x0))` per channel onto the final gradient — penalizes VAE-latent channel-mean drift, counteracts TAG brightness/saturation artifacts without a text negative prompt. `=0.0` disables. Conceptually aligned with Piva and Stable Score Distillation. |
 
 ### TAG branch (edit strength)
 
@@ -146,6 +148,8 @@ DC_CUSTOM_PARAMS = dict(
     cross_attention_mask_enabled=False,
     cross_attention_mask_weight=1.0,
     cross_attention_mask_layers=[1, 2],
+    psi_late_multiplier=1.0,         # DaCapo-inspired ψ schedule (1.0 = off)
+    latent_mean_anchor_weight=0.0,   # N2: latent-mean anchor (0.0 = off)
 
     # TAG
     eta_tag=1.0,
@@ -259,5 +263,47 @@ Comparisons across runs must use the **same `downscale`** for reconstruction, ed
   booktitle = {CVPR},
   year      = {2024},
   url       = {https://arxiv.org/abs/2311.16711},
+}
+
+@inproceedings{huang2025dacapo,
+  title     = {{DaCapo}: Score Distillation as Stacked Bridge for Fast and High-quality 3D Editing},
+  author    = {Huang and collaborators},
+  booktitle = {CVPR},
+  year      = {2025},
+}
+
+@article{piva2024,
+  title     = {Preserving Identity with Variational Score for General-purpose 3D Editing},
+  year      = {2024},
+  url       = {https://arxiv.org/abs/2406.08953},
+}
+
+@article{ssd2025,
+  title     = {Stable Score Distillation},
+  year      = {2025},
+  url       = {https://arxiv.org/abs/2507.09168},
+}
+
+@article{kim2025romap,
+  title     = {{RoMaP}: Robust 3D-Masked Part-level Editing in 3D Gaussian Splatting with Regularized Score Distillation Sampling},
+  author    = {Hayeon Kim and Ji Ha Jang and Se Young Chun},
+  year      = {2025},
+  url       = {https://arxiv.org/abs/2507.11061},
+}
+
+@inproceedings{miao2025uds,
+  title     = {Rethinking Score Distilling Sampling for 3D Editing and Generation},
+  author    = {Miao and collaborators},
+  booktitle = {ICML},
+  year      = {2025},
+  url       = {https://arxiv.org/abs/2505.01888},
+}
+
+@inproceedings{koo2024pds,
+  title     = {Posterior Distillation Sampling},
+  author    = {Juil Koo and Chanho Park and Minhyuk Sung},
+  booktitle = {CVPR},
+  year      = {2024},
+  url       = {https://arxiv.org/abs/2311.13831},
 }
 ```
