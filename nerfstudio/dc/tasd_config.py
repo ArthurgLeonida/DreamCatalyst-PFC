@@ -33,6 +33,11 @@ DC_CUSTOM_PARAMS = dict(
     cross_attention_mask_weight=1.0,
     cross_attention_mask_blur=0.0,
     cross_attention_mask_gamma=1.0,
+    # M1: ignore M_self and use M_attn alone (use when ||eps_tgt - eps_src|| anti-localizes the edit,
+    # e.g. IP2P on face scenes where image conditioning collapses the delta on the target).
+    cross_attention_mask_only=False,
+    # M2: treat (1 - M_self) as the "model-agreement" mask and intersect with M_attn.
+    invert_self_mask=False,
 
     # ---------------------------------------------------------------------
     # 2. TAG branch

@@ -97,6 +97,14 @@ class DCConfig:
     cross_attention_mask_blur: float = 0.0
     cross_attention_mask_gamma: float = 1.0
 
+    # M1 — CA-only localization: ignore M_self, use cross-attention as the sole mask.
+    # Useful on scenes (e.g. IP2P faces) where ||eps_tgt - eps_src|| anti-localizes the edit.
+    cross_attention_mask_only: bool = False
+    # M2 — inverted self-mask: use (1 - M_self) as the self-mask component before fusion.
+    # Rationale: on IP2P, high ||eps_tgt - eps_src|| marks model-disagreement regions
+    # (often NOT the edit target); inverting reframes M_self as a "model-agreement" mask.
+    invert_self_mask: bool = False
+
 
 class DC(object):
     def __init__(self, config: DCConfig, use_wandb=False):
@@ -504,15 +512,22 @@ class DC(object):
         
         grad_mask = None
         self_grad_mask = None
-        if (
+
+        # M1 short-circuit: when cross_attention_mask_only is set, skip the self-mask build.
+        needs_self_mask = (
             self.config.gradient_mask_enabled
             or self.config.source_blend_localization_enabled
             or self.config.outside_mask_anchor_weight > 0
             or self.config.cross_attention_mask_enabled
-        ):
+        ) and not self.config.cross_attention_mask_only
+
+        if needs_self_mask:
             self_grad_mask = self._build_gradient_relevance_mask(
                 eps_raw["tgt"], eps_raw["src"], current_spot
             )
+            if self.config.invert_self_mask:
+                # M2: flip so high values mark model-agreement (often the real edit region on IP2P).
+                self_grad_mask = (1.0 - self_grad_mask).clamp(0.0, 1.0)
             grad_mask = self_grad_mask
 
         if cross_attention_mask is not None:
@@ -524,8 +539,14 @@ class DC(object):
                     mode="bilinear",
                     align_corners=False,
                 )
-            if grad_mask is None:
+            if self.config.cross_attention_mask_only:
+                # M1: cross-attention is the sole localization signal.
                 grad_mask = cross_attention_mask
+            elif grad_mask is None:
+                grad_mask = cross_attention_mask
+            elif self.config.invert_self_mask:
+                # M2: intersection of (1 - M_self) and M_attn — both factors ≤ 1, order invariant.
+                grad_mask = grad_mask * cross_attention_mask
             else:
                 weight = float(self.config.cross_attention_mask_weight)
                 weight = min(max(weight, 0.0), 1.0)
