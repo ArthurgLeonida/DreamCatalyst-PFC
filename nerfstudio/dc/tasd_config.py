@@ -16,6 +16,11 @@ DC_CUSTOM_PARAMS = dict(
     source_blend_localization_enabled=True,
     gradient_mask_enabled=False,
     outside_mask_anchor_weight=0.05, # Default = 0.05
+    # Coverage-adaptive outside-mask anchor: scales outside_mask_anchor_weight by
+    # (1 − per-sample mean(grad_mask)). Face (small coverage) keeps the bg anchor tight;
+    # stormtrooper (large coverage) automatically loosens it. Enables one anchor value
+    # to work across identity-preserving and creative-transform scenes.
+    outside_mask_anchor_coverage_adaptive=False,
 
     # These parameters matter whenever source_blend_localization_enabled,
     # gradient_mask_enabled, or outside_mask_anchor_weight is active.
@@ -72,6 +77,15 @@ DC_CUSTOM_PARAMS = dict(
     stg_schedule_enabled=False,
     stg_decay_start_ratio=0.0,
     stg_decay_end_ratio=0.35,
+    # "decay" (original: STG early, off late) or "growth" (STG off early, on late).
+    # Use "growth" on creative-transform scenes (stormtrooper) so TAG commits the edit
+    # first and STG only refines structure once new geometry has emerged.
+    stg_schedule_mode="decay",
+    # Coverage-adaptive STG: multiply stg_scale by (1 − previous iteration mask coverage).
+    # Small edit regions (face) keep STG near base; large edit regions (stormtrooper)
+    # fade STG toward 0. Pairs with outside_mask_anchor_coverage_adaptive for a single
+    # config that self-adjusts to both identity-preserving and creative-transform scenes.
+    stg_coverage_adaptive=False,
 
     # ---------------------------------------------------------------------
     # 4. Perp-Neg branch

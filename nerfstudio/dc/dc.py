@@ -77,6 +77,17 @@ class DCConfig:
     stg_schedule_enabled: bool = False
     stg_decay_start_ratio: float = 0.0
     stg_decay_end_ratio: float = 1.0
+    # Schedule direction:
+    #   "decay"  → STG active early, fades to 0 by stg_decay_end_ratio (original behavior)
+    #   "growth" → STG at 0 early, ramps to stg_scale between stg_decay_start_ratio and
+    #              stg_decay_end_ratio (edit commits first, STG refines structure late)
+    stg_schedule_mode: str = "decay"
+    # Coverage-adaptive STG: multiply stg_scale by (1 − mean(grad_mask)) from the previous
+    # iteration. Scenes with small edit regions (identity-preserving like face) keep STG
+    # strong; scenes with large edit regions (creative transforms like stormtrooper) fade
+    # STG toward 0 automatically, since the mask reports the edit is broad and STG would
+    # otherwise pull eps_tgt back toward the source-image structure prior.
+    stg_coverage_adaptive: bool = False
 
     # Self-derived relevance masking — localize the DDS gradient using the
     # model's own tgt/src prediction discrepancy.
@@ -87,6 +98,12 @@ class DCConfig:
     gradient_mask_warmup: int = 50
     source_blend_localization_enabled: bool = False
     outside_mask_anchor_weight: float = 0.0
+    # Coverage-adaptive outside-mask anchor: scale outside_mask_anchor_weight by
+    # (1 − mean(grad_mask)). Small edit regions (face) keep the bg anchor tight;
+    # large edit regions (stormtrooper) loosen bg anchor automatically. Lets a single
+    # outside_mask_anchor_weight value work across identity-preserving and
+    # creative-transform scenes.
+    outside_mask_anchor_coverage_adaptive: bool = False
 
     # Cross-attention-based relevance masking — use cross-attention maps
     cross_attention_mask_enabled: bool = False
@@ -156,6 +173,9 @@ class DC(object):
         self.iteration = 0
         self.max_iteration = config.max_iteration
         self.gradient_mask_ema: Dict[int, torch.Tensor] = {}
+        # Running scalar used by coverage-adaptive STG. Updated at end of each iteration
+        # when a mask is built. 0.0 initial value means "no attenuation" for iteration 0.
+        self.previous_mask_coverage: float = 0.0
 
         b1 = self.config.freeu_b1
         b2 = self.config.freeu_b2
@@ -269,28 +289,57 @@ class DC(object):
     def _get_current_stg_scale(self) -> float:
         """Return the STG scale for the current edit iteration.
 
-        By default STG stays constant for the whole run. When the schedule is
-        enabled, it linearly decays from stg_scale to 0 between
-        stg_decay_start_ratio and stg_decay_end_ratio of the total edit budget.
+        By default STG stays constant (no schedule). With the schedule enabled:
+          - mode="decay" (default): STG at stg_scale for progress < decay_start,
+            linearly decays to 0 between decay_start and decay_end, 0 after.
+          - mode="growth": STG at 0 for progress < decay_start, linearly grows to
+            stg_scale between decay_start and decay_end, stg_scale after. Use on
+            creative-transform scenes so the edit commits first (TAG drives early)
+            and STG only refines structure once the new geometry has emerged.
+
+        With stg_coverage_adaptive=True, the returned scale is further multiplied
+        by (1 − previous iteration mask coverage). On scenes where the mask covers
+        a large fraction of the image (creative transform), STG automatically fades
+        toward 0; on small-coverage scenes (identity-preserving face) it stays near
+        base scale.
         """
-        base_scale = self.config.stg_scale
+        base_scale = float(self.config.stg_scale)
         if not self.config.stg_schedule_enabled:
-            return base_scale
+            scale = base_scale
+        else:
+            max_iteration = max(int(self.max_iteration), 1)
+            progress = min(max(self.iteration / max_iteration, 0.0), 1.0)
+            ratio_start = float(self.config.stg_decay_start_ratio)
+            ratio_end = float(self.config.stg_decay_end_ratio)
+            mode = str(getattr(self.config, "stg_schedule_mode", "decay")).lower()
 
-        max_iteration = max(int(self.max_iteration), 1)
-        progress = min(max(self.iteration / max_iteration, 0.0), 1.0)
-        decay_start = float(self.config.stg_decay_start_ratio)
-        decay_end = float(self.config.stg_decay_end_ratio)
+            if mode == "growth":
+                if progress <= ratio_start:
+                    scale = 0.0
+                elif progress >= ratio_end or ratio_end <= ratio_start:
+                    scale = base_scale
+                else:
+                    scale = base_scale * (progress - ratio_start) / (ratio_end - ratio_start)
+            else:
+                # decay mode (default)
+                if ratio_end <= ratio_start:
+                    scale = base_scale if progress < ratio_end else 0.0
+                elif progress <= ratio_start:
+                    scale = base_scale
+                elif progress >= ratio_end:
+                    scale = 0.0
+                else:
+                    decay_progress = (progress - ratio_start) / (ratio_end - ratio_start)
+                    scale = base_scale * (1.0 - decay_progress)
 
-        if decay_end <= decay_start:
-            return base_scale if progress < decay_end else 0.0
-        if progress <= decay_start:
-            return base_scale
-        if progress >= decay_end:
-            return 0.0
+        if getattr(self.config, "stg_coverage_adaptive", False):
+            # Use previous iteration's coverage since the current mask isn't built yet.
+            # Defaults to 0.0 (no attenuation) until the first mask exists.
+            coverage = float(getattr(self, "previous_mask_coverage", 0.0))
+            coverage = min(max(coverage, 0.0), 1.0)
+            scale = scale * (1.0 - coverage)
 
-        decay_progress = (progress - decay_start) / (decay_end - decay_start)
-        return base_scale * (1.0 - decay_progress)
+        return scale
 
     def dc_timestep_sampling(self, batch_size):
         self.scheduler.set_timesteps(self.config.num_inference_steps)
@@ -574,7 +623,14 @@ class DC(object):
         psi_schedule_factor = 1.0 + (self.config.psi_late_multiplier - 1.0) * (1.0 - t_normalized)
         preserve_weight = self.config.psi * psi_schedule_factor
         if grad_mask is not None and self.config.outside_mask_anchor_weight > 0:
-            preserve_weight = preserve_weight + self.config.outside_mask_anchor_weight * (1.0 - grad_mask)
+            # Coverage-adaptive anchor: scale w_out by (1 − mean(grad_mask)) per sample
+            # so identity-preserving scenes (small coverage) keep strong bg anchor and
+            # creative-transform scenes (large coverage) loosen it automatically.
+            w_out_effective = self.config.outside_mask_anchor_weight
+            if getattr(self.config, "outside_mask_anchor_coverage_adaptive", False):
+                coverage_per_sample = grad_mask.mean(dim=(2, 3), keepdim=True).clamp(0.0, 1.0)
+                w_out_effective = w_out_effective * (1.0 - coverage_per_sample)
+            preserve_weight = preserve_weight + w_out_effective * (1.0 - grad_mask)
 
         w_DDS = self.config.delta + self.config.gamma * (t_normalized ** (1/math.e))
         grad = (
@@ -591,6 +647,11 @@ class DC(object):
             tgt_mean = tgt_x0.mean(dim=(2, 3), keepdim=True)
             src_mean = src_x0.mean(dim=(2, 3), keepdim=True)
             grad = grad + self.config.latent_mean_anchor_weight * (tgt_mean - src_mean).expand_as(grad)
+
+        # Cache batch-mean mask coverage for the next iteration's coverage-adaptive STG.
+        # Skipped silently when no mask exists (e.g. W_trueDC runs).
+        if grad_mask is not None:
+            self.previous_mask_coverage = float(grad_mask.mean().item())
 
         grad = torch.nan_to_num(grad)
         

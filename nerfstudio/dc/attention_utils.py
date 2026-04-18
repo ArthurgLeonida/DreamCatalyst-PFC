@@ -89,14 +89,19 @@ class CrossAttentionMapRecorder:
         best_shape = None
         best_error = None
 
-        for height in range(1, int(math.sqrt(query_tokens)) + 1):
-            if query_tokens % height != 0:
+        # Iterate over all divisor pairs in BOTH orientations so that portrait
+        # latents (ref_h > ref_w) are matchable. The previous version only tried
+        # height <= sqrt(N), which silently forced landscape reshapes and
+        # produced transposed attention maps on portrait scenes.
+        for divisor in range(1, int(math.sqrt(query_tokens)) + 1):
+            if query_tokens % divisor != 0:
                 continue
-            width = query_tokens // height
-            ratio_error = abs(math.log((width / height) / target_ratio))
-            if best_error is None or ratio_error < best_error:
-                best_error = ratio_error
-                best_shape = (height, width)
+            other = query_tokens // divisor
+            for (h, w) in ((divisor, other), (other, divisor)):
+                ratio_error = abs(math.log((w / h) / target_ratio))
+                if best_error is None or ratio_error < best_error:
+                    best_error = ratio_error
+                    best_shape = (h, w)
 
         return best_shape
 
