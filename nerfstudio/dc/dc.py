@@ -59,15 +59,10 @@ class DCConfig:
     tag_negative_prompt: str = ""
     tag_negative_strength: float = 0.0
 
-    # Perpendicular Gradient Projection (Perp-Neg) — orthogonalize eps_tgt w.r.t. eps_src
+    # Perpendicular Gradient Projection (Perp-Neg) — orthogonalize eps_tgt w.r.t. eps_src.
+    # Kept as an optional global branch; earlier depth/cached-mask variants were retired in
+    # favor of self-mask + cross-attention-mask localization.
     perp_neg: bool = False
-    # Foreground-Masked Perp-Neg — restrict PN subtraction to foreground
-    depth_masked_perp_neg: bool = False
-    depth_mask_source: str = "depth"  # "depth" (renderer depth) or "cached" (precomputed masks)
-    depth_mask_threshold: float = 0.5  # for depth source only
-    cached_mask_dir: str = ""  # for cached source only
-    perp_neg_mask_dilate: int = 0  # dilate binary mask by N image-pixels (hard expansion)
-    perp_neg_mask_blur: float = 0.0  # Gaussian blur sigma in image-pixels (soft falloff; 0=off)
     perp_neg_alpha: float = 1.0  # PN subtraction strength (1.0 = full, 0.5 = half)
 
     # STG (Spatiotemporal Skip Guidance) — replace CFG with structure-preserving perturbation
@@ -77,11 +72,18 @@ class DCConfig:
     stg_schedule_enabled: bool = False
     stg_decay_start_ratio: float = 0.0
     stg_decay_end_ratio: float = 1.0
-    # Schedule direction:
-    #   "decay"  → STG active early, fades to 0 by stg_decay_end_ratio (original behavior)
+    # Schedule shape:
+    #   "decay"  → STG active early, fades to 0 by stg_decay_end_ratio (original behavior).
     #   "growth" → STG at 0 early, ramps to stg_scale between stg_decay_start_ratio and
-    #              stg_decay_end_ratio (edit commits first, STG refines structure late)
+    #              stg_decay_end_ratio (edit commits first, STG refines structure late).
+    #   "bump"   → triangle: STG=0 before stg_decay_start_ratio, grows to stg_scale at
+    #              (start + stg_bump_peak_ratio·(end−start)), decays back to 0 by
+    #              stg_decay_end_ratio, 0 after. Lets STG help mid-phase structural
+    #              commitment without freezing late view-dependent inconsistencies.
     stg_schedule_mode: str = "decay"
+    # Only used in "bump" mode. Fraction of the [start, end] window at which STG peaks.
+    # 0.5 = symmetric triangle; values >0.5 push peak later (faster rise, slower decay).
+    stg_bump_peak_ratio: float = 0.5
     # Coverage-adaptive STG: multiply stg_scale by (1 − mean(grad_mask)) from the previous
     # iteration. Scenes with small edit regions (identity-preserving like face) keep STG
     # strong; scenes with large edit regions (creative transforms like stormtrooper) fade
@@ -105,10 +107,10 @@ class DCConfig:
     # creative-transform scenes.
     outside_mask_anchor_coverage_adaptive: bool = False
 
-    # Cross-attention-based relevance masking — use cross-attention maps
+    # Cross-attention-based relevance masking — use cross-attention maps.
+    # Token selection is auto-derived from src/tgt prompts (target-only words, minus
+    # stopwords) to stay fully general across scenes; no manual keyword override.
     cross_attention_mask_enabled: bool = False
-    cross_attention_mask_keywords: str = ""
-    cross_attention_mask_prompt: str = ""
     cross_attention_mask_layers: List[int] = field(default_factory=lambda: [1, 2])
     cross_attention_mask_weight: float = 1.0
     cross_attention_mask_blur: float = 0.0
@@ -320,6 +322,20 @@ class DC(object):
                     scale = base_scale
                 else:
                     scale = base_scale * (progress - ratio_start) / (ratio_end - ratio_start)
+            elif mode == "bump":
+                if progress <= ratio_start or progress >= ratio_end or ratio_end <= ratio_start:
+                    scale = 0.0
+                else:
+                    peak_ratio = min(max(float(getattr(self.config, "stg_bump_peak_ratio", 0.5)), 0.0), 1.0)
+                    peak_time = ratio_start + peak_ratio * (ratio_end - ratio_start)
+                    if progress <= peak_time:
+                        # Rising edge: 0 → base_scale between ratio_start and peak_time.
+                        span = max(peak_time - ratio_start, 1e-8)
+                        scale = base_scale * (progress - ratio_start) / span
+                    else:
+                        # Falling edge: base_scale → 0 between peak_time and ratio_end.
+                        span = max(ratio_end - peak_time, 1e-8)
+                        scale = base_scale * (ratio_end - progress) / span
             else:
                 # decay mode (default)
                 if ratio_end <= ratio_start:
@@ -369,7 +385,6 @@ class DC(object):
         return_dict=False,
         step=0,
         current_spot=0,
-        depth_mask=None,
     ):
         device = self.device
         scheduler = self.scheduler
@@ -405,8 +420,6 @@ class DC(object):
             cross_attention_token_indices = get_cross_attention_token_indices(
                 self.tokenizer,
                 self.tgt_prompt,
-                explicit_keywords=self.config.cross_attention_mask_keywords,
-                cross_attention_prompt=self.config.cross_attention_mask_prompt,
                 src_prompt=self.src_prompt,
             )
          
@@ -552,20 +565,14 @@ class DC(object):
             pred_x0s[name] = pred_x0
             noisy_latents[name] = latents_noisy
 
-        # Perpendicular Gradient Projection (Perp-Neg): orthogonalize eps_tgt w.r.t. eps_src
+        # Perpendicular Gradient Projection (Perp-Neg): orthogonalize eps_tgt w.r.t. eps_src.
+        # Depth/cached-mask variants were retired in favor of self-mask + CA-mask localization.
         # ====================================================================================
         if self.config.perp_neg:
-            # Always compute projection globally (keeps creative editing signal)
             src_norm_sq = (eps["src"] * eps["src"]).sum(dim=(1, 2, 3), keepdim=True).clamp(min=1e-8)
             projection = (eps["tgt"] * eps["src"]).sum(dim=(1, 2, 3), keepdim=True) / src_norm_sq
             alpha = self.config.perp_neg_alpha
-            if self.config.depth_masked_perp_neg and depth_mask is not None:
-                # Masked application: subtract only in foreground, background keeps eps_tgt
-                mask = F.interpolate(depth_mask, size=tgt_x0.shape[2:], mode="nearest")
-                eps["tgt"] = eps["tgt"] - alpha * projection * eps["src"] * mask
-            else:
-                # Standard global Perp-Neg
-                eps["tgt"] = eps["tgt"] - alpha * projection * eps["src"]
+            eps["tgt"] = eps["tgt"] - alpha * projection * eps["src"]
         # ====================================================================================
 
         self.iteration += 1

@@ -104,7 +104,8 @@ All extensions live in `nerfstudio/dc/dc.py` and are configured centrally in `ne
 | **Self-derived relevance mask** | `gradient_mask_enabled` | Builds a soft mask `M` from the per-pixel norm of `eps_tgt − eps_src` (pre-TAG / pre-STG / pre-PN snapshot). Inspired by LatentEditor. |
 | **Source-blended localization** | `source_blend_localization_enabled` | Replaces the DDS target with `eps_src + M·(eps_tgt − eps_src)`, so the edit signal vanishes outside the mask. Motivated by LatentEditor / FoI / ZONE. |
 | **Outside-mask background anchor** | `outside_mask_anchor_weight` | Strengthens the preservation term by `w_out · (1 − M)`, tightening `x0` outside the mask. Conceptually aligned with RoMaP. |
-| **Cross-attention semantic mask** | `cross_attention_mask_enabled` + `cross_attention_mask_{keywords,layers,weight,gamma,blur}` | Aggregates target-token cross-attention from selected UNet up-blocks, fuses with the self-mask as `M_hybrid = M_self · ((1 − w) + w · M_attn)`. Based on Prompt-to-Prompt, What the DAAM, DiffEdit, LEDITS++. |
+| **Coverage-adaptive anchor** | `outside_mask_anchor_coverage_adaptive` | Scales `w_out` by `(1 − mean(M))`. Identity-preserving scenes (small coverage, e.g. face) keep the bg anchor tight; creative-transform scenes (large coverage, e.g. stormtrooper) loosen automatically. Lets one anchor value work across scene types. |
+| **Cross-attention semantic mask** | `cross_attention_mask_enabled` + `cross_attention_mask_{layers,weight,gamma,blur}` | Aggregates target-token cross-attention from selected UNet up-blocks, fuses with the self-mask as `M_hybrid = M_self · ((1 − w) + w · M_attn)`. Target-token selection is auto-derived from src/tgt prompts (no manual keyword overrides). Based on Prompt-to-Prompt, What the DAAM, DiffEdit, LEDITS++. |
 | **ψ schedule** | `psi_late_multiplier` | Temporal schedule on the preservation weight: `preserve_weight = ψ · (1 + (psi_late_multiplier − 1) · (1 − t_norm))`. Edit commits early, preservation tightens late. `=1.0` disables. Based on DaCapo (Huang et al., CVPR 2025). |
 | **Latent-mean anchor (N2)** | `latent_mean_anchor_weight` | Adds `λ · (mean(tgt_x0) − mean(src_x0))` per channel onto the final gradient — penalizes VAE-latent channel-mean drift, counteracts TAG brightness/saturation artifacts without a text negative prompt. `=0.0` disables. Conceptually aligned with Piva and Stable Score Distillation. |
 
@@ -122,14 +123,14 @@ All extensions live in `nerfstudio/dc/dc.py` and are configured centrally in `ne
 | Novelty | Config | Description |
 |---|---|---|
 | **STG** | `stg_enabled`, `stg_scale`, `stg_skip_layers` | Runs a weak UNet pass via `STGIdentityValueAttnProcessor` on selected up-blocks and amplifies `eps = eps_full + s · (eps_full − eps_weak)`. Based on STG (Hyung et al., CVPR 2025). Target-branch only. |
-| **STG schedule** | `stg_schedule_enabled`, `stg_decay_{start,end}_ratio` | Linearly decays `stg_scale` to 0 between two fractions of the training budget, so structural amplification is used mainly in the creative stage. |
+| **STG schedule** | `stg_schedule_enabled`, `stg_schedule_mode`, `stg_decay_{start,end}_ratio`, `stg_bump_peak_ratio` | Three shapes: `"decay"` (STG early, off late — best on identity-preserving edits), `"growth"` (STG off early, on late — lets TAG commit the edit first), `"bump"` (triangle: STG peaks mid-phase and returns to 0 before the end — prevents late STG from locking in view-dependent partial-state inconsistencies on creative edits). |
+| **Coverage-adaptive STG** | `stg_coverage_adaptive` | Multiplies the scheduled STG scale by `(1 − prev_coverage)`. Self-mask coverage is a proxy for scene type: small coverage (face) keeps STG near its scheduled value; large coverage (stormtrooper) fades STG toward 0 automatically, preventing it from pulling `eps_tgt` back toward the current source-image structure during creative restructuring. |
 
 ### Perp-Neg branch (creative direction separation)
 
 | Novelty | Config | Description |
 |---|---|---|
-| **Perpendicular Gradient Projection** | `perp_neg` | Orthogonalizes `eps_tgt` with respect to `eps_src` via Gram-Schmidt. Based on PCGrad (Yu et al., NeurIPS 2020) and Perp-Neg (Armandpour et al., ICML 2023). |
-| **Foreground-masked Perp-Neg** | `depth_masked_perp_neg` + `depth_mask_source`, `cached_mask_dir`, `perp_neg_mask_{dilate,blur}`, `perp_neg_alpha` | Restricts the projection to a foreground region. Mask sources: `"cached"` (precomputed via Grounded-SAM / rembg) or `"depth"` (renderer depth, percentile-normalized). |
+| **Perpendicular Gradient Projection** | `perp_neg`, `perp_neg_alpha` | Orthogonalizes `eps_tgt` with respect to `eps_src` via Gram-Schmidt. Kept as an optional global branch; earlier depth/cached-mask foreground variants were retired in favor of self-mask + CA-mask localization, which subsume their role. Based on PCGrad (Yu et al., NeurIPS 2020) and Perp-Neg (Armandpour et al., ICML 2023). |
 
 ### Central config
 
@@ -141,13 +142,15 @@ DC_CUSTOM_PARAMS = dict(
     source_blend_localization_enabled=True,
     gradient_mask_enabled=False,
     outside_mask_anchor_weight=0.05,
-    gradient_mask_blur=2.0,
+    outside_mask_anchor_coverage_adaptive=False,
+    gradient_mask_blur=1.0,
     gradient_mask_gamma=1.2,
-    gradient_mask_ema_beta=0,
+    gradient_mask_ema_beta=0.0,
     gradient_mask_warmup=0,
     cross_attention_mask_enabled=False,
-    cross_attention_mask_weight=1.0,
     cross_attention_mask_layers=[1, 2],
+    cross_attention_mask_weight=1.0,
+    cross_attention_mask_gamma=1.0,
     psi_late_multiplier=1.0,         # DaCapo-inspired ψ schedule (1.0 = off)
     latent_mean_anchor_weight=0.0,   # N2: latent-mean anchor (0.0 = off)
 
@@ -163,12 +166,14 @@ DC_CUSTOM_PARAMS = dict(
     stg_scale=0.5,
     stg_skip_layers=[2],
     stg_schedule_enabled=False,
-    stg_decay_end_ratio=0.35,
+    stg_decay_start_ratio=0.0,
+    stg_decay_end_ratio=1.0,
+    stg_schedule_mode="decay",       # "decay" | "growth" | "bump"
+    stg_bump_peak_ratio=0.5,         # only used in "bump" mode
+    stg_coverage_adaptive=False,
 
-    # Perp-Neg
+    # Perp-Neg (optional; earlier depth/cached-mask variants retired)
     perp_neg=False,
-    depth_masked_perp_neg=True,
-    depth_mask_source="cached",
     perp_neg_alpha=1.0,
 )
 ```

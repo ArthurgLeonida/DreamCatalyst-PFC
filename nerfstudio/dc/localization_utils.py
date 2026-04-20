@@ -33,10 +33,11 @@ def apply_mask_postprocessing(mask: torch.Tensor, gamma: float, sigma: float) ->
     return mask.clamp(0.0, 1.0)
 
 
-def derive_cross_attention_keywords(explicit_keywords: str, src_prompt: Optional[str], tgt_prompt: str) -> List[str]:
-    if explicit_keywords.strip():
-        return [keyword.strip() for keyword in explicit_keywords.split(",") if keyword.strip()]
+def derive_cross_attention_keywords(src_prompt: Optional[str], tgt_prompt: str) -> List[str]:
+    """Auto-derive CA keywords: target-only words minus stopwords and source words.
 
+    Kept prompt-based to remain fully general — no manual per-scene keyword overrides.
+    """
     source_words = set(re.findall(r"[a-zA-Z0-9]+", (src_prompt or "").lower()))
     target_words = re.findall(r"[a-zA-Z0-9]+", tgt_prompt.lower())
     keywords = []
@@ -83,20 +84,17 @@ def find_token_positions(full_token_ids: List[int], phrase_token_ids: List[int])
 def get_cross_attention_token_indices(
     tokenizer,
     tgt_prompt: str,
-    explicit_keywords: str = "",
-    cross_attention_prompt: str = "",
     src_prompt: Optional[str] = None,
 ) -> List[int]:
-    prompt_for_mask = cross_attention_prompt.strip() or tgt_prompt
     full_token_ids = tokenizer(
-        prompt_for_mask,
+        tgt_prompt,
         padding="max_length",
         max_length=tokenizer.model_max_length,
         truncation=True,
         return_tensors="pt",
     ).input_ids[0].tolist()
 
-    keywords = derive_cross_attention_keywords(explicit_keywords, src_prompt, prompt_for_mask)
+    keywords = derive_cross_attention_keywords(src_prompt, tgt_prompt)
     token_indices = []
     for keyword in keywords:
         token_indices.extend(find_token_positions(full_token_ids, get_phrase_token_ids(tokenizer, keyword)))

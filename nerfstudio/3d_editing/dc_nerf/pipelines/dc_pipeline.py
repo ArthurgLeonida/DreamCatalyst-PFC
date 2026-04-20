@@ -65,49 +65,26 @@ class DCPipeline(ModifiedVanillaPipeline):
         self.src_x0s = dict()
         self.current_spot = None
 
-        # Load cached foreground masks for masked Perp-Neg, keyed by image stem name
-        self.cached_masks = {}
-        if self.config.dc.depth_masked_perp_neg and self.config.dc.depth_mask_source == "cached":
-            from pathlib import Path as P
-            mask_dir = P(self.config.dc.cached_mask_dir)
-            if mask_dir.exists():
-                for img_path in self.datamanager.train_dataparser_outputs.image_filenames:
-                    stem = img_path.stem
-                    mask_path = mask_dir / f"{stem}.png"
-                    if mask_path.exists():
-                        mask = np.array(Image.open(mask_path).convert("L")).astype(np.float32) / 255.0
-                        self.cached_masks[stem] = torch.tensor(mask).unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
-                print(f"[Masked PN] Loaded {len(self.cached_masks)} cached masks from {mask_dir}")
-            else:
-                print(f"[Masked PN] WARNING: cached_mask_dir '{mask_dir}' not found, falling back to depth")
-                self.config.dc.depth_mask_source = "depth"
-        
     def get_current_rendering(self, step):
         if getattr(self, "current_spot", None) is None or step % self.config.change_view_step == 0:
             self.current_spot = np.random.randint(len(self.datamanager.train_dataparser_outputs.image_filenames))
         current_spot = self.current_spot
         current_index = self.datamanager.image_batch["image_idx"][current_spot]
         current_camera = self.datamanager.train_dataparser_outputs.cameras[current_index:current_index+1].to(self.device)
-        # Get the image stem for correct cached mask lookup
-        current_stem = self.datamanager.train_dataparser_outputs.image_filenames[current_index].stem
         camera_outputs = self.model.diff_get_outputs_for_camera(current_camera)
         rendered_image = camera_outputs["rgb"].unsqueeze(dim=0).permute(0, 3, 1, 2)  # [B,3,H,W]
-        # Extract depth for depth-masked Perp-Neg (free — already computed by renderer)
-        depth_map = camera_outputs.get("depth", None)
-        if depth_map is not None:
-            depth_map = depth_map.detach().unsqueeze(dim=0).permute(0, 3, 1, 2)  # [1,1,H,W]
 
         # delete to free up memory
         del camera_outputs
         del current_camera
         clean_gpu()
 
-        return rendered_image, current_spot, current_stem, depth_map
+        return rendered_image, current_spot
 
     def get_train_loss_dict(self, step: int):
         loss_dict = dict()
 
-        rendered_image, current_spot, current_stem, depth_map = self.get_current_rendering(step)
+        rendered_image, current_spot = self.get_current_rendering(step)
         # get original image from dataloader
         original_image = self.datamanager.original_image_batch["image"][current_spot].to(self.device)
         original_image = original_image.unsqueeze(dim=0).permute(0, 3, 1, 2)
@@ -133,38 +110,7 @@ class DCPipeline(ModifiedVanillaPipeline):
         del original_image_512
         clean_gpu()
 
-        # Build foreground mask for masked Perp-Neg
-        depth_mask = None
-        if self.config.dc.depth_masked_perp_neg and self.config.dc.perp_neg:
-            source = self.config.dc.depth_mask_source
-            use_cached = source == "cached" and current_stem in self.cached_masks
-            if use_cached:
-                # Precomputed mask (e.g. from Grounded-SAM), resize to 512-space
-                depth_mask = F.interpolate(self.cached_masks[current_stem], size=(h, w), mode="nearest")
-                depth_mask = depth_mask.to(self.dc_device)
-            elif depth_map is not None:
-                # Renderer depth, percentile-normalized
-                d_flat = depth_map.reshape(-1)
-                d_lo = torch.quantile(d_flat, 0.05)
-                d_hi = torch.quantile(d_flat, 0.95)
-                depth_clipped = depth_map.clamp(d_lo, d_hi)
-                depth_norm = (depth_clipped - d_lo) / (d_hi - d_lo + 1e-8)
-                mask_pixel = (depth_norm < self.config.dc.depth_mask_threshold).float()
-                depth_mask = F.interpolate(mask_pixel, size=(h, w), mode="nearest")
-                depth_mask = depth_mask.to(self.dc_device)
-            # Post-process mask in image-space (512-space)
-            if depth_mask is not None:
-                # Optional hard dilation (expand binary region)
-                d = self.config.dc.perp_neg_mask_dilate
-                if d > 0:
-                    depth_mask = F.max_pool2d(depth_mask, kernel_size=2*d+1, stride=1, padding=d)
-                # Optional Gaussian blur (soft falloff: 1.0 at core → 0.0 far away)
-                sigma = self.config.dc.perp_neg_mask_blur
-                if sigma > 0:
-                    k = int(6 * sigma) | 1  # kernel covers ±3σ, forced odd
-                    depth_mask = TF.gaussian_blur(depth_mask, kernel_size=k, sigma=sigma)
-
-        dic = self.dc(tgt_x0=x0, src_x0=src_x0, src_emb=src_emb, return_dict=True, step=step, current_spot=current_spot, depth_mask=depth_mask)
+        dic = self.dc(tgt_x0=x0, src_x0=src_x0, src_emb=src_emb, return_dict=True, step=step, current_spot=current_spot)
         grad = dic["grad"].cpu()
         grad_mask = dic.get("grad_mask", None)
         self_grad_mask = dic.get("self_grad_mask", None)
@@ -191,12 +137,6 @@ class DCPipeline(ModifiedVanillaPipeline):
             wandb.log({
                 "dc_loss": loss.item(),
             }, step=step, commit=False)
-
-        # Save depth mask visualization for debugging
-        if depth_mask is not None and step % self.config.log_step == 0:
-            mask_vis = F.interpolate(depth_mask.cpu(), size=(h, w), mode="nearest")
-            mask_img = Image.fromarray((mask_vis[0, 0].numpy() * 255).astype(np.uint8))
-            mask_img.save(self.base_dir / f"logging/{step}_depth_mask.png")
 
         # Save self-derived relevance mask visualization for debugging
         if grad_mask is not None and step % self.config.log_step == 0:
