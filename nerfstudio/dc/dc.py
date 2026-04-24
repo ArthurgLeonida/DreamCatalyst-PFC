@@ -12,6 +12,17 @@ from dc.attention_utils import (
     run_unet_with_skipped_attn,
 )
 from dc.dc_unet import CustomUNet2DConditionModel
+from dc.guidance_utils import (
+    apply_latent_mean_anchor,
+    apply_perp_neg,
+    apply_source_blend,
+    apply_stg,
+    apply_tag,
+    compute_mask_coverage,
+    compute_preserve_weight,
+    compute_stg_scale,
+    compute_tag_eta,
+)
 from dc.localization_utils import (
     apply_mask_postprocessing,
     build_cross_attention_relevance_mask,
@@ -49,90 +60,45 @@ class DCConfig:
     freeu_s1: float=0.9
     freeu_s2: float=0.2
 
-    # Maximum iterations (must match --max-num-iterations for correct timestep schedule)
     max_iteration: int = 3000
 
-    # TAG (Tangential Amplified Guidance) — eta_tag=1.0 disables TAG
     eta_tag: float = 1.0
     adaptive_tag: bool = False
     asymmetric_tag: bool = False
-    tag_negative_prompt: str = ""
-    tag_negative_strength: float = 0.0
 
-    # Perpendicular Gradient Projection (Perp-Neg) — orthogonalize eps_tgt w.r.t. eps_src.
-    # Kept as an optional global branch; earlier depth/cached-mask variants were retired in
-    # favor of self-mask + cross-attention-mask localization.
     perp_neg: bool = False
-    perp_neg_alpha: float = 1.0  # PN subtraction strength (1.0 = full, 0.5 = half)
+    perp_neg_alpha: float = 1.0
 
-    # STG (Spatiotemporal Skip Guidance) — replace CFG with structure-preserving perturbation
     stg_enabled: bool = False
     stg_scale: float = 0.5
     stg_skip_layers: List[int] = field(default_factory=lambda: [2])
     stg_schedule_enabled: bool = False
-    stg_decay_start_ratio: float = 0.0
-    stg_decay_end_ratio: float = 1.0
-    # Schedule shape:
-    #   "decay"  → STG active early, fades to 0 by stg_decay_end_ratio (original behavior).
-    #   "growth" → STG at 0 early, ramps to stg_scale between stg_decay_start_ratio and
-    #              stg_decay_end_ratio (edit commits first, STG refines structure late).
-    #   "bump"   → triangle: STG=0 before stg_decay_start_ratio, grows to stg_scale at
-    #              (start + stg_bump_peak_ratio·(end−start)), decays back to 0 by
-    #              stg_decay_end_ratio, 0 after. Lets STG help mid-phase structural
-    #              commitment without freezing late view-dependent inconsistencies.
+    stg_schedule_start_ratio: float = 0.0
+    stg_schedule_end_ratio: float = 1.0
     stg_schedule_mode: str = "decay"
-    # Only used in "bump" mode. Fraction of the [start, end] window at which STG peaks.
-    # 0.5 = symmetric triangle; values >0.5 push peak later (faster rise, slower decay).
     stg_bump_peak_ratio: float = 0.5
-    # Coverage-adaptive STG: multiply stg_scale by (1 − mean(grad_mask)) from the previous
-    # iteration. Scenes with small edit regions (identity-preserving like face) keep STG
-    # strong; scenes with large edit regions (creative transforms like stormtrooper) fade
-    # STG toward 0 automatically, since the mask reports the edit is broad and STG would
-    # otherwise pull eps_tgt back toward the source-image structure prior.
     stg_coverage_adaptive: bool = False
 
-    # Self-derived relevance masking — localize the DDS gradient using the
-    # model's own tgt/src prediction discrepancy.
+    # Self-derived relevance masking
     gradient_mask_enabled: bool = False
     gradient_mask_blur: float = 3.0
     gradient_mask_ema_beta: float = 0.9
     gradient_mask_gamma: float = 1.0
     gradient_mask_warmup: int = 50
     source_blend_localization_enabled: bool = False
+
     outside_mask_anchor_weight: float = 0.0
-    # Coverage-adaptive outside-mask anchor: scale outside_mask_anchor_weight by
-    # (1 − mean(grad_mask)). Small edit regions (face) keep the bg anchor tight;
-    # large edit regions (stormtrooper) loosen bg anchor automatically. Lets a single
-    # outside_mask_anchor_weight value work across identity-preserving and
-    # creative-transform scenes.
     outside_mask_anchor_coverage_adaptive: bool = False
 
-    # Cross-attention-based relevance masking — use cross-attention maps.
-    # Token selection is auto-derived from src/tgt prompts (target-only words, minus
-    # stopwords) to stay fully general across scenes; no manual keyword override.
     cross_attention_mask_enabled: bool = False
     cross_attention_mask_layers: List[int] = field(default_factory=lambda: [1, 2])
     cross_attention_mask_weight: float = 1.0
     cross_attention_mask_blur: float = 0.0
     cross_attention_mask_gamma: float = 1.0
 
-    # M1 — CA-only localization: ignore M_self, use cross-attention as the sole mask.
-    # Useful on scenes (e.g. IP2P faces) where ||eps_tgt - eps_src|| anti-localizes the edit.
-    cross_attention_mask_only: bool = False
-    # M2 — inverted self-mask: use (1 - M_self) as the self-mask component before fusion.
-    # Rationale: on IP2P, high ||eps_tgt - eps_src|| marks model-disagreement regions
-    # (often NOT the edit target); inverting reframes M_self as a "model-agreement" mask.
-    invert_self_mask: bool = False
-
     # DaCapo-inspired ψ schedule (Huang et al., CVPR 2025).
-    # preserve_weight = psi * (1 + (psi_late_multiplier - 1) * (1 - t_normalized))
-    # psi_late_multiplier=1.0 disables the schedule (current behavior).
-    # >1 grows preservation as t decreases: coarse/edit early, fine/preserve late.
     psi_late_multiplier: float = 1.0
 
-    # N2: latent-mean anchor. Adds λ · (mean(tgt_x0) - mean(src_x0)) to the final grad,
-    # minimizing channel-mean drift in VAE latent space. Targets the TAG brightness /
-    # saturation artifact without relying on text-semantic negative prompts.
     latent_mean_anchor_weight: float = 0.0
 
 
@@ -159,25 +125,18 @@ class DC(object):
         self.text_encoder.requires_grad_(False)
         self.vae.requires_grad_(False)
 
-        ## construct text features beforehand.
+        # construct text features beforehand.
         self.src_prompt = self.config.src_prompt
         self.tgt_prompt = self.config.tgt_prompt
-        self.tag_negative_prompt = self.config.tag_negative_prompt
 
         self.update_text_features(src_prompt=self.src_prompt, tgt_prompt=self.tgt_prompt)
         self.null_text_feature = self.encode_text("")
-        self.tag_negative_text_feature = (
-            self.encode_text(self.tag_negative_prompt) if self.tag_negative_prompt else None
-        )
     
         self.use_wandb = use_wandb
 
         self.iteration = 0
         self.max_iteration = config.max_iteration
         self.gradient_mask_ema: Dict[int, torch.Tensor] = {}
-        # Running scalar used by coverage-adaptive STG. Updated at end of each iteration
-        # when a mask is built. 0.0 initial value means "no attenuation" for iteration 0.
-        self.previous_mask_coverage: float = 0.0
 
         b1 = self.config.freeu_b1
         b2 = self.config.freeu_b2
@@ -284,78 +243,22 @@ class DC(object):
                 self.tgt_prompt = tgt_prompt
                 self.tgt_text_feature = self.encode_text(tgt_prompt)
 
-    def get_tag_negative_text_embedding(self):
-        """Return the cached text embedding for the post-TAG negative regularizer."""
-        return self.tag_negative_text_feature
-
-    def _get_current_stg_scale(self) -> float:
-        """Return the STG scale for the current edit iteration.
-
-        By default STG stays constant (no schedule). With the schedule enabled:
-          - mode="decay" (default): STG at stg_scale for progress < decay_start,
-            linearly decays to 0 between decay_start and decay_end, 0 after.
-          - mode="growth": STG at 0 for progress < decay_start, linearly grows to
-            stg_scale between decay_start and decay_end, stg_scale after. Use on
-            creative-transform scenes so the edit commits first (TAG drives early)
-            and STG only refines structure once the new geometry has emerged.
-
-        With stg_coverage_adaptive=True, the returned scale is further multiplied
-        by (1 − previous iteration mask coverage). On scenes where the mask covers
-        a large fraction of the image (creative transform), STG automatically fades
-        toward 0; on small-coverage scenes (identity-preserving face) it stays near
-        base scale.
-        """
-        base_scale = float(self.config.stg_scale)
-        if not self.config.stg_schedule_enabled:
-            scale = base_scale
-        else:
-            max_iteration = max(int(self.max_iteration), 1)
-            progress = min(max(self.iteration / max_iteration, 0.0), 1.0)
-            ratio_start = float(self.config.stg_decay_start_ratio)
-            ratio_end = float(self.config.stg_decay_end_ratio)
-            mode = str(getattr(self.config, "stg_schedule_mode", "decay")).lower()
-
-            if mode == "growth":
-                if progress <= ratio_start:
-                    scale = 0.0
-                elif progress >= ratio_end or ratio_end <= ratio_start:
-                    scale = base_scale
-                else:
-                    scale = base_scale * (progress - ratio_start) / (ratio_end - ratio_start)
-            elif mode == "bump":
-                if progress <= ratio_start or progress >= ratio_end or ratio_end <= ratio_start:
-                    scale = 0.0
-                else:
-                    peak_ratio = min(max(float(getattr(self.config, "stg_bump_peak_ratio", 0.5)), 0.0), 1.0)
-                    peak_time = ratio_start + peak_ratio * (ratio_end - ratio_start)
-                    if progress <= peak_time:
-                        # Rising edge: 0 → base_scale between ratio_start and peak_time.
-                        span = max(peak_time - ratio_start, 1e-8)
-                        scale = base_scale * (progress - ratio_start) / span
-                    else:
-                        # Falling edge: base_scale → 0 between peak_time and ratio_end.
-                        span = max(ratio_end - peak_time, 1e-8)
-                        scale = base_scale * (ratio_end - progress) / span
-            else:
-                # decay mode (default)
-                if ratio_end <= ratio_start:
-                    scale = base_scale if progress < ratio_end else 0.0
-                elif progress <= ratio_start:
-                    scale = base_scale
-                elif progress >= ratio_end:
-                    scale = 0.0
-                else:
-                    decay_progress = (progress - ratio_start) / (ratio_end - ratio_start)
-                    scale = base_scale * (1.0 - decay_progress)
-
-        if getattr(self.config, "stg_coverage_adaptive", False):
-            # Use previous iteration's coverage since the current mask isn't built yet.
-            # Defaults to 0.0 (no attenuation) until the first mask exists.
-            coverage = float(getattr(self, "previous_mask_coverage", 0.0))
-            coverage = min(max(coverage, 0.0), 1.0)
-            scale = scale * (1.0 - coverage)
-
-        return scale
+    def _get_current_stg_scale(self, current_mask_coverage=None, iteration=None) -> float:
+        """Return scheduled STG scale, optionally using current same-view coverage."""
+        if iteration is None:
+            iteration = self.iteration
+        return compute_stg_scale(
+            base_scale=self.config.stg_scale,
+            iteration=iteration,
+            max_iteration=self.max_iteration,
+            schedule_enabled=self.config.stg_schedule_enabled,
+            mode=self.config.stg_schedule_mode,
+            start_ratio=self.config.stg_schedule_start_ratio,
+            end_ratio=self.config.stg_schedule_end_ratio,
+            bump_peak_ratio=self.config.stg_bump_peak_ratio,
+            coverage_adaptive=self.config.stg_coverage_adaptive,
+            current_mask_coverage=current_mask_coverage,
+        )
 
     def dc_timestep_sampling(self, batch_size):
         self.scheduler.set_timesteps(self.config.num_inference_steps)
@@ -378,7 +281,7 @@ class DC(object):
         self,
         tgt_x0,
         src_x0,
-        src_emb,
+        src_encoded,
         tgt_prompt=None,
         src_prompt=None,
         reduction="mean",
@@ -389,7 +292,6 @@ class DC(object):
         device = self.device
         scheduler = self.scheduler
 
-        # process text.
         self.update_text_features(src_prompt=src_prompt, tgt_prompt=tgt_prompt)
         tgt_text_embedding, src_text_embedding = (
             self.tgt_text_feature,
@@ -399,18 +301,20 @@ class DC(object):
 
         batch_size = tgt_x0.shape[0]
         t, t_prev, t_normalized = self.dc_timestep_sampling(batch_size)
-
-        if self.config.adaptive_tag:
-            eta_tag_current = 1.0 + (self.config.eta_tag - 1.0) * t_normalized ** (1/math.e) # Maybe test with other exponents too
-        else:
-            eta_tag_current = self.config.eta_tag
+        eta_tag_current = compute_tag_eta(
+            self.config.eta_tag,
+            t_normalized,
+            self.config.adaptive_tag,
+        )
 
         noise = torch.randn_like(tgt_x0)
-        
+
         eps = dict()
         eps_raw = dict()
         pred_x0s = dict()
         noisy_latents = dict()
+        base_text_embeddings_by_name = dict()
+        base_latent_model_inputs = dict()
         cross_attention_mask = None
         cross_attention_token_indices = None
         if self.config.cross_attention_mask_enabled:
@@ -419,170 +323,90 @@ class DC(object):
                 self.tgt_prompt,
                 src_prompt=self.src_prompt,
             )
-         
+
+        uncond_image_latent = torch.zeros_like(src_encoded)
+
+        # Phase 1: clean CFG predictions only. These eps_raw tensors are the
+        # localization source of truth and are intentionally pre-STG/pre-TAG/pre-PN.
         for latent, cond_text_embedding, name in zip(
             [tgt_x0, src_x0], [tgt_text_embedding, src_text_embedding], ["tgt", "src"]
         ):
             latents_noisy = scheduler.add_noise(latent, noise, t)
-            src_encoded = src_emb.latent_dist.mode()
-            
-            uncond_image_latent = torch.zeros_like(src_encoded)
+            noisy_latents[name] = latents_noisy
+
             base_text_embeddings = torch.cat([cond_text_embedding, uncond_embedding, uncond_embedding], dim=0)
             base_text_embeddings = torch.cat([base_text_embeddings, base_text_embeddings], dim=1)
             base_latent_image = torch.cat([src_encoded, src_encoded, uncond_image_latent], dim=0)
             base_latent_model_input = torch.cat([latents_noisy] * 3, dim=0)
             base_latent_model_input = torch.cat([base_latent_model_input, base_latent_image], dim=1)
-            
+            base_text_embeddings_by_name[name] = base_text_embeddings
+            base_latent_model_inputs[name] = base_latent_model_input
+
             if name == "tgt":
-                tag_negative_correction = None
-                if self.config.tag_negative_strength > 0 and self.get_tag_negative_text_embedding() is not None:
-                    neg_text_embedding = self.get_tag_negative_text_embedding()
-                    text_embeddings = torch.cat([cond_text_embedding, neg_text_embedding, uncond_embedding, uncond_embedding], dim=0)
-                    text_embeddings = torch.cat([text_embeddings, text_embeddings], dim=1)
-                    latent_image = torch.cat([src_encoded, src_encoded, src_encoded, uncond_image_latent], dim=0)
-                    latent_model_input = torch.cat([latents_noisy] * 4, dim=0)
-                    latent_model_input = torch.cat([latent_model_input, latent_image], dim=1)
-                    timestep_input = torch.cat([t] * 4).to(device)
-
-                    if self.config.cross_attention_mask_enabled:
-                        noise_pred, cross_attention_mask = run_unet_with_cross_attention_capture(
-                            self.unet,
-                            self.config.cross_attention_mask_layers,
-                            cross_attention_token_indices,
-                            latent_model_input,
-                            timestep_input,
-                            text_embeddings,
-                            conditioned_batch_size=batch_size,
-                            build_attention_mask_fn=lambda maps: build_cross_attention_relevance_mask(
-                                maps,
-                                gamma=self.config.cross_attention_mask_gamma,
-                                sigma=self.config.cross_attention_mask_blur,
-                                target_shape=latents_noisy.shape[-2:],
-                            ),
-                        )
-                    else:
-                        noise_pred = self.unet.forward(
-                            latent_model_input,
-                            timestep_input,
-                            encoder_hidden_states=text_embeddings,
-                        ).sample
-
-                    noise_pred_text, neg_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(4)
-                    
-                    noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_image) + \
-                        self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
-                    
-                    noise_pred_neg_cfg = noise_pred_uncond + self.config.guidance_scale * (neg_text - noise_pred_image) + \
-                        self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
-                    
-                    tag_negative_correction = noise_pred_neg_cfg - noise_pred
-                else:
-                    text_embeddings = base_text_embeddings
-                    latent_model_input = base_latent_model_input
-                    timestep_input = torch.cat([t] * 3).to(device)
-                    if self.config.cross_attention_mask_enabled:
-                        noise_pred, cross_attention_mask = run_unet_with_cross_attention_capture(
-                            self.unet,
-                            self.config.cross_attention_mask_layers,
-                            cross_attention_token_indices,
-                            latent_model_input,
-                            timestep_input,
-                            text_embeddings,
-                            conditioned_batch_size=batch_size,
-                            build_attention_mask_fn=lambda maps: build_cross_attention_relevance_mask(
-                                maps,
-                                gamma=self.config.cross_attention_mask_gamma,
-                                sigma=self.config.cross_attention_mask_blur,
-                                target_shape=latents_noisy.shape[-2:],
-                            ),
-                        )
-                    else:
-                        noise_pred = self.unet.forward(
-                            latent_model_input,
-                            timestep_input,
-                            encoder_hidden_states=text_embeddings,
-                        ).sample
-                    noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
-                    noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_image) + \
-                        self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
-
-                # Pre-STG, pre-TAG, pre-PN snapshot used downstream for clean mask construction.
-                eps_raw["tgt"] = noise_pred.detach().clone()
-
-                current_stg_scale = self._get_current_stg_scale()
-                if self.config.stg_enabled and current_stg_scale > 0:
-                    weak_pred = run_unet_with_skipped_attn(
+                timestep_input = torch.cat([t] * 3).to(device)
+                if self.config.cross_attention_mask_enabled:
+                    noise_pred, cross_attention_mask = run_unet_with_cross_attention_capture(
                         self.unet,
-                        self.device,
-                        self.config.stg_skip_layers,
+                        self.config.cross_attention_mask_layers,
+                        cross_attention_token_indices,
                         base_latent_model_input,
-                        t,
+                        timestep_input,
                         base_text_embeddings,
+                        conditioned_batch_size=batch_size,
+                        build_attention_mask_fn=lambda maps: build_cross_attention_relevance_mask(
+                            maps,
+                            gamma=self.config.cross_attention_mask_gamma,
+                            sigma=self.config.cross_attention_mask_blur,
+                            target_shape=latents_noisy.shape[-2:],
+                        ),
                     )
-                    weak_text, weak_image, weak_uncond = weak_pred.chunk(3)
-                    noise_pred_weak = weak_uncond + self.config.guidance_scale * (weak_text - weak_image) + \
-                        self.config.image_guidance_scale * (weak_image - weak_uncond)
-                    noise_pred = noise_pred + current_stg_scale * (noise_pred - noise_pred_weak)
+                else:
+                    noise_pred = self.unet.forward(
+                        base_latent_model_input,
+                        timestep_input,
+                        encoder_hidden_states=base_text_embeddings,
+                    ).sample
+                noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
+                noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_image) + \
+                    self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
             else:
-                text_embeddings = base_text_embeddings
-                latent_model_input = base_latent_model_input
-
+                timestep_input = torch.cat([t] * 3).to(device)
                 noise_pred = self.unet.forward(
-                    latent_model_input,
-                    torch.cat([t] * 3).to(device),
-                    encoder_hidden_states=text_embeddings,
+                    base_latent_model_input,
+                    timestep_input,
+                    encoder_hidden_states=base_text_embeddings,
                 ).sample
                 noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
                 noise_pred = noise_pred_uncond + self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
-                eps_raw["src"] = noise_pred.detach().clone()
 
-            if self.config.asymmetric_tag:
-                eta_current = eta_tag_current if name == "tgt" else 1.0
-            else:
-                eta_current = eta_tag_current
-            
-            v = latents_noisy / (latents_noisy.norm(p=2, dim=(1, 2, 3), keepdim=True) + 1e-8)
-            noise_parallel = (noise_pred * v).sum(dim=(1, 2, 3), keepdim=True) * v
-            noise_tangential = noise_pred - noise_parallel
-            noise_pred = noise_parallel + eta_current * noise_tangential
+            eps_raw[name] = noise_pred.detach().clone()
 
-            if name == "tgt" and self.config.tag_negative_strength > 0 and tag_negative_correction is not None:
-                noise_pred = noise_pred - self.config.tag_negative_strength * tag_negative_correction
-
-            _, pred_x0 = self.compute_posterior_mean(latents_noisy, noise_pred, t, t_prev)
-
-            eps[name] = noise_pred
-            pred_x0s[name] = pred_x0
-            noisy_latents[name] = latents_noisy
-
-        if self.config.perp_neg:
-            src_norm_sq = (eps["src"] * eps["src"]).sum(dim=(1, 2, 3), keepdim=True).clamp(min=1e-8)
-            projection = (eps["tgt"] * eps["src"]).sum(dim=(1, 2, 3), keepdim=True) / src_norm_sq
-            alpha = self.config.perp_neg_alpha
-            eps["tgt"] = eps["tgt"] - alpha * projection * eps["src"]
-
+        # STG schedule uses the pre-increment iteration so progress starts at 0
+        # on the first call. After the increment, self.iteration drives the mask
+        # warmup check below: with gradient_mask_warmup=N, the self-mask stays as
+        # all-ones for post-increment iterations 1..N-1 and switches to the real
+        # EMA mask at post-increment iteration N.
+        iteration_for_stg = self.iteration
         self.iteration += 1
-        
+
         grad_mask = None
         self_grad_mask = None
-
         needs_self_mask = (
             self.config.gradient_mask_enabled
             or self.config.source_blend_localization_enabled
             or self.config.outside_mask_anchor_weight > 0
             or self.config.cross_attention_mask_enabled
-        ) and not self.config.cross_attention_mask_only
+            or self.config.stg_coverage_adaptive
+        )
 
         if needs_self_mask:
             self_grad_mask = self._build_gradient_relevance_mask(
                 eps_raw["tgt"], eps_raw["src"], current_spot
             )
-            if self.config.invert_self_mask:
-                self_grad_mask = (1.0 - self_grad_mask).clamp(0.0, 1.0)
             grad_mask = self_grad_mask
 
         if cross_attention_mask is not None:
-            target_shape = grad_mask.shape[-2:] if grad_mask is not None else eps["tgt"].shape[-2:]
+            target_shape = grad_mask.shape[-2:] if grad_mask is not None else eps_raw["tgt"].shape[-2:]
             if cross_attention_mask.shape[-2:] != target_shape:
                 cross_attention_mask = F.interpolate(
                     cross_attention_mask,
@@ -590,12 +414,8 @@ class DC(object):
                     mode="bilinear",
                     align_corners=False,
                 )
-            if self.config.cross_attention_mask_only:
+            if grad_mask is None:
                 grad_mask = cross_attention_mask
-            elif grad_mask is None:
-                grad_mask = cross_attention_mask
-            elif self.config.invert_self_mask:
-                grad_mask = grad_mask * cross_attention_mask
             else:
                 weight = float(self.config.cross_attention_mask_weight)
                 weight = min(max(weight, 0.0), 1.0)
@@ -603,20 +423,55 @@ class DC(object):
                 grad_mask = self_mask * ((1.0 - weight) + weight * cross_attention_mask)
             grad_mask = grad_mask.clamp(0.0, 1.0)
 
+        mask_is_warmup = needs_self_mask and self.iteration < self.config.gradient_mask_warmup
+        current_mask_coverage = None if mask_is_warmup else compute_mask_coverage(grad_mask)
+        current_stg_scale = self._get_current_stg_scale(
+            current_mask_coverage=current_mask_coverage,
+            iteration=iteration_for_stg,
+        )
+
+        # Phase 2: apply guidance novelties from cached eps_raw after the clean current mask exists.
+        for name in ["tgt", "src"]:
+            noise_pred = eps_raw[name]
+            latents_noisy = noisy_latents[name]
+
+            if name == "tgt" and self.config.stg_enabled and current_stg_scale > 0:
+                weak_pred = run_unet_with_skipped_attn(
+                    self.unet,
+                    self.device,
+                    self.config.stg_skip_layers,
+                    base_latent_model_inputs["tgt"],
+                    t,
+                    base_text_embeddings_by_name["tgt"],
+                )
+                weak_text, weak_image, weak_uncond = weak_pred.chunk(3)
+                noise_pred_weak = weak_uncond + self.config.guidance_scale * (weak_text - weak_image) + \
+                    self.config.image_guidance_scale * (weak_image - weak_uncond)
+                noise_pred = apply_stg(noise_pred, noise_pred_weak, current_stg_scale)
+
+            eta_current = eta_tag_current if (name == "tgt" or not self.config.asymmetric_tag) else 1.0
+            noise_pred = apply_tag(noise_pred, latents_noisy, eta_current)
+
+            _, pred_x0 = self.compute_posterior_mean(latents_noisy, noise_pred, t, t_prev)
+            eps[name] = noise_pred
+            pred_x0s[name] = pred_x0
+
+        if self.config.perp_neg:
+            eps["tgt"] = apply_perp_neg(eps["tgt"], eps["src"], self.config.perp_neg_alpha)
+
         eps_tgt_for_grad = eps["tgt"]
         if self.config.source_blend_localization_enabled and grad_mask is not None:
-            eps_tgt_for_grad = eps["src"] + grad_mask * (eps["tgt"] - eps["src"])
+            eps_tgt_for_grad = apply_source_blend(eps["tgt"], eps["src"], grad_mask)
 
-        # DaCapo-inspired temporal schedule
-        psi_schedule_factor = 1.0 + (self.config.psi_late_multiplier - 1.0) * (1.0 - t_normalized)
-        preserve_weight = self.config.psi * psi_schedule_factor
-        
-        if grad_mask is not None and self.config.outside_mask_anchor_weight > 0:
-            w_out_effective = self.config.outside_mask_anchor_weight
-            if getattr(self.config, "outside_mask_anchor_coverage_adaptive", False):
-                coverage_per_sample = grad_mask.mean(dim=(2, 3), keepdim=True).clamp(0.0, 1.0)
-                w_out_effective = w_out_effective * (1.0 - coverage_per_sample)
-            preserve_weight = preserve_weight + w_out_effective * (1.0 - grad_mask)
+        preserve_weight = compute_preserve_weight(
+            psi=self.config.psi,
+            psi_late_multiplier=self.config.psi_late_multiplier,
+            t_normalized=t_normalized,
+            grad_mask=grad_mask,
+            outside_mask_anchor_weight=self.config.outside_mask_anchor_weight,
+            outside_mask_anchor_coverage_adaptive=self.config.outside_mask_anchor_coverage_adaptive,
+            mask_coverage=current_mask_coverage,
+        )
 
         w_DDS = self.config.delta + self.config.gamma * (t_normalized ** (1/math.e))
         grad = (
@@ -627,15 +482,12 @@ class DC(object):
         if self.config.gradient_mask_enabled and grad_mask is not None:
             grad = grad * grad_mask
 
-        # latent-mean anchor
-        if self.config.latent_mean_anchor_weight > 0:
-            tgt_mean = tgt_x0.mean(dim=(2, 3), keepdim=True)
-            src_mean = src_x0.mean(dim=(2, 3), keepdim=True)
-            grad = grad + self.config.latent_mean_anchor_weight * (tgt_mean - src_mean).expand_as(grad)
-
-        # Cache batch-mean mask coverage for the next iteration's coverage-adaptive STG.
-        if grad_mask is not None:
-            self.previous_mask_coverage = float(grad_mask.mean().item())
+        grad = apply_latent_mean_anchor(
+            grad,
+            tgt_x0,
+            src_x0,
+            self.config.latent_mean_anchor_weight,
+        )
 
         grad = torch.nan_to_num(grad)
         
@@ -651,6 +503,7 @@ class DC(object):
                 t_normalized=t_normalized,
                 eta_tag_current=eta_tag_current,
                 current_stg_scale=current_stg_scale if self.config.stg_enabled else 0.0,
+                stg_mask_coverage=current_mask_coverage,
                 w_dds=w_DDS,
                 preserve_weight=preserve_weight,
                 eps_tgt=eps["tgt"],
@@ -674,6 +527,8 @@ class DC(object):
                 "grad_mask": grad_mask,
                 "self_grad_mask": self_grad_mask,
                 "cross_attention_mask": cross_attention_mask,
+                "mask_coverage": current_mask_coverage,
+                "stg_scale": current_stg_scale if self.config.stg_enabled else 0.0,
             }
             return dic
         else:

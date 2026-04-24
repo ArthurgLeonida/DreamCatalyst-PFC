@@ -16,7 +16,7 @@ from typing_extensions import Literal
 from dc_nerf.pipelines.base_pipeline import ModifiedVanillaPipeline
 from dc_nerf.data.datamanagers.dc_datamanager import DCDataManagerConfig
 from dc_nerf.data.datamanagers.dc_splat_datamanager import DCSplatDataManagerConfig
-from dc.dc import DC, DCConfig, tensor_to_pil, DC
+from dc.dc import DC, DCConfig, tensor_to_pil
 from dc.utils.imageutil import merge_images
 from dc.utils.sysutil import clean_gpu
 from dc.utils.free_lunch import register_free_upblock2d, register_free_crossattn_upblock2d
@@ -61,8 +61,9 @@ class DCPipeline(ModifiedVanillaPipeline):
         self.use_wandb = kwargs.get("wandb_enabled", False)
         
         self.dc = DC(self.config.dc, use_wandb=self.use_wandb)
-        # Caching source's x0
+        # Caching source's x0 and IP2P image-conditioning latent per view.
         self.src_x0s = dict()
+        self.src_encodeds = dict()
         self.current_spot = None
 
     def get_current_rendering(self, step):
@@ -103,14 +104,21 @@ class DCPipeline(ModifiedVanillaPipeline):
         else:
             src_x0 = self.src_x0s[current_spot].to(self.dc_device)
 
+        if current_spot not in self.src_encodeds:
+            with torch.no_grad():
+                src_emb = self.dc.encode_src_image(original_image_512.to(self.dc_device))
+                src_encoded = src_emb.latent_dist.mode()
+                self.src_encodeds[current_spot] = src_encoded.clone().cpu()
+        else:
+            src_encoded = self.src_encodeds[current_spot].to(self.dc_device)
+
         x0 = self.dc.encode_image(rendered_image_512.to(self.dc_device))
-        src_emb = self.dc.encode_src_image(original_image_512.to(self.dc_device))
 
         del rendered_image_512
         del original_image_512
         clean_gpu()
 
-        dic = self.dc(tgt_x0=x0, src_x0=src_x0, src_emb=src_emb, return_dict=True, step=step, current_spot=current_spot)
+        dic = self.dc(tgt_x0=x0, src_x0=src_x0, src_encoded=src_encoded, return_dict=True, step=step, current_spot=current_spot)
         grad = dic["grad"].cpu()
         grad_mask = dic.get("grad_mask", None)
         self_grad_mask = dic.get("self_grad_mask", None)

@@ -16,7 +16,7 @@ Photos/Video ──► COLMAP ──► Nerfacto (NeRF) ──► DreamCatalyst 
 ## Research scope
 
 The contributions of this work are concentrated in **Step 3**. Extensions target:
-- stronger DDS guidance (TAG family, STG, Perp-Neg, post-TAG negative prompt),
+- stronger DDS guidance (TAG family, STG, Perp-Neg),
 - better localization / background preservation (self-derived relevance mask, source-blended localization, cross-attention semantic mask, outside-mask background anchor),
 - cleaner multi-scene evaluation.
 
@@ -95,7 +95,7 @@ Uses SDEdit (SD 1.5, 20 denoising steps with `skip=7`) to produce edited 2D imag
 
 ## Novelties
 
-All extensions live in `nerfstudio/dc/dc.py` and are configured centrally in `nerfstudio/dc/tasd_config.py` (`DC_CUSTOM_PARAMS`). Every novelty defaults to *off*, so enabling it produces a clean ablation.
+The main DDS orchestration lives in `nerfstudio/dc/dc.py`; reusable novelty math lives in `nerfstudio/dc/guidance_utils.py`; settings are configured centrally in `nerfstudio/dc/tasd_config.py` (`DC_CUSTOM_PARAMS`). Every novelty defaults to *off*, so enabling it produces a clean ablation.
 
 ### Localization branch (main research direction)
 
@@ -107,7 +107,7 @@ All extensions live in `nerfstudio/dc/dc.py` and are configured centrally in `ne
 | **Coverage-adaptive anchor** | `outside_mask_anchor_coverage_adaptive` | Scales `w_out` by `(1 − mean(M))`. Identity-preserving scenes (small coverage, e.g. face) keep the bg anchor tight; creative-transform scenes (large coverage, e.g. stormtrooper) loosen automatically. Lets one anchor value work across scene types. |
 | **Cross-attention semantic mask** | `cross_attention_mask_enabled` + `cross_attention_mask_{layers,weight,gamma,blur}` | Aggregates target-token cross-attention from selected UNet up-blocks, fuses with the self-mask as `M_hybrid = M_self · ((1 − w) + w · M_attn)`. Target-token selection is auto-derived from src/tgt prompts (no manual keyword overrides). Based on Prompt-to-Prompt, What the DAAM, DiffEdit, LEDITS++. |
 | **ψ schedule** | `psi_late_multiplier` | Temporal schedule on the preservation weight: `preserve_weight = ψ · (1 + (psi_late_multiplier − 1) · (1 − t_norm))`. Edit commits early, preservation tightens late. `=1.0` disables. Based on DaCapo (Huang et al., CVPR 2025). |
-| **Latent-mean anchor (N2)** | `latent_mean_anchor_weight` | Adds `λ · (mean(tgt_x0) − mean(src_x0))` per channel onto the final gradient — penalizes VAE-latent channel-mean drift, counteracts TAG brightness/saturation artifacts without a text negative prompt. `=0.0` disables. Conceptually aligned with Piva and Stable Score Distillation. |
+| **Latent-mean anchor (N2)** | `latent_mean_anchor_weight` | Adds `λ · (mean(tgt_x0) − mean(src_x0))` per channel onto the final gradient — penalizes VAE-latent channel-mean drift and counteracts TAG brightness/saturation artifacts directly in latent statistics. `=0.0` disables. Conceptually aligned with Piva and Stable Score Distillation. |
 
 ### TAG branch (edit strength)
 
@@ -116,15 +116,13 @@ All extensions live in `nerfstudio/dc/dc.py` and are configured centrally in `ne
 | **TAG** | `eta_tag` | Amplifies the tangential component of `noise_pred` with respect to the noisy latent. `eta_tag=1.0` disables. Based on TAG (Cho et al., 2024). |
 | **Adaptive TAG** | `adaptive_tag` | Anneals `η(t) = 1 + (eta_tag − 1) · t_norm^(1/e)` so amplification is strongest at high noise and decays toward 1.0 near the clean regime. |
 | **Asymmetric TAG** | `asymmetric_tag` | Applies TAG only to the target branch, leaving `eps_src` at `η = 1.0`. |
-| **Post-TAG negative prompt** | `tag_negative_prompt`, `tag_negative_strength` | Subtracts a negative-prompt CFG direction after TAG. Exploratory — does not yet convincingly beat non-neg runs. |
-
 ### STG branch (structural amplification)
 
 | Novelty | Config | Description |
 |---|---|---|
 | **STG** | `stg_enabled`, `stg_scale`, `stg_skip_layers` | Runs a weak UNet pass via `STGIdentityValueAttnProcessor` on selected up-blocks and amplifies `eps = eps_full + s · (eps_full − eps_weak)`. Based on STG (Hyung et al., CVPR 2025). Target-branch only. |
-| **STG schedule** | `stg_schedule_enabled`, `stg_schedule_mode`, `stg_decay_{start,end}_ratio`, `stg_bump_peak_ratio` | Three shapes: `"decay"` (STG early, off late — best on identity-preserving edits), `"growth"` (STG off early, on late — lets TAG commit the edit first), `"bump"` (triangle: STG peaks mid-phase and returns to 0 before the end — prevents late STG from locking in view-dependent partial-state inconsistencies on creative edits). |
-| **Coverage-adaptive STG** | `stg_coverage_adaptive` | Multiplies the scheduled STG scale by `(1 − prev_coverage)`. Self-mask coverage is a proxy for scene type: small coverage (face) keeps STG near its scheduled value; large coverage (stormtrooper) fades STG toward 0 automatically, preventing it from pulling `eps_tgt` back toward the current source-image structure during creative restructuring. |
+| **STG schedule** | `stg_schedule_enabled`, `stg_schedule_mode`, `stg_schedule_{start,end}_ratio`, `stg_bump_peak_ratio` | Three shapes: `"decay"` (STG early, off late — best on identity-preserving edits), `"growth"` (STG off early, on late — lets TAG commit the edit first), `"bump"` (triangle: STG peaks mid-phase and returns to 0 before the end — prevents late STG from locking in view-dependent partial-state inconsistencies on creative edits). |
+| **Coverage-adaptive STG** | `stg_coverage_adaptive` | Multiplies the scheduled STG scale by `(1 − current_coverage)` using the same-view mask built from clean pre-guidance `eps_raw`. Self-mask coverage is a proxy for scene type: small coverage (face) keeps STG near its scheduled value; large coverage (stormtrooper) fades STG toward 0 automatically, preventing it from pulling `eps_tgt` back toward the current source-image structure during creative restructuring. |
 
 ### Perp-Neg branch (creative direction separation)
 
@@ -159,16 +157,14 @@ DC_CUSTOM_PARAMS = dict(
     eta_tag=1.25,
     adaptive_tag=True,
     asymmetric_tag=True,
-    tag_negative_prompt="",
-    tag_negative_strength=0.0,
 
     # STG
     stg_enabled=True,
     stg_scale=2,
     stg_skip_layers=[2],
     stg_schedule_enabled=True,
-    stg_decay_start_ratio=0.4,
-    stg_decay_end_ratio=0.7,
+    stg_schedule_start_ratio=0.4,
+    stg_schedule_end_ratio=0.7,
     stg_schedule_mode="bump",        # "decay" | "growth" | "bump"
     stg_bump_peak_ratio=0.5,         # only used in "bump" mode
     stg_coverage_adaptive=True,
