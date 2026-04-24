@@ -141,36 +141,37 @@ DC_CUSTOM_PARAMS = dict(
     psi=0.075,
     source_blend_localization_enabled=True,
     gradient_mask_enabled=False,
-    outside_mask_anchor_weight=0.05,
-    outside_mask_anchor_coverage_adaptive=False,
+    outside_mask_anchor_weight=0.2,
+    outside_mask_anchor_coverage_adaptive=True,
     gradient_mask_blur=1.0,
     gradient_mask_gamma=1.2,
     gradient_mask_ema_beta=0.0,
     gradient_mask_warmup=0,
-    cross_attention_mask_enabled=False,
+    cross_attention_mask_enabled=True,
     cross_attention_mask_layers=[1, 2],
-    cross_attention_mask_weight=1.0,
-    cross_attention_mask_gamma=1.0,
+    cross_attention_mask_weight=0.7,
+    cross_attention_mask_blur=0.5,
+    cross_attention_mask_gamma=1.2,
     psi_late_multiplier=1.0,         # DaCapo-inspired ψ schedule (1.0 = off)
-    latent_mean_anchor_weight=0.0,   # N2: latent-mean anchor (0.0 = off)
+    latent_mean_anchor_weight=0.005, # N2: latent-mean anchor (0.0 = off)
 
     # TAG
-    eta_tag=1.0,
-    adaptive_tag=False,
-    asymmetric_tag=False,
+    eta_tag=1.25,
+    adaptive_tag=True,
+    asymmetric_tag=True,
     tag_negative_prompt="",
     tag_negative_strength=0.0,
 
     # STG
-    stg_enabled=False,
-    stg_scale=0.5,
+    stg_enabled=True,
+    stg_scale=2,
     stg_skip_layers=[2],
-    stg_schedule_enabled=False,
-    stg_decay_start_ratio=0.0,
-    stg_decay_end_ratio=1.0,
-    stg_schedule_mode="decay",       # "decay" | "growth" | "bump"
+    stg_schedule_enabled=True,
+    stg_decay_start_ratio=0.4,
+    stg_decay_end_ratio=0.7,
+    stg_schedule_mode="bump",        # "decay" | "growth" | "bump"
     stg_bump_peak_ratio=0.5,         # only used in "bump" mode
-    stg_coverage_adaptive=False,
+    stg_coverage_adaptive=True,
 
     # Perp-Neg (optional; earlier depth/cached-mask variants retired)
     perp_neg=False,

@@ -400,18 +400,15 @@ class DC(object):
         batch_size = tgt_x0.shape[0]
         t, t_prev, t_normalized = self.dc_timestep_sampling(batch_size)
 
-        # Adaptive TAG: anneal η from eta_tag (high noise) → 1.0 (low noise)
-        # ====================================================================================
         if self.config.adaptive_tag:
             eta_tag_current = 1.0 + (self.config.eta_tag - 1.0) * t_normalized ** (1/math.e) # Maybe test with other exponents too
         else:
             eta_tag_current = self.config.eta_tag
-        # ====================================================================================
 
         noise = torch.randn_like(tgt_x0)
         
         eps = dict()
-        eps_raw = dict()  # post-CFG snapshot, pre-STG/TAG/PN, used only for mask construction
+        eps_raw = dict()
         pred_x0s = dict()
         noisy_latents = dict()
         cross_attention_mask = None
@@ -512,8 +509,6 @@ class DC(object):
                 # Pre-STG, pre-TAG, pre-PN snapshot used downstream for clean mask construction.
                 eps_raw["tgt"] = noise_pred.detach().clone()
 
-                # STG: amplify structural signal beyond full model (paper Eq 13)
-                # ==============================================================================
                 current_stg_scale = self._get_current_stg_scale()
                 if self.config.stg_enabled and current_stg_scale > 0:
                     weak_pred = run_unet_with_skipped_attn(
@@ -528,7 +523,6 @@ class DC(object):
                     noise_pred_weak = weak_uncond + self.config.guidance_scale * (weak_text - weak_image) + \
                         self.config.image_guidance_scale * (weak_image - weak_uncond)
                     noise_pred = noise_pred + current_stg_scale * (noise_pred - noise_pred_weak)
-                # ==============================================================================
             else:
                 text_embeddings = base_text_embeddings
                 latent_model_input = base_latent_model_input
@@ -542,8 +536,6 @@ class DC(object):
                 noise_pred = noise_pred_uncond + self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
                 eps_raw["src"] = noise_pred.detach().clone()
 
-            # TAG: amplify tangential component of noise prediction
-            # ====================================================================================
             if self.config.asymmetric_tag:
                 eta_current = eta_tag_current if name == "tgt" else 1.0
             else:
@@ -554,10 +546,8 @@ class DC(object):
             noise_tangential = noise_pred - noise_parallel
             noise_pred = noise_parallel + eta_current * noise_tangential
 
-            # Post-TAG negative-prompt regularizer
             if name == "tgt" and self.config.tag_negative_strength > 0 and tag_negative_correction is not None:
                 noise_pred = noise_pred - self.config.tag_negative_strength * tag_negative_correction
-            # ====================================================================================
 
             _, pred_x0 = self.compute_posterior_mean(latents_noisy, noise_pred, t, t_prev)
 
@@ -565,22 +555,17 @@ class DC(object):
             pred_x0s[name] = pred_x0
             noisy_latents[name] = latents_noisy
 
-        # Perpendicular Gradient Projection (Perp-Neg): orthogonalize eps_tgt w.r.t. eps_src.
-        # Depth/cached-mask variants were retired in favor of self-mask + CA-mask localization.
-        # ====================================================================================
         if self.config.perp_neg:
             src_norm_sq = (eps["src"] * eps["src"]).sum(dim=(1, 2, 3), keepdim=True).clamp(min=1e-8)
             projection = (eps["tgt"] * eps["src"]).sum(dim=(1, 2, 3), keepdim=True) / src_norm_sq
             alpha = self.config.perp_neg_alpha
             eps["tgt"] = eps["tgt"] - alpha * projection * eps["src"]
-        # ====================================================================================
 
         self.iteration += 1
         
         grad_mask = None
         self_grad_mask = None
 
-        # M1 short-circuit: when cross_attention_mask_only is set, skip the self-mask build.
         needs_self_mask = (
             self.config.gradient_mask_enabled
             or self.config.source_blend_localization_enabled
@@ -593,7 +578,6 @@ class DC(object):
                 eps_raw["tgt"], eps_raw["src"], current_spot
             )
             if self.config.invert_self_mask:
-                # M2: flip so high values mark model-agreement (often the real edit region on IP2P).
                 self_grad_mask = (1.0 - self_grad_mask).clamp(0.0, 1.0)
             grad_mask = self_grad_mask
 
@@ -607,12 +591,10 @@ class DC(object):
                     align_corners=False,
                 )
             if self.config.cross_attention_mask_only:
-                # M1: cross-attention is the sole localization signal.
                 grad_mask = cross_attention_mask
             elif grad_mask is None:
                 grad_mask = cross_attention_mask
             elif self.config.invert_self_mask:
-                # M2: intersection of (1 - M_self) and M_attn — both factors ≤ 1, order invariant.
                 grad_mask = grad_mask * cross_attention_mask
             else:
                 weight = float(self.config.cross_attention_mask_weight)
@@ -625,14 +607,11 @@ class DC(object):
         if self.config.source_blend_localization_enabled and grad_mask is not None:
             eps_tgt_for_grad = eps["src"] + grad_mask * (eps["tgt"] - eps["src"])
 
-        # DaCapo-inspired temporal schedule on ψ: coarse/edit at high t, fine/preserve at low t.
-        # psi_late_multiplier=1.0 (default) → no change from DreamCatalyst behavior.
+        # DaCapo-inspired temporal schedule
         psi_schedule_factor = 1.0 + (self.config.psi_late_multiplier - 1.0) * (1.0 - t_normalized)
         preserve_weight = self.config.psi * psi_schedule_factor
+        
         if grad_mask is not None and self.config.outside_mask_anchor_weight > 0:
-            # Coverage-adaptive anchor: scale w_out by (1 − mean(grad_mask)) per sample
-            # so identity-preserving scenes (small coverage) keep strong bg anchor and
-            # creative-transform scenes (large coverage) loosen it automatically.
             w_out_effective = self.config.outside_mask_anchor_weight
             if getattr(self.config, "outside_mask_anchor_coverage_adaptive", False):
                 coverage_per_sample = grad_mask.mean(dim=(2, 3), keepdim=True).clamp(0.0, 1.0)
@@ -648,15 +627,13 @@ class DC(object):
         if self.config.gradient_mask_enabled and grad_mask is not None:
             grad = grad * grad_mask
 
-        # N2: latent-mean anchor. Adds a bias that drives mean(tgt_x0) toward mean(src_x0) per
-        # channel, counteracting TAG/CFG-driven brightness & saturation drift in VAE latent space.
+        # latent-mean anchor
         if self.config.latent_mean_anchor_weight > 0:
             tgt_mean = tgt_x0.mean(dim=(2, 3), keepdim=True)
             src_mean = src_x0.mean(dim=(2, 3), keepdim=True)
             grad = grad + self.config.latent_mean_anchor_weight * (tgt_mean - src_mean).expand_as(grad)
 
         # Cache batch-mean mask coverage for the next iteration's coverage-adaptive STG.
-        # Skipped silently when no mask exists (e.g. W_trueDC runs).
         if grad_mask is not None:
             self.previous_mask_coverage = float(grad_mask.mean().item())
 
