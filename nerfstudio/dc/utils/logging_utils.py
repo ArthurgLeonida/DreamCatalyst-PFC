@@ -96,6 +96,10 @@ def log_dc_debug_to_wandb(
     }
     if stg_mask_coverage is not None:
         log_payload["dc_debug/stg_mask_coverage"] = float(stg_mask_coverage)
+        if grad_mask is not None:
+            log_payload["dc_debug/stg_mask_coverage_raw_mean"] = float(
+                grad_mask.detach().mean().item()
+            )
 
     if self_grad_mask is not None:
         self_mask_stats = summarize_mask(self_grad_mask)

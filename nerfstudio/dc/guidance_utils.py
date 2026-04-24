@@ -101,26 +101,37 @@ def compute_stg_scale(
     return scale
 
 
-def compute_mask_coverage(mask: Optional[torch.Tensor], threshold: float = 0.5) -> Optional[float]:
-    """Return robust batch-mean mask coverage as a Python scalar.
+def compute_mask_coverage(mask: Optional[torch.Tensor]) -> Optional[float]:
+    """Return effective-support coverage via the Herfindahl-inverse statistic.
 
-    Weak background speckle should not count as edit support. Values below
-    `threshold` contribute 0; values above it contribute linearly up to 1.
-    Set threshold <= 0 to recover the raw mask mean.
+    coverage = mean(M)**2 / mean(M**2)  ∈ [0, 1]
+
+    Interpretation: "effective fraction of pixels participating in the mask
+    mass." For a binary mask, coverage equals the area fraction of mask=1
+    pixels. For a smooth mask, it captures shape concentration — a tight
+    hotspot gives low coverage, diffuse support gives high coverage.
+
+    Motivation: the self-mask and cross-attention mask are both
+    percentile-normalized inside `normalize_relevance_map`, which fixes their
+    raw means to a narrow band across scene types and destroys magnitude-based
+    discrimination. The Herfindahl inverse survives percentile normalization
+    because it is a shape statistic — the denominator mean(M**2) varies with
+    how the (near-constant) L1 mass is distributed spatially.
+
+    Used by the coverage-adaptive STG scale and outside-mask anchor weight as
+    `multiplier = (1 - coverage)`: localized edits (elf face, low coverage)
+    keep STG/anchor near full strength; creative edits (stormtrooper body,
+    high coverage) attenuate both — the target universal-config behavior.
     """
     if mask is None:
         return None
 
     mask = mask.detach().float().clamp(0.0, 1.0)
-    threshold = min(max(float(threshold), 0.0), 1.0)
-    if threshold <= 0.0:
-        coverage_mask = mask
-    elif threshold >= 1.0:
-        coverage_mask = (mask >= 1.0).float()
-    else:
-        coverage_mask = ((mask - threshold) / (1.0 - threshold)).clamp(0.0, 1.0)
-
-    return float(coverage_mask.mean().item())
+    mean_m = mask.mean()
+    mean_m_sq = (mask * mask).mean()
+    if mean_m_sq.item() <= 1e-12:
+        return 0.0
+    return float((mean_m * mean_m / mean_m_sq).item())
 
 
 def compute_preserve_weight(
