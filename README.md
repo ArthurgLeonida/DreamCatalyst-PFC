@@ -104,7 +104,7 @@ The main DDS orchestration lives in `nerfstudio/dc/dc.py`; reusable novelty math
 | **Self-derived relevance mask** | `gradient_mask_enabled` | Builds a soft mask `M` from the per-pixel norm of `eps_tgt − eps_src` (pre-TAG / pre-STG / pre-PN snapshot). Inspired by LatentEditor. |
 | **Source-blended localization** | `source_blend_localization_enabled` | Replaces the DDS target with `eps_src + M·(eps_tgt − eps_src)`, so the edit signal vanishes outside the mask. Motivated by LatentEditor / FoI / ZONE. |
 | **Outside-mask background anchor** | `outside_mask_anchor_weight` | Strengthens the preservation term by `w_out · (1 − M)`, tightening `x0` outside the mask. Conceptually aligned with RoMaP. |
-| **Coverage-adaptive anchor** | `outside_mask_anchor_coverage_adaptive` | Scales `w_out` by `(1 − mean(M))`. Identity-preserving scenes (small coverage, e.g. face) keep the bg anchor tight; creative-transform scenes (large coverage, e.g. stormtrooper) loosen automatically. Lets one anchor value work across scene types. |
+| **Coverage-adaptive anchor** | `outside_mask_anchor_coverage_adaptive`, `mask_coverage_threshold` | Scales `w_out` by `(1 − c)`, where `c` is a soft-thresholded robust coverage of `M`. Weak background speckle below `mask_coverage_threshold` does not count as edit support, so one anchor value transfers better across scene types. |
 | **Cross-attention semantic mask** | `cross_attention_mask_enabled` + `cross_attention_mask_{layers,weight,gamma,blur}` | Aggregates target-token cross-attention from selected UNet up-blocks, fuses with the self-mask as `M_hybrid = M_self · ((1 − w) + w · M_attn)`. Target-token selection is auto-derived from src/tgt prompts (no manual keyword overrides). Based on Prompt-to-Prompt, What the DAAM, DiffEdit, LEDITS++. |
 | **ψ schedule** | `psi_late_multiplier` | Temporal schedule on the preservation weight: `preserve_weight = ψ · (1 + (psi_late_multiplier − 1) · (1 − t_norm))`. Edit commits early, preservation tightens late. `=1.0` disables. Based on DaCapo (Huang et al., CVPR 2025). |
 | **Latent-mean anchor (N2)** | `latent_mean_anchor_weight` | Adds `λ · (mean(tgt_x0) − mean(src_x0))` per channel onto the final gradient — penalizes VAE-latent channel-mean drift and counteracts TAG brightness/saturation artifacts directly in latent statistics. `=0.0` disables. Conceptually aligned with Piva and Stable Score Distillation. |
@@ -122,7 +122,7 @@ The main DDS orchestration lives in `nerfstudio/dc/dc.py`; reusable novelty math
 |---|---|---|
 | **STG** | `stg_enabled`, `stg_scale`, `stg_skip_layers` | Runs a weak UNet pass via `STGIdentityValueAttnProcessor` on selected up-blocks and amplifies `eps = eps_full + s · (eps_full − eps_weak)`. Based on STG (Hyung et al., CVPR 2025). Target-branch only. |
 | **STG schedule** | `stg_schedule_enabled`, `stg_schedule_mode`, `stg_schedule_{start,end}_ratio`, `stg_bump_peak_ratio` | Three shapes: `"decay"` (STG early, off late — best on identity-preserving edits), `"growth"` (STG off early, on late — lets TAG commit the edit first), `"bump"` (triangle: STG peaks mid-phase and returns to 0 before the end — prevents late STG from locking in view-dependent partial-state inconsistencies on creative edits). |
-| **Coverage-adaptive STG** | `stg_coverage_adaptive` | Multiplies the scheduled STG scale by `(1 − current_coverage)` using the same-view mask built from clean pre-guidance `eps_raw`. Self-mask coverage is a proxy for scene type: small coverage (face) keeps STG near its scheduled value; large coverage (stormtrooper) fades STG toward 0 automatically, preventing it from pulling `eps_tgt` back toward the current source-image structure during creative restructuring. |
+| **Coverage-adaptive STG** | `stg_coverage_adaptive`, `mask_coverage_threshold` | Multiplies the scheduled STG scale by `(1 − current_coverage)` using robust same-view coverage from the clean pre-guidance mask. Low-confidence mask noise is ignored; large confident edit support still fades STG automatically during creative restructuring. |
 
 ### Perp-Neg branch (creative direction separation)
 
@@ -145,6 +145,7 @@ DC_CUSTOM_PARAMS = dict(
     gradient_mask_gamma=1.2,
     gradient_mask_ema_beta=0.0,
     gradient_mask_warmup=0,
+    mask_coverage_threshold=0.5,
     cross_attention_mask_enabled=True,
     cross_attention_mask_layers=[1, 2],
     cross_attention_mask_weight=0.7,

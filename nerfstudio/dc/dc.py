@@ -85,6 +85,7 @@ class DCConfig:
     gradient_mask_ema_beta: float = 0.9
     gradient_mask_gamma: float = 1.0
     gradient_mask_warmup: int = 50
+    mask_coverage_threshold: float = 0.5
     source_blend_localization_enabled: bool = False
 
     outside_mask_anchor_weight: float = 0.0
@@ -424,7 +425,14 @@ class DC(object):
             grad_mask = grad_mask.clamp(0.0, 1.0)
 
         mask_is_warmup = needs_self_mask and self.iteration < self.config.gradient_mask_warmup
-        current_mask_coverage = None if mask_is_warmup else compute_mask_coverage(grad_mask)
+        current_mask_coverage = (
+            None
+            if mask_is_warmup
+            else compute_mask_coverage(
+                grad_mask,
+                threshold=self.config.mask_coverage_threshold,
+            )
+        )
         current_stg_scale = self._get_current_stg_scale(
             current_mask_coverage=current_mask_coverage,
             iteration=iteration_for_stg,

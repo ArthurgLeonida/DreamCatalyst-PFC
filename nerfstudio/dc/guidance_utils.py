@@ -54,7 +54,7 @@ def compute_stg_scale(
     coverage_adaptive: bool,
     current_mask_coverage: Optional[float],
 ) -> float:
-    """Return scheduled STG scale, optionally attenuated by current-step coverage."""
+    """Return scheduled STG scale, optionally attenuated by robust current-step coverage."""
     if not schedule_enabled:
         scale = float(base_scale)
     else:
@@ -101,11 +101,26 @@ def compute_stg_scale(
     return scale
 
 
-def compute_mask_coverage(mask: Optional[torch.Tensor]) -> Optional[float]:
-    """Return batch-mean mask coverage as a Python scalar."""
+def compute_mask_coverage(mask: Optional[torch.Tensor], threshold: float = 0.5) -> Optional[float]:
+    """Return robust batch-mean mask coverage as a Python scalar.
+
+    Weak background speckle should not count as edit support. Values below
+    `threshold` contribute 0; values above it contribute linearly up to 1.
+    Set threshold <= 0 to recover the raw mask mean.
+    """
     if mask is None:
         return None
-    return float(mask.detach().mean().item())
+
+    mask = mask.detach().float().clamp(0.0, 1.0)
+    threshold = min(max(float(threshold), 0.0), 1.0)
+    if threshold <= 0.0:
+        coverage_mask = mask
+    elif threshold >= 1.0:
+        coverage_mask = (mask >= 1.0).float()
+    else:
+        coverage_mask = ((mask - threshold) / (1.0 - threshold)).clamp(0.0, 1.0)
+
+    return float(coverage_mask.mean().item())
 
 
 def compute_preserve_weight(
@@ -120,9 +135,9 @@ def compute_preserve_weight(
 ):
     """Compute DreamCatalyst preservation weight plus optional outside-mask anchor.
 
-    `mask_coverage` is a precomputed scalar coverage of `grad_mask`. When None
-    (e.g. during mask warmup), coverage-adaptive attenuation is skipped, matching
-    the STG scheduler's behavior.
+    `mask_coverage` is a precomputed robust scalar coverage of `grad_mask`.
+    When None (e.g. during mask warmup), coverage-adaptive attenuation is
+    skipped, matching the STG scheduler's behavior.
     """
     psi_schedule_factor = 1.0 + (psi_late_multiplier - 1.0) * (1.0 - t_normalized)
     preserve_weight = psi * psi_schedule_factor

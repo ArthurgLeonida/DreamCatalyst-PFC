@@ -22,6 +22,7 @@ DC_CUSTOM_PARAMS = dict(
     gradient_mask_gamma=1.2,
     gradient_mask_ema_beta=0.0,
     gradient_mask_warmup=0,
+    mask_coverage_threshold=0.5,
 
     cross_attention_mask_enabled=True,
     cross_attention_mask_layers=[1, 2],
