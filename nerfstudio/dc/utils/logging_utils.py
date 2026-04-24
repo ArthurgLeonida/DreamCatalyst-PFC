@@ -39,7 +39,7 @@ def log_dc_debug_to_wandb(
     t_normalized: float,
     eta_tag_current: float,
     current_stg_scale: float,
-    stg_mask_coverage: Optional[float],
+    current_edit_strength: Optional[float],
     w_dds: float,
     preserve_weight,
     eps_tgt: torch.Tensor,
@@ -94,12 +94,8 @@ def log_dc_debug_to_wandb(
         "dc_debug/effective_eps_delta_norm": effective_eps_delta,
         "dc_debug/grad_norm": grad_norm,
     }
-    if stg_mask_coverage is not None:
-        log_payload["dc_debug/stg_mask_coverage"] = float(stg_mask_coverage)
-        if grad_mask is not None:
-            log_payload["dc_debug/stg_mask_coverage_raw_mean"] = float(
-                grad_mask.detach().mean().item()
-            )
+    if current_edit_strength is not None:
+        log_payload["dc_debug/edit_strength"] = float(current_edit_strength)
 
     if self_grad_mask is not None:
         self_mask_stats = summarize_mask(self_grad_mask)

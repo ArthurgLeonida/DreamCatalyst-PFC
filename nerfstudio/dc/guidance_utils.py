@@ -51,10 +51,15 @@ def compute_stg_scale(
     start_ratio: float,
     end_ratio: float,
     bump_peak_ratio: float,
-    coverage_adaptive: bool,
-    current_mask_coverage: Optional[float],
+    edit_strength_adaptive: bool,
+    current_edit_strength: Optional[float],
 ) -> float:
-    """Return scheduled STG scale, optionally attenuated by robust current-step coverage."""
+    """Return scheduled STG scale, optionally attenuated by current-step edit strength.
+
+    `current_edit_strength` is the ratio `||eps_tgt − eps_src|| / (||eps_tgt|| + ||eps_src||)`
+    in [0, 1] — high for creative/structural edits, low for identity-preserving edits.
+    When enabled, `scale *= (1 − edit_strength)` so bold edits attenuate STG more.
+    """
     if not schedule_enabled:
         scale = float(base_scale)
     else:
@@ -94,44 +99,45 @@ def compute_stg_scale(
                 decay_progress = (progress - start_ratio) / (end_ratio - start_ratio)
                 scale = float(base_scale) * (1.0 - decay_progress)
 
-    if coverage_adaptive and current_mask_coverage is not None:
-        coverage = min(max(float(current_mask_coverage), 0.0), 1.0)
-        scale = scale * (1.0 - coverage)
+    if edit_strength_adaptive and current_edit_strength is not None:
+        s = min(max(float(current_edit_strength), 0.0), 1.0)
+        scale = scale * (1.0 - s)
 
     return scale
 
 
-def compute_mask_coverage(mask: Optional[torch.Tensor]) -> Optional[float]:
-    """Return effective-support coverage via the Herfindahl-inverse statistic.
+def compute_edit_strength(eps_tgt: torch.Tensor, eps_src: torch.Tensor) -> float:
+    """Return edit strength ∈ [0, 1] from the raw target/source noise predictions.
 
-    coverage = mean(M)**2 / mean(M**2)  ∈ [0, 1]
+        s = ||eps_tgt − eps_src|| / (||eps_tgt|| + ||eps_src||)
 
-    Interpretation: "effective fraction of pixels participating in the mask
-    mass." For a binary mask, coverage equals the area fraction of mask=1
-    pixels. For a smooth mask, it captures shape concentration — a tight
-    hotspot gives low coverage, diffuse support gives high coverage.
+    Bounded in [0, 1] by the triangle inequality. Time-invariant: numerator
+    and denominator scale together with the noise-prediction magnitude at the
+    current timestep, so the ratio cancels timestep effects.
 
-    Motivation: the self-mask and cross-attention mask are both
-    percentile-normalized inside `normalize_relevance_map`, which fixes their
-    raw means to a narrow band across scene types and destroys magnitude-based
-    discrimination. The Herfindahl inverse survives percentile normalization
-    because it is a shape statistic — the denominator mean(M**2) varies with
-    how the (near-constant) L1 mass is distributed spatially.
+    Physically: "how much the target's noise prediction diverges from the
+    source's, relative to their combined magnitude." Low for identity-preserving
+    edits (e.g. face / elf — target mostly agrees with source); high for
+    structural edits (e.g. person → stormtrooper — target pulls the latent to a
+    different rendering).
 
-    Used by the coverage-adaptive STG scale and outside-mask anchor weight as
-    `multiplier = (1 - coverage)`: localized edits (elf face, low coverage)
-    keep STG/anchor near full strength; creative edits (stormtrooper body,
-    high coverage) attenuate both — the target universal-config behavior.
+    Motivation over mask-based coverage: both the self-mask and the
+    cross-attention mask are percentile-normalized in `normalize_relevance_map`,
+    which forces their magnitudes into a narrow band across scenes. Neither raw
+    mean nor the Herfindahl-inverse shape statistic discriminates scene types
+    robustly in the direction the adaptation needs. `eps_tgt − eps_src` is the
+    raw DDS delta before any mask is built — the clean scene-level signal.
+
+    Used by the adaptive STG scale and outside-mask anchor weight as
+    `multiplier = (1 − s)`: identity edits keep STG/anchor near full strength;
+    structural edits attenuate both.
     """
-    if mask is None:
-        return None
-
-    mask = mask.detach().float().clamp(0.0, 1.0)
-    mean_m = mask.mean()
-    mean_m_sq = (mask * mask).mean()
-    if mean_m_sq.item() <= 1e-12:
-        return 0.0
-    return float((mean_m * mean_m / mean_m_sq).item())
+    delta = (eps_tgt - eps_src).detach().float()
+    tgt = eps_tgt.detach().float()
+    src = eps_src.detach().float()
+    delta_norm = delta.flatten(1).norm(dim=1)
+    denom = (tgt.flatten(1).norm(dim=1) + src.flatten(1).norm(dim=1)).clamp_min(1e-8)
+    return float((delta_norm / denom).mean().item())
 
 
 def compute_preserve_weight(
@@ -141,23 +147,24 @@ def compute_preserve_weight(
     t_normalized: float,
     grad_mask: Optional[torch.Tensor],
     outside_mask_anchor_weight: float,
-    outside_mask_anchor_coverage_adaptive: bool,
-    mask_coverage: Optional[float] = None,
+    outside_mask_anchor_edit_strength_adaptive: bool,
+    edit_strength: Optional[float] = None,
 ):
     """Compute DreamCatalyst preservation weight plus optional outside-mask anchor.
 
-    `mask_coverage` is a precomputed robust scalar coverage of `grad_mask`.
-    When None (e.g. during mask warmup), coverage-adaptive attenuation is
-    skipped, matching the STG scheduler's behavior.
+    `edit_strength` ∈ [0, 1] is the precomputed scalar from `compute_edit_strength`.
+    When the adaptive flag is on and edit_strength is provided, the anchor weight
+    is attenuated by `(1 − edit_strength)` so creative edits relax the background
+    anchor while identity edits keep it near full strength.
     """
     psi_schedule_factor = 1.0 + (psi_late_multiplier - 1.0) * (1.0 - t_normalized)
     preserve_weight = psi * psi_schedule_factor
 
     if grad_mask is not None and outside_mask_anchor_weight > 0:
         w_out_effective = outside_mask_anchor_weight
-        if outside_mask_anchor_coverage_adaptive and mask_coverage is not None:
-            coverage = min(max(float(mask_coverage), 0.0), 1.0)
-            w_out_effective = w_out_effective * (1.0 - coverage)
+        if outside_mask_anchor_edit_strength_adaptive and edit_strength is not None:
+            s = min(max(float(edit_strength), 0.0), 1.0)
+            w_out_effective = w_out_effective * (1.0 - s)
         preserve_weight = preserve_weight + w_out_effective * (1.0 - grad_mask)
 
     return preserve_weight

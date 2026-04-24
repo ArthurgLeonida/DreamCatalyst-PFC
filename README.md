@@ -104,7 +104,7 @@ The main DDS orchestration lives in `nerfstudio/dc/dc.py`; reusable novelty math
 | **Self-derived relevance mask** | `gradient_mask_enabled` | Builds a soft mask `M` from the per-pixel norm of `eps_tgt − eps_src` (pre-TAG / pre-STG / pre-PN snapshot). Inspired by LatentEditor. |
 | **Source-blended localization** | `source_blend_localization_enabled` | Replaces the DDS target with `eps_src + M·(eps_tgt − eps_src)`, so the edit signal vanishes outside the mask. Motivated by LatentEditor / FoI / ZONE. |
 | **Outside-mask background anchor** | `outside_mask_anchor_weight` | Strengthens the preservation term by `w_out · (1 − M)`, tightening `x0` outside the mask. Conceptually aligned with RoMaP. |
-| **Coverage-adaptive anchor** | `outside_mask_anchor_coverage_adaptive` | Scales `w_out` by `(1 − c)`, where `c = mean(M)² / mean(M²)` is the effective-support coverage (Herfindahl inverse / participation ratio). A shape statistic — low on tight hotspots, high on diffuse support — chosen because both the self-mask and CA mask are percentile-normalized, which collapses any magnitude-based coverage to a narrow band across scenes. |
+| **Edit-strength-adaptive anchor** | `outside_mask_anchor_edit_strength_adaptive` | Scales `w_out` by `(1 − s)`, where `s = ‖eps_tgt − eps_src‖ / (‖eps_tgt‖ + ‖eps_src‖) ∈ [0, 1]` is the scene-level edit strength from the raw pre-guidance noise predictions. Time-invariant (numerator and denominator scale together with timestep). Low on identity-preserving edits (face / elf), high on structural edits (person → stormtrooper). Replaces an earlier mask-coverage approach that was shown to be undiscriminative once both masks are percentile-normalized. |
 | **Cross-attention semantic mask** | `cross_attention_mask_enabled` + `cross_attention_mask_{layers,weight,gamma,blur}` | Aggregates target-token cross-attention from selected UNet up-blocks, fuses with the self-mask as `M_hybrid = M_self · ((1 − w) + w · M_attn)`. Target-token selection is auto-derived from src/tgt prompts (no manual keyword overrides). Based on Prompt-to-Prompt, What the DAAM, DiffEdit, LEDITS++. |
 | **ψ schedule** | `psi_late_multiplier` | Temporal schedule on the preservation weight: `preserve_weight = ψ · (1 + (psi_late_multiplier − 1) · (1 − t_norm))`. Edit commits early, preservation tightens late. `=1.0` disables. Based on DaCapo (Huang et al., CVPR 2025). |
 | **Latent-mean anchor (N2)** | `latent_mean_anchor_weight` | Adds `λ · (mean(tgt_x0) − mean(src_x0))` per channel onto the final gradient — penalizes VAE-latent channel-mean drift and counteracts TAG brightness/saturation artifacts directly in latent statistics. `=0.0` disables. Conceptually aligned with Piva and Stable Score Distillation. |
@@ -122,7 +122,7 @@ The main DDS orchestration lives in `nerfstudio/dc/dc.py`; reusable novelty math
 |---|---|---|
 | **STG** | `stg_enabled`, `stg_scale`, `stg_skip_layers` | Runs a weak UNet pass via `STGIdentityValueAttnProcessor` on selected up-blocks and amplifies `eps = eps_full + s · (eps_full − eps_weak)`. Based on STG (Hyung et al., CVPR 2025). Target-branch only. |
 | **STG schedule** | `stg_schedule_enabled`, `stg_schedule_mode`, `stg_schedule_{start,end}_ratio`, `stg_bump_peak_ratio` | Three shapes: `"decay"` (STG early, off late — best on identity-preserving edits), `"growth"` (STG off early, on late — lets TAG commit the edit first), `"bump"` (triangle: STG peaks mid-phase and returns to 0 before the end — prevents late STG from locking in view-dependent partial-state inconsistencies on creative edits). |
-| **Coverage-adaptive STG** | `stg_coverage_adaptive` | Multiplies the scheduled STG scale by `(1 − current_coverage)` using the effective-support (Herfindahl-inverse) coverage of the clean pre-guidance mask. Tight edits keep STG near full strength; diffuse / creative edits fade STG automatically. |
+| **Edit-strength-adaptive STG** | `stg_edit_strength_adaptive` | Multiplies the scheduled STG scale by `(1 − s)`, where `s` is the same per-step edit strength used by the anchor. Identity edits keep STG near full strength; structural edits fade STG automatically. |
 
 ### Perp-Neg branch (creative direction separation)
 
@@ -140,7 +140,7 @@ DC_CUSTOM_PARAMS = dict(
     source_blend_localization_enabled=True,
     gradient_mask_enabled=False,
     outside_mask_anchor_weight=0.2,
-    outside_mask_anchor_coverage_adaptive=True,
+    outside_mask_anchor_edit_strength_adaptive=True,
     gradient_mask_blur=1.0,
     gradient_mask_gamma=1.2,
     gradient_mask_ema_beta=0.0,
@@ -167,7 +167,7 @@ DC_CUSTOM_PARAMS = dict(
     stg_schedule_end_ratio=0.7,
     stg_schedule_mode="bump",        # "decay" | "growth" | "bump"
     stg_bump_peak_ratio=0.5,         # only used in "bump" mode
-    stg_coverage_adaptive=True,
+    stg_edit_strength_adaptive=True,
 
     # Perp-Neg (optional; earlier depth/cached-mask variants retired)
     perp_neg=False,

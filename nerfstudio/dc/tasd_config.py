@@ -16,7 +16,7 @@ DC_CUSTOM_PARAMS = dict(
     source_blend_localization_enabled=True,
     gradient_mask_enabled=False,
     outside_mask_anchor_weight=0.2,
-    outside_mask_anchor_coverage_adaptive=True,
+    outside_mask_anchor_edit_strength_adaptive=True,
 
     gradient_mask_blur=1.0,
     gradient_mask_gamma=1.2,
@@ -60,7 +60,7 @@ DC_CUSTOM_PARAMS = dict(
     #              view-dependent inconsistencies at the end of training.
     stg_schedule_mode="bump",
     stg_bump_peak_ratio=0.5,
-    stg_coverage_adaptive=True,
+    stg_edit_strength_adaptive=True,
 
     # ---------------------------------------------------------------------
     # 4. Perp-Neg branch (optional)

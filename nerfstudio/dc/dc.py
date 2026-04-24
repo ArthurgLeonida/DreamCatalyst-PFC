@@ -18,7 +18,7 @@ from dc.guidance_utils import (
     apply_source_blend,
     apply_stg,
     apply_tag,
-    compute_mask_coverage,
+    compute_edit_strength,
     compute_preserve_weight,
     compute_stg_scale,
     compute_tag_eta,
@@ -77,7 +77,7 @@ class DCConfig:
     stg_schedule_end_ratio: float = 1.0
     stg_schedule_mode: str = "decay"
     stg_bump_peak_ratio: float = 0.5
-    stg_coverage_adaptive: bool = False
+    stg_edit_strength_adaptive: bool = False
 
     # Self-derived relevance masking
     gradient_mask_enabled: bool = False
@@ -88,7 +88,7 @@ class DCConfig:
     source_blend_localization_enabled: bool = False
 
     outside_mask_anchor_weight: float = 0.0
-    outside_mask_anchor_coverage_adaptive: bool = False
+    outside_mask_anchor_edit_strength_adaptive: bool = False
 
     cross_attention_mask_enabled: bool = False
     cross_attention_mask_layers: List[int] = field(default_factory=lambda: [1, 2])
@@ -243,8 +243,8 @@ class DC(object):
                 self.tgt_prompt = tgt_prompt
                 self.tgt_text_feature = self.encode_text(tgt_prompt)
 
-    def _get_current_stg_scale(self, current_mask_coverage=None, iteration=None) -> float:
-        """Return scheduled STG scale, optionally using current same-view coverage."""
+    def _get_current_stg_scale(self, current_edit_strength=None, iteration=None) -> float:
+        """Return scheduled STG scale, optionally attenuated by current edit strength."""
         if iteration is None:
             iteration = self.iteration
         return compute_stg_scale(
@@ -256,8 +256,8 @@ class DC(object):
             start_ratio=self.config.stg_schedule_start_ratio,
             end_ratio=self.config.stg_schedule_end_ratio,
             bump_peak_ratio=self.config.stg_bump_peak_ratio,
-            coverage_adaptive=self.config.stg_coverage_adaptive,
-            current_mask_coverage=current_mask_coverage,
+            edit_strength_adaptive=self.config.stg_edit_strength_adaptive,
+            current_edit_strength=current_edit_strength,
         )
 
     def dc_timestep_sampling(self, batch_size):
@@ -396,7 +396,6 @@ class DC(object):
             or self.config.source_blend_localization_enabled
             or self.config.outside_mask_anchor_weight > 0
             or self.config.cross_attention_mask_enabled
-            or self.config.stg_coverage_adaptive
         )
 
         if needs_self_mask:
@@ -423,11 +422,11 @@ class DC(object):
                 grad_mask = self_mask * ((1.0 - weight) + weight * cross_attention_mask)
             grad_mask = grad_mask.clamp(0.0, 1.0)
 
-        mask_is_warmup = needs_self_mask and self.iteration < self.config.gradient_mask_warmup
-        
-        current_mask_coverage = None if mask_is_warmup else compute_mask_coverage(grad_mask)
+        # Edit strength is computed from the raw eps_raw snapshot (pre-STG / pre-TAG /
+        # pre-Perp-Neg), so it is available from step 1 — no warmup gating needed.
+        current_edit_strength = compute_edit_strength(eps_raw["tgt"], eps_raw["src"])
         current_stg_scale = self._get_current_stg_scale(
-            current_mask_coverage=current_mask_coverage,
+            current_edit_strength=current_edit_strength,
             iteration=iteration_for_stg,
         )
 
@@ -470,8 +469,8 @@ class DC(object):
             t_normalized=t_normalized,
             grad_mask=grad_mask,
             outside_mask_anchor_weight=self.config.outside_mask_anchor_weight,
-            outside_mask_anchor_coverage_adaptive=self.config.outside_mask_anchor_coverage_adaptive,
-            mask_coverage=current_mask_coverage,
+            outside_mask_anchor_edit_strength_adaptive=self.config.outside_mask_anchor_edit_strength_adaptive,
+            edit_strength=current_edit_strength,
         )
 
         w_DDS = self.config.delta + self.config.gamma * (t_normalized ** (1/math.e))
@@ -504,7 +503,7 @@ class DC(object):
                 t_normalized=t_normalized,
                 eta_tag_current=eta_tag_current,
                 current_stg_scale=current_stg_scale if self.config.stg_enabled else 0.0,
-                stg_mask_coverage=current_mask_coverage,
+                current_edit_strength=current_edit_strength,
                 w_dds=w_DDS,
                 preserve_weight=preserve_weight,
                 eps_tgt=eps["tgt"],
@@ -528,7 +527,7 @@ class DC(object):
                 "grad_mask": grad_mask,
                 "self_grad_mask": self_grad_mask,
                 "cross_attention_mask": cross_attention_mask,
-                "mask_coverage": current_mask_coverage,
+                "edit_strength": current_edit_strength,
                 "stg_scale": current_stg_scale if self.config.stg_enabled else 0.0,
             }
             return dic
