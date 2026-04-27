@@ -96,9 +96,6 @@ class DCConfig:
     cross_attention_mask_blur: float = 0.0
     cross_attention_mask_gamma: float = 1.0
 
-    # DaCapo-inspired ψ schedule (Huang et al., CVPR 2025).
-    psi_late_multiplier: float = 1.0
-
     latent_mean_anchor_weight: float = 0.0
 
 
@@ -465,8 +462,6 @@ class DC(object):
 
         preserve_weight = compute_preserve_weight(
             psi=self.config.psi,
-            psi_late_multiplier=self.config.psi_late_multiplier,
-            t_normalized=t_normalized,
             grad_mask=grad_mask,
             outside_mask_anchor_weight=self.config.outside_mask_anchor_weight,
             outside_mask_anchor_edit_strength_adaptive=self.config.outside_mask_anchor_edit_strength_adaptive,

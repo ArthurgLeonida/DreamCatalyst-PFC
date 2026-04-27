@@ -143,8 +143,6 @@ def compute_edit_strength(eps_tgt: torch.Tensor, eps_src: torch.Tensor) -> float
 def compute_preserve_weight(
     *,
     psi: float,
-    psi_late_multiplier: float,
-    t_normalized: float,
     grad_mask: Optional[torch.Tensor],
     outside_mask_anchor_weight: float,
     outside_mask_anchor_edit_strength_adaptive: bool,
@@ -157,8 +155,7 @@ def compute_preserve_weight(
     is attenuated by `(1 − edit_strength)` so creative edits relax the background
     anchor while identity edits keep it near full strength.
     """
-    psi_schedule_factor = 1.0 + (psi_late_multiplier - 1.0) * (1.0 - t_normalized)
-    preserve_weight = psi * psi_schedule_factor
+    preserve_weight = psi
 
     if grad_mask is not None and outside_mask_anchor_weight > 0:
         w_out_effective = outside_mask_anchor_weight

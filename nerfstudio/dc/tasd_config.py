@@ -29,9 +29,6 @@ DC_CUSTOM_PARAMS = dict(
     cross_attention_mask_blur=0.5,
     cross_attention_mask_gamma=1.2,
 
-    # DaCapo-inspired ψ schedule (Huang et al., CVPR 2025). =1.0 disables.
-    psi_late_multiplier=1.0,
-
     latent_mean_anchor_weight=0.005,
 
     # ---------------------------------------------------------------------

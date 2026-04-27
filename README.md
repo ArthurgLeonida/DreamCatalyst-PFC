@@ -106,7 +106,6 @@ The main DDS orchestration lives in `nerfstudio/dc/dc.py`; reusable novelty math
 | **Outside-mask background anchor** | `outside_mask_anchor_weight` | Strengthens the preservation term by `w_out · (1 − M)`, tightening `x0` outside the mask. Conceptually aligned with RoMaP. |
 | **Edit-strength-adaptive anchor** | `outside_mask_anchor_edit_strength_adaptive` | Scales `w_out` by `(1 − s)`, where `s = ‖eps_tgt − eps_src‖ / (‖eps_tgt‖ + ‖eps_src‖) ∈ [0, 1]` is the scene-level edit strength from the raw pre-guidance noise predictions. Time-invariant (numerator and denominator scale together with timestep). Low on identity-preserving edits (face / elf), high on structural edits (person → stormtrooper). Replaces an earlier mask-coverage approach that was shown to be undiscriminative once both masks are percentile-normalized. |
 | **Cross-attention semantic mask** | `cross_attention_mask_enabled` + `cross_attention_mask_{layers,weight,gamma,blur}` | Aggregates target-token cross-attention from selected UNet up-blocks, fuses with the self-mask as `M_hybrid = M_self · ((1 − w) + w · M_attn)`. Target-token selection is auto-derived from src/tgt prompts (no manual keyword overrides). Based on Prompt-to-Prompt, What the DAAM, DiffEdit, LEDITS++. |
-| **ψ schedule** | `psi_late_multiplier` | Temporal schedule on the preservation weight: `preserve_weight = ψ · (1 + (psi_late_multiplier − 1) · (1 − t_norm))`. Edit commits early, preservation tightens late. `=1.0` disables. Based on DaCapo (Huang et al., CVPR 2025). |
 | **Latent-mean anchor (N2)** | `latent_mean_anchor_weight` | Adds `λ · (mean(tgt_x0) − mean(src_x0))` per channel onto the final gradient — penalizes VAE-latent channel-mean drift and counteracts TAG brightness/saturation artifacts directly in latent statistics. `=0.0` disables. Conceptually aligned with Piva and Stable Score Distillation. |
 
 ### TAG branch (edit strength)
@@ -150,7 +149,6 @@ DC_CUSTOM_PARAMS = dict(
     cross_attention_mask_weight=0.7,
     cross_attention_mask_blur=0.5,
     cross_attention_mask_gamma=1.2,
-    psi_late_multiplier=1.0,         # DaCapo-inspired ψ schedule (1.0 = off)
     latent_mean_anchor_weight=0.005, # N2: latent-mean anchor (0.0 = off)
 
     # TAG
