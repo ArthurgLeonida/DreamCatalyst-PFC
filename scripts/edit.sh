@@ -40,6 +40,13 @@ PROJECT_NAME="${PROJECT_NAME:-dreamcatalyst-pfc}"
 EXPERIMENT_NAME="${RUN_NAME:-${SCENE}_dc_edit}"
 EVAL_AFTER_EDIT="${EVAL_AFTER_EDIT:-1}"
 EVAL_DEVICE="${EVAL_DEVICE:-cuda}"
+MASK_VOXEL_CACHE="${MASK_VOXEL_CACHE:-0}"
+MASK_VOXEL_CACHE_RESOLUTION="${MASK_VOXEL_CACHE_RESOLUTION:-128}"
+MASK_VOXEL_CACHE_EMA_BETA="${MASK_VOXEL_CACHE_EMA_BETA:-0.9}"
+MASK_VOXEL_CACHE_WARMUP_START="${MASK_VOXEL_CACHE_WARMUP_START:-700}"
+MASK_VOXEL_CACHE_WARMUP_END="${MASK_VOXEL_CACHE_WARMUP_END:-1500}"
+MASK_VOXEL_CACHE_MAX_BLEND="${MASK_VOXEL_CACHE_MAX_BLEND:-0.5}"
+MASK_VOXEL_CACHE_ACCUMULATION_THRESHOLD="${MASK_VOXEL_CACHE_ACCUMULATION_THRESHOLD:-0.3}"
 RUN_DIR=""
 TRAIN_LOG=""
 
@@ -109,6 +116,7 @@ echo " Src:       ${SRC_PROMPT}"
 echo " Tgt:       ${TGT_PROMPT}"
 echo " Load from: ${LOAD_DIR}"
 echo " GPUs:      ${CUDA_VISIBLE_DEVICES}"
+echo " Voxel 3D:  ${MASK_VOXEL_CACHE}"
 echo "============================================"
 
 if [ ! -f "${DATA_DIR}/transforms.json" ]; then
@@ -141,6 +149,18 @@ CMD=(ns-train "${METHOD}" \
     --pipeline.dc.sd-pretrained-model-or-path timbrooks/instruct-pix2pix \
     pipeline.datamanager:"${DM_CONFIG}" \
     --pipeline.datamanager.dataparser.downscale-factor "${DOWN_SCALE}")
+
+if [ "${MASK_VOXEL_CACHE}" = "1" ]; then
+    CMD+=(
+        --pipeline.mask-voxel-cache-enabled True
+        --pipeline.mask-voxel-cache-resolution "${MASK_VOXEL_CACHE_RESOLUTION}"
+        --pipeline.mask-voxel-cache-ema-beta "${MASK_VOXEL_CACHE_EMA_BETA}"
+        --pipeline.mask-voxel-cache-warmup-start "${MASK_VOXEL_CACHE_WARMUP_START}"
+        --pipeline.mask-voxel-cache-warmup-end "${MASK_VOXEL_CACHE_WARMUP_END}"
+        --pipeline.mask-voxel-cache-max-blend "${MASK_VOXEL_CACHE_MAX_BLEND}"
+        --pipeline.mask-voxel-cache-accumulation-threshold "${MASK_VOXEL_CACHE_ACCUMULATION_THRESHOLD}"
+    )
+fi
 
 TRAIN_LOG="$(mktemp -t edit-train-XXXXXX.log)"
 echo "[edit.sh] Capturing training log to ${TRAIN_LOG}"

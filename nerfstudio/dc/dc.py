@@ -285,6 +285,9 @@ class DC(object):
         return_dict=False,
         step=0,
         current_spot=0,
+        external_grad_mask=None,
+        external_grad_mask_valid=None,
+        external_mask_blend=0.0,
     ):
         device = self.device
         scheduler = self.scheduler
@@ -419,6 +422,46 @@ class DC(object):
                 grad_mask = self_mask * ((1.0 - weight) + weight * cross_attention_mask)
             grad_mask = grad_mask.clamp(0.0, 1.0)
 
+        internal_grad_mask = grad_mask.detach().clone() if grad_mask is not None else None
+
+        # Optional external (e.g. 3D-voxel-cache-derived) mask override.
+        # Blended with the internal hybrid mask via `external_mask_blend ∈ [0, 1]`:
+        #   blend = 0 → use the internal per-view hybrid (current default behavior).
+        #   blend = 1 → use the external mask exclusively.
+        # The pipeline ramps `blend` from 0 toward 1 over a warmup window so the
+        # 3D cache has time to populate from many views before it dominates.
+        # If a validity map is provided, invalid cache pixels fall back to the
+        # internal mask instead of injecting the cache fallback value.
+        if external_grad_mask is not None:
+            blend = min(max(float(external_mask_blend), 0.0), 1.0)
+            ext = external_grad_mask
+            target_shape = grad_mask.shape[-2:] if grad_mask is not None else ext.shape[-2:]
+            if ext.shape[-2:] != target_shape:
+                ext = F.interpolate(
+                    ext,
+                    size=target_shape,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            ext = ext.to(device=eps_raw["tgt"].device, dtype=eps_raw["tgt"].dtype).clamp(0.0, 1.0)
+            valid = None
+            if external_grad_mask_valid is not None:
+                valid = external_grad_mask_valid
+                if valid.dim() == 2:
+                    valid = valid.unsqueeze(0).unsqueeze(0)
+                elif valid.dim() == 3:
+                    valid = valid.unsqueeze(0)
+                valid = valid.to(device=eps_raw["tgt"].device, dtype=torch.float32)
+                if valid.shape[-2:] != target_shape:
+                    valid = F.interpolate(valid, size=target_shape, mode="nearest")
+                valid = valid > 0.5
+            if grad_mask is None:
+                grad_mask = ext
+            else:
+                blended_mask = (1.0 - blend) * grad_mask + blend * ext
+                grad_mask = torch.where(valid, blended_mask, grad_mask) if valid is not None else blended_mask
+            grad_mask = grad_mask.clamp(0.0, 1.0)
+
         # Edit strength is computed from the raw eps_raw snapshot (pre-STG / pre-TAG /
         # pre-Perp-Neg), so it is available from step 1 — no warmup gating needed.
         current_edit_strength = compute_edit_strength(eps_raw["tgt"], eps_raw["src"])
@@ -520,6 +563,7 @@ class DC(object):
                 "grad": grad,
                 "t": t,
                 "grad_mask": grad_mask,
+                "internal_grad_mask": internal_grad_mask,
                 "self_grad_mask": self_grad_mask,
                 "cross_attention_mask": cross_attention_mask,
                 "edit_strength": current_edit_strength,
