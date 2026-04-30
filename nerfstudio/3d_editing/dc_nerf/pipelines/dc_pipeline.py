@@ -77,6 +77,16 @@ class DCPipelineConfig(VanillaPipelineConfig):
     # before constructing the cache. Cache is dormant during this window, then
     # built once at iteration `bbox_observe_steps` and used onward.
     mask_voxel_cache_bbox_observe_steps: int = 50
+    # Per-iteration quantile clip applied to observed world points. Robust
+    # alternative to min/max — clips far-depth outliers from low-confidence
+    # rays so the bbox tightly fits the actual subject region.
+    #   0.0  → use min/max (old behavior, sensitive to far-plane outliers).
+    #   0.05 → use 5th/95th percentile per iteration (default, robust).
+    # Empirical motivation: with min/max + accumulation_threshold=0.05, the
+    # observed bbox extent ballooned to ~240 units along x/z (subject is ~2),
+    # making 64³ voxels too coarse to distinguish body parts. Percentile
+    # clipping at 5/95 collapses the bbox to the actual surface support.
+    mask_voxel_cache_bbox_observe_quantile: float = 0.05
     # Inflation factor around the chosen AABB. With "observed" source the
     # bbox already contains all observed points, so a small margin (10–25%)
     # is enough. With "cameras" or "scene_box", more inflation is usually
@@ -251,11 +261,21 @@ class DCPipeline(ModifiedVanillaPipeline):
         )
 
     def _observe_points(self, points_world: torch.Tensor, valid: torch.Tensor) -> None:
-        """Accumulate per-axis min/max of *valid* backprojected world points.
+        """Accumulate robust per-axis bounds of valid backprojected world points.
 
         Called during the bbox-observation window (when bbox_source="observed"
         and the cache hasn't been built yet). Once enough iterations have been
         observed, `_ensure_voxel_cache()` will pick up these accumulated bounds.
+
+        Per-iteration robustification:
+          - With `bbox_observe_quantile = 0` we take the literal per-axis
+            min/max for each iteration (sensitive to far-depth outliers).
+          - With `bbox_observe_quantile = q ∈ (0, 0.5)` we take the (q, 1-q)
+            quantile per iteration, which clips long-tail outliers from
+            low-confidence rays while preserving the legitimate surface
+            extent. Across iterations we accumulate the cross-iteration
+            min(of-low-quantile) and max(of-high-quantile), giving a bbox
+            that tightly fits the union of well-supported surface regions.
         """
         valid = valid.reshape(-1).to(self.device)
         pts = points_world.reshape(-1, 3).to(self.device).float()
@@ -264,8 +284,15 @@ class DCPipeline(ModifiedVanillaPipeline):
         pts = pts[torch.isfinite(pts).all(dim=-1)]
         if pts.numel() == 0:
             return
-        cur_min = pts.min(dim=0).values
-        cur_max = pts.max(dim=0).values
+
+        q = float(self.config.mask_voxel_cache_bbox_observe_quantile)
+        q = min(max(q, 0.0), 0.49)
+        if q <= 0.0:
+            cur_min = pts.min(dim=0).values
+            cur_max = pts.max(dim=0).values
+        else:
+            cur_min = torch.quantile(pts, q, dim=0)
+            cur_max = torch.quantile(pts, 1.0 - q, dim=0)
         if self._observed_pts_min is None:
             self._observed_pts_min = cur_min
             self._observed_pts_max = cur_max
