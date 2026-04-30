@@ -55,6 +55,22 @@ class DCPipelineConfig(VanillaPipelineConfig):
     mask_voxel_cache_warmup_end: int = 1500
     mask_voxel_cache_max_blend: float = 0.5
     mask_voxel_cache_accumulation_threshold: float = 0.3
+    # Source for the cache's world-space bbox.
+    #   "cameras"   — derive from camera-position AABB inflated by `bbox_inflation`.
+    #                 Robust default: rays generated from these cameras are in the
+    #                 same coordinate frame by construction.
+    #   "scene_box" — use `dataparser_outputs.scene_box.aabb`. Faster but only
+    #                 correct when the dataparser sets scene_box in the same
+    #                 frame as `Cameras.generate_rays(...)` returns. Some
+    #                 dataparsers normalize cameras while leaving scene_box in
+    #                 raw world units (or vice versa), which silently drops most
+    #                 backprojected points out of the bbox.
+    mask_voxel_cache_bbox_source: str = "cameras"
+    # Inflation factor applied around the camera-positions AABB (or scene_box).
+    # Cameras orbit *around* the scene; the actual scene content extends beyond
+    # the camera-position AABB along the viewing direction. 0.5 = inflate by 50%
+    # in each direction, which is generous but cheap given coarse voxel sizes.
+    mask_voxel_cache_bbox_inflation: float = 0.5
 
 
 class DCPipeline(ModifiedVanillaPipeline):
@@ -89,6 +105,7 @@ class DCPipeline(ModifiedVanillaPipeline):
         # Initialized lazily on first iteration so we have access to the
         # scene bounding box from the dataparser.
         self.mask_voxel_cache: Optional[MaskVoxelCache] = None
+        self.mask_voxel_cache_start_step: Optional[int] = None
 
     def get_current_rendering(self, step):
         if getattr(self, "current_spot", None) is None or step % self.config.change_view_step == 0:
@@ -130,25 +147,74 @@ class DCPipeline(ModifiedVanillaPipeline):
         return rendered_image, current_spot, depth_world, accumulation_world, ray_origins, ray_directions
 
     def _ensure_voxel_cache(self):
-        """Lazy-initialize the voxel cache from the dataparser scene box.
+        """Lazy-initialize the voxel cache.
 
-        Reference: `dataparser_outputs.scene_box.aabb` is the standard
-        Nerfstudio scene-bounds tensor, shape [2, 3] = [[x_min, y_min, z_min],
-        [x_max, y_max, z_max]]. Pad slightly so rays grazing the boundary
-        still fall inside.
+        Two bbox sources are supported, selected by
+        `config.mask_voxel_cache_bbox_source`:
+
+        - "cameras" (default, robust):
+            Derive from the AABB of camera positions
+            (`cameras.camera_to_worlds[..., :3, 3]`), inflated by
+            `bbox_inflation`. By construction, rays generated from these
+            cameras are in the same coordinate frame, so backprojected
+            world points cannot fall outside the bbox due to a frame
+            mismatch.
+
+        - "scene_box":
+            Use `dataparser_outputs.scene_box.aabb`. Fast but assumes the
+            dataparser keeps scene_box in the same frame as the cameras —
+            which several Nerfstudio dataparsers do not (some normalize
+            cameras to a unit cube while leaving `scene_box.aabb` in raw
+            world units, or vice versa). When this assumption fails, most
+            backprojected points fall outside the bbox and the cache
+            populates extremely sparsely (the symptom on the prior run:
+            occupancy ~1.2%, valid_ratio ~0.5%).
+
+        The chosen bbox is printed once at init so you can eyeball it
+        against the camera positions and any depth statistics in WandB.
         """
         if self.mask_voxel_cache is not None:
             return
         if not self.config.mask_voxel_cache_enabled:
             return
-        scene_box = self.datamanager.train_dataparser_outputs.scene_box
-        aabb = scene_box.aabb.to(self.device)  # [2, 3]
-        bbox_min = aabb[0]
-        bbox_max = aabb[1]
-        # Inflate by 5% per side to absorb edge cases at the bbox boundary.
-        extent = bbox_max - bbox_min
-        bbox_min = bbox_min - 0.05 * extent
-        bbox_max = bbox_max + 0.05 * extent
+
+        source = str(self.config.mask_voxel_cache_bbox_source).lower()
+        inflation = float(self.config.mask_voxel_cache_bbox_inflation)
+        cameras = self.datamanager.train_dataparser_outputs.cameras
+
+        if source == "cameras":
+            # Camera-position AABB. cameras.camera_to_worlds is [..., 3, 4];
+            # the last column is the translation (= camera origin in world).
+            c2w = cameras.camera_to_worlds.to(self.device)
+            if c2w.dim() == 2:
+                c2w = c2w.unsqueeze(0)
+            cam_pos = c2w[..., :3, 3].reshape(-1, 3).float()
+            bbox_min = cam_pos.min(dim=0).values
+            bbox_max = cam_pos.max(dim=0).values
+        elif source == "scene_box":
+            scene_box = self.datamanager.train_dataparser_outputs.scene_box
+            aabb = scene_box.aabb.to(self.device).float()
+            bbox_min = aabb[0]
+            bbox_max = aabb[1]
+        else:
+            raise ValueError(
+                f"Unknown mask_voxel_cache_bbox_source={source!r}; "
+                f"expected 'cameras' or 'scene_box'."
+            )
+
+        center = 0.5 * (bbox_min + bbox_max)
+        half_extent = 0.5 * (bbox_max - bbox_min) * (1.0 + inflation)
+        bbox_min = center - half_extent
+        bbox_max = center + half_extent
+
+        print(
+            f"[voxel cache] source={source}, inflation={inflation:.2f}, "
+            f"resolution={self.config.mask_voxel_cache_resolution}"
+        )
+        print(f"[voxel cache] bbox_min = {bbox_min.tolist()}")
+        print(f"[voxel cache] bbox_max = {bbox_max.tolist()}")
+        print(f"[voxel cache] extent   = {(bbox_max - bbox_min).tolist()}")
+
         self.mask_voxel_cache = MaskVoxelCache(
             bbox_min=bbox_min,
             bbox_max=bbox_max,
@@ -157,7 +223,19 @@ class DCPipeline(ModifiedVanillaPipeline):
             device=self.device,
         )
 
-    def _voxel_cache_warmup_blend(self, step: int) -> float:
+    def _voxel_cache_edit_step(self, step: int) -> int:
+        """Return a zero-based edit-local step.
+
+        Nerfstudio's trainer step can resume from the reconstruction checkpoint
+        step (for example 30000), but the voxel cache starts empty at the
+        beginning of the edit run. Warmup must therefore use edit-local time,
+        not the global trainer step.
+        """
+        if self.mask_voxel_cache_start_step is None:
+            self.mask_voxel_cache_start_step = int(step)
+        return max(0, int(step) - self.mask_voxel_cache_start_step)
+
+    def _voxel_cache_warmup_blend(self, edit_step: int) -> float:
         """Linear ramp from 0 → max_blend over [warmup_start, warmup_end].
 
         Same shape as your existing `gradient_mask_warmup` pattern, just
@@ -167,7 +245,7 @@ class DCPipeline(ModifiedVanillaPipeline):
         e = self.config.mask_voxel_cache_warmup_end
         if e <= s:
             return float(self.config.mask_voxel_cache_max_blend)
-        progress = max(0, step - s) / max(1, e - s)
+        progress = max(0, edit_step - s) / max(1, e - s)
         progress = min(max(progress, 0.0), 1.0)
         return float(progress * self.config.mask_voxel_cache_max_blend)
 
@@ -224,6 +302,7 @@ class DCPipeline(ModifiedVanillaPipeline):
         external_mask_blend = 0.0
         mask_world_points = None
         mask_world_points_valid = None
+        voxel_cache_edit_step = None
         if (
             self.config.mask_voxel_cache_enabled
             and depth_world is not None
@@ -231,6 +310,7 @@ class DCPipeline(ModifiedVanillaPipeline):
             and ray_directions is not None
         ):
             self._ensure_voxel_cache()
+            voxel_cache_edit_step = self._voxel_cache_edit_step(step)
             mask_h, mask_w = x0.shape[-2:]
             # Move spatial maps to [B, C, H, W] for F.interpolate, then to mask resolution.
             d = depth_world.to(self.dc_device)
@@ -273,7 +353,49 @@ class DCPipeline(ModifiedVanillaPipeline):
                 device=x0.device, dtype=x0.dtype
             )
             external_grad_mask_valid = cache_valid.view(1, 1, mask_h, mask_w).to(device=x0.device)
-            external_mask_blend = self._voxel_cache_warmup_blend(step)
+            external_mask_blend = self._voxel_cache_warmup_blend(voxel_cache_edit_step)
+
+            # ----------------------------------------------------------------
+            # Diagnostic logging — disentangle the failure modes that show up
+            # as a low `valid_ratio`. The chart names are deliberately
+            # structured so a glance answers:
+            #   - Are world points inside the bbox at all?
+            #     (`voxel_pure_in_bbox_frac`)
+            #   - Do they pass the accumulation/depth filter?
+            #     (`voxel_acc_filter_pass_frac`)
+            #   - Is the NeRF actually solid where rays land?
+            #     (`voxel_mean_accumulation`)
+            #   - And the spatial extent of points being projected this step
+            #     (`voxel_pts_{min,max}_{x,y,z}`) — compare against the bbox
+            #     printed at cache init to confirm coordinate alignment.
+            # ----------------------------------------------------------------
+            if self.use_wandb and step % self.config.log_step == 0:
+                import wandb
+                with torch.no_grad():
+                    pts = mask_world_points
+                    pts_min = pts.min(dim=0).values
+                    pts_max = pts.max(dim=0).values
+                    bbox_lo = self.mask_voxel_cache.bbox_min
+                    bbox_hi = self.mask_voxel_cache.bbox_max
+                    norm = (pts - bbox_lo) / (bbox_hi - bbox_lo).clamp_min(1e-8)
+                    pure_in_bbox = ((norm >= 0.0) & (norm < 1.0)).all(dim=-1).float().mean()
+                    acc_pass = mask_world_points_valid.float().mean()
+                    mean_acc = acc.float().mean() if acc is not None else torch.tensor(1.0)
+                    wandb.log(
+                        {
+                            "dc_debug/voxel_pts_min_x": float(pts_min[0]),
+                            "dc_debug/voxel_pts_min_y": float(pts_min[1]),
+                            "dc_debug/voxel_pts_min_z": float(pts_min[2]),
+                            "dc_debug/voxel_pts_max_x": float(pts_max[0]),
+                            "dc_debug/voxel_pts_max_y": float(pts_max[1]),
+                            "dc_debug/voxel_pts_max_z": float(pts_max[2]),
+                            "dc_debug/voxel_pure_in_bbox_frac": float(pure_in_bbox),
+                            "dc_debug/voxel_acc_filter_pass_frac": float(acc_pass),
+                            "dc_debug/voxel_mean_accumulation": float(mean_acc),
+                        },
+                        step=step,
+                        commit=False,
+                    )
 
         dic = self.dc(
             tgt_x0=x0,
@@ -322,6 +444,7 @@ class DCPipeline(ModifiedVanillaPipeline):
                         "dc_debug/voxel_cache_occupancy": float(self.mask_voxel_cache.occupancy),
                         "dc_debug/voxel_cache_blend": float(external_mask_blend),
                         "dc_debug/voxel_cache_valid_ratio": valid_ratio,
+                        "dc_debug/voxel_cache_edit_step": float(voxel_cache_edit_step or 0),
                     },
                     step=step,
                     commit=False,

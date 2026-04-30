@@ -146,9 +146,7 @@ CMD=(ns-train "${METHOD}" \
     --pipeline.dc.max-iteration "${MAX_ITERS}" \
     --pipeline.dc.guidance-scale 7.5 \
     --pipeline.dc-device "cuda:0" \
-    --pipeline.dc.sd-pretrained-model-or-path timbrooks/instruct-pix2pix \
-    pipeline.datamanager:"${DM_CONFIG}" \
-    --pipeline.datamanager.dataparser.downscale-factor "${DOWN_SCALE}")
+    --pipeline.dc.sd-pretrained-model-or-path timbrooks/instruct-pix2pix)
 
 if [ "${MASK_VOXEL_CACHE}" = "1" ]; then
     CMD+=(
@@ -161,6 +159,11 @@ if [ "${MASK_VOXEL_CACHE}" = "1" ]; then
         --pipeline.mask-voxel-cache-accumulation-threshold "${MASK_VOXEL_CACHE_ACCUMULATION_THRESHOLD}"
     )
 fi
+
+CMD+=(
+    pipeline.datamanager:"${DM_CONFIG}"
+    --pipeline.datamanager.dataparser.downscale-factor "${DOWN_SCALE}"
+)
 
 TRAIN_LOG="$(mktemp -t edit-train-XXXXXX.log)"
 echo "[edit.sh] Capturing training log to ${TRAIN_LOG}"
