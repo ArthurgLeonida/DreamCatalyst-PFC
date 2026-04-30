@@ -56,21 +56,32 @@ class DCPipelineConfig(VanillaPipelineConfig):
     mask_voxel_cache_max_blend: float = 0.5
     mask_voxel_cache_accumulation_threshold: float = 0.3
     # Source for the cache's world-space bbox.
-    #   "cameras"   — derive from camera-position AABB inflated by `bbox_inflation`.
-    #                 Robust default: rays generated from these cameras are in the
-    #                 same coordinate frame by construction.
-    #   "scene_box" — use `dataparser_outputs.scene_box.aabb`. Faster but only
-    #                 correct when the dataparser sets scene_box in the same
-    #                 frame as `Cameras.generate_rays(...)` returns. Some
-    #                 dataparsers normalize cameras while leaving scene_box in
-    #                 raw world units (or vice versa), which silently drops most
-    #                 backprojected points out of the bbox.
-    mask_voxel_cache_bbox_source: str = "cameras"
-    # Inflation factor applied around the camera-positions AABB (or scene_box).
-    # Cameras orbit *around* the scene; the actual scene content extends beyond
-    # the camera-position AABB along the viewing direction. 0.5 = inflate by 50%
-    # in each direction, which is generous but cheap given coarse voxel sizes.
-    mask_voxel_cache_bbox_inflation: float = 0.5
+    #   "observed" (default) — observe `bbox_observe_steps` iterations of
+    #                          backprojected world points first, take their
+    #                          AABB, inflate by `bbox_inflation`, then build
+    #                          the cache. By construction this bbox contains
+    #                          exactly the points the cache will need to index.
+    #                          Robust to any dataparser convention.
+    #   "cameras"            — camera-position AABB inflated by `bbox_inflation`.
+    #                          WARNING: for object-centric capture (cameras
+    #                          looking inward at a subject), the subject is
+    #                          *outside* the camera AABB along the viewing
+    #                          direction — every backprojected point will fall
+    #                          out of bbox. Diagnosed empirically: failed with
+    #                          `voxel_pure_in_bbox_frac = 0` on the clown scene.
+    #   "scene_box"          — use `dataparser_outputs.scene_box.aabb`. Fast
+    #                          but only correct when the dataparser sets
+    #                          scene_box in the same frame as the rays.
+    mask_voxel_cache_bbox_source: str = "observed"
+    # For "observed" source: number of iterations to accumulate world points
+    # before constructing the cache. Cache is dormant during this window, then
+    # built once at iteration `bbox_observe_steps` and used onward.
+    mask_voxel_cache_bbox_observe_steps: int = 50
+    # Inflation factor around the chosen AABB. With "observed" source the
+    # bbox already contains all observed points, so a small margin (10–25%)
+    # is enough. With "cameras" or "scene_box", more inflation is usually
+    # needed.
+    mask_voxel_cache_bbox_inflation: float = 0.2
 
 
 class DCPipeline(ModifiedVanillaPipeline):
@@ -102,10 +113,15 @@ class DCPipeline(ModifiedVanillaPipeline):
         self.current_spot = None
 
         # Optional 3D voxel-cache for cross-view-consistent localization.
-        # Initialized lazily on first iteration so we have access to the
-        # scene bounding box from the dataparser.
+        # Initialized lazily on first iteration (or after observing a few
+        # iterations of backprojected world points, depending on bbox source).
         self.mask_voxel_cache: Optional[MaskVoxelCache] = None
         self.mask_voxel_cache_start_step: Optional[int] = None
+        # For "observed" bbox source: rolling per-axis min/max accumulated
+        # across the first `bbox_observe_steps` iterations.
+        self._observed_pts_min: Optional[torch.Tensor] = None
+        self._observed_pts_max: Optional[torch.Tensor] = None
+        self._observed_pts_count: int = 0
 
     def get_current_rendering(self, step):
         if getattr(self, "current_spot", None) is None or step % self.config.change_view_step == 0:
@@ -182,9 +198,20 @@ class DCPipeline(ModifiedVanillaPipeline):
         inflation = float(self.config.mask_voxel_cache_bbox_inflation)
         cameras = self.datamanager.train_dataparser_outputs.cameras
 
-        if source == "cameras":
+        if source == "observed":
+            # Caller is responsible for accumulating observed world points
+            # via `_observe_points()` and only invoking this method once
+            # enough observations are in. Use the rolling min/max here.
+            if self._observed_pts_min is None or self._observed_pts_max is None:
+                # Not enough observations yet — caller should retry later.
+                return
+            bbox_min = self._observed_pts_min.clone()
+            bbox_max = self._observed_pts_max.clone()
+        elif source == "cameras":
             # Camera-position AABB. cameras.camera_to_worlds is [..., 3, 4];
             # the last column is the translation (= camera origin in world).
+            # NOTE: empirically wrong for object-centric capture — left here
+            # only as an explicit opt-in for debugging.
             c2w = cameras.camera_to_worlds.to(self.device)
             if c2w.dim() == 2:
                 c2w = c2w.unsqueeze(0)
@@ -199,7 +226,7 @@ class DCPipeline(ModifiedVanillaPipeline):
         else:
             raise ValueError(
                 f"Unknown mask_voxel_cache_bbox_source={source!r}; "
-                f"expected 'cameras' or 'scene_box'."
+                f"expected 'observed', 'cameras', or 'scene_box'."
             )
 
         center = 0.5 * (bbox_min + bbox_max)
@@ -222,6 +249,30 @@ class DCPipeline(ModifiedVanillaPipeline):
             ema_beta=self.config.mask_voxel_cache_ema_beta,
             device=self.device,
         )
+
+    def _observe_points(self, points_world: torch.Tensor, valid: torch.Tensor) -> None:
+        """Accumulate per-axis min/max of *valid* backprojected world points.
+
+        Called during the bbox-observation window (when bbox_source="observed"
+        and the cache hasn't been built yet). Once enough iterations have been
+        observed, `_ensure_voxel_cache()` will pick up these accumulated bounds.
+        """
+        valid = valid.reshape(-1).to(self.device)
+        pts = points_world.reshape(-1, 3).to(self.device).float()
+        pts = pts[valid]
+        # Drop any non-finite rows (NaN/inf depths produce inf points).
+        pts = pts[torch.isfinite(pts).all(dim=-1)]
+        if pts.numel() == 0:
+            return
+        cur_min = pts.min(dim=0).values
+        cur_max = pts.max(dim=0).values
+        if self._observed_pts_min is None:
+            self._observed_pts_min = cur_min
+            self._observed_pts_max = cur_max
+        else:
+            self._observed_pts_min = torch.minimum(self._observed_pts_min, cur_min)
+            self._observed_pts_max = torch.maximum(self._observed_pts_max, cur_max)
+        self._observed_pts_count += 1
 
     def _voxel_cache_edit_step(self, step: int) -> int:
         """Return a zero-based edit-local step.
@@ -309,8 +360,12 @@ class DCPipeline(ModifiedVanillaPipeline):
             and ray_origins is not None
             and ray_directions is not None
         ):
-            self._ensure_voxel_cache()
             voxel_cache_edit_step = self._voxel_cache_edit_step(step)
+            # For non-observed sources, build the cache eagerly (existing flow).
+            # For "observed" source, defer building until enough world-point
+            # samples are accumulated below.
+            if str(self.config.mask_voxel_cache_bbox_source).lower() != "observed":
+                self._ensure_voxel_cache()
             mask_h, mask_w = x0.shape[-2:]
             # Move spatial maps to [B, C, H, W] for F.interpolate, then to mask resolution.
             d = depth_world.to(self.dc_device)
@@ -341,33 +396,55 @@ class DCPipeline(ModifiedVanillaPipeline):
                 & torch.isfinite(d)
                 & (d > 0.0)
             ).reshape(-1)
-            # Query the cache. `cache_valid` is true only for observed, in-bounds,
-            # sufficiently accumulated voxels; invalid pixels fall back to the
-            # internal per-view mask inside DC.__call__.
-            queried, cache_valid = self.mask_voxel_cache.query(
-                mask_world_points,
-                in_bounds=mask_world_points_valid,
-                return_valid=True,
-            )
-            external_grad_mask = queried.view(1, 1, mask_h, mask_w).to(
-                device=x0.device, dtype=x0.dtype
-            )
-            external_grad_mask_valid = cache_valid.view(1, 1, mask_h, mask_w).to(device=x0.device)
-            external_mask_blend = self._voxel_cache_warmup_blend(voxel_cache_edit_step)
+
+            # Observation-then-build flow for bbox_source="observed".
+            # The cache stays None during the observation window; once enough
+            # samples are accumulated, `_ensure_voxel_cache()` reads the rolling
+            # AABB and builds. Until then we just observe; the DDS gradient
+            # runs with the internal mask only.
+            if (
+                str(self.config.mask_voxel_cache_bbox_source).lower() == "observed"
+                and self.mask_voxel_cache is None
+            ):
+                self._observe_points(mask_world_points, mask_world_points_valid)
+                if (
+                    self._observed_pts_count
+                    >= int(self.config.mask_voxel_cache_bbox_observe_steps)
+                ):
+                    self._ensure_voxel_cache()
+                if self.use_wandb and step % self.config.log_step == 0:
+                    import wandb
+                    wandb.log(
+                        {
+                            "dc_debug/voxel_cache_observing_count": int(self._observed_pts_count),
+                        },
+                        step=step,
+                        commit=False,
+                    )
+
+            if self.mask_voxel_cache is not None:
+                # Cache exists — query it. `cache_valid` is true only for
+                # observed, in-bounds, sufficiently accumulated voxels;
+                # invalid pixels fall back to the internal per-view mask
+                # inside DC.__call__.
+                queried, cache_valid = self.mask_voxel_cache.query(
+                    mask_world_points,
+                    in_bounds=mask_world_points_valid,
+                    return_valid=True,
+                )
+                external_grad_mask = queried.view(1, 1, mask_h, mask_w).to(
+                    device=x0.device, dtype=x0.dtype
+                )
+                external_grad_mask_valid = cache_valid.view(1, 1, mask_h, mask_w).to(
+                    device=x0.device
+                )
+                external_mask_blend = self._voxel_cache_warmup_blend(voxel_cache_edit_step)
 
             # ----------------------------------------------------------------
             # Diagnostic logging — disentangle the failure modes that show up
-            # as a low `valid_ratio`. The chart names are deliberately
-            # structured so a glance answers:
-            #   - Are world points inside the bbox at all?
-            #     (`voxel_pure_in_bbox_frac`)
-            #   - Do they pass the accumulation/depth filter?
-            #     (`voxel_acc_filter_pass_frac`)
-            #   - Is the NeRF actually solid where rays land?
-            #     (`voxel_mean_accumulation`)
-            #   - And the spatial extent of points being projected this step
-            #     (`voxel_pts_{min,max}_{x,y,z}`) — compare against the bbox
-            #     printed at cache init to confirm coordinate alignment.
+            # as a low `valid_ratio`. The pts_min/max and accumulation stats
+            # are always available; the in-bbox fraction requires an existing
+            # cache (so it's logged only after the observation window ends).
             # ----------------------------------------------------------------
             if self.use_wandb and step % self.config.log_step == 0:
                 import wandb
@@ -375,27 +452,25 @@ class DCPipeline(ModifiedVanillaPipeline):
                     pts = mask_world_points
                     pts_min = pts.min(dim=0).values
                     pts_max = pts.max(dim=0).values
-                    bbox_lo = self.mask_voxel_cache.bbox_min
-                    bbox_hi = self.mask_voxel_cache.bbox_max
-                    norm = (pts - bbox_lo) / (bbox_hi - bbox_lo).clamp_min(1e-8)
-                    pure_in_bbox = ((norm >= 0.0) & (norm < 1.0)).all(dim=-1).float().mean()
                     acc_pass = mask_world_points_valid.float().mean()
                     mean_acc = acc.float().mean() if acc is not None else torch.tensor(1.0)
-                    wandb.log(
-                        {
-                            "dc_debug/voxel_pts_min_x": float(pts_min[0]),
-                            "dc_debug/voxel_pts_min_y": float(pts_min[1]),
-                            "dc_debug/voxel_pts_min_z": float(pts_min[2]),
-                            "dc_debug/voxel_pts_max_x": float(pts_max[0]),
-                            "dc_debug/voxel_pts_max_y": float(pts_max[1]),
-                            "dc_debug/voxel_pts_max_z": float(pts_max[2]),
-                            "dc_debug/voxel_pure_in_bbox_frac": float(pure_in_bbox),
-                            "dc_debug/voxel_acc_filter_pass_frac": float(acc_pass),
-                            "dc_debug/voxel_mean_accumulation": float(mean_acc),
-                        },
-                        step=step,
-                        commit=False,
-                    )
+                    payload = {
+                        "dc_debug/voxel_pts_min_x": float(pts_min[0]),
+                        "dc_debug/voxel_pts_min_y": float(pts_min[1]),
+                        "dc_debug/voxel_pts_min_z": float(pts_min[2]),
+                        "dc_debug/voxel_pts_max_x": float(pts_max[0]),
+                        "dc_debug/voxel_pts_max_y": float(pts_max[1]),
+                        "dc_debug/voxel_pts_max_z": float(pts_max[2]),
+                        "dc_debug/voxel_acc_filter_pass_frac": float(acc_pass),
+                        "dc_debug/voxel_mean_accumulation": float(mean_acc),
+                    }
+                    if self.mask_voxel_cache is not None:
+                        bbox_lo = self.mask_voxel_cache.bbox_min
+                        bbox_hi = self.mask_voxel_cache.bbox_max
+                        norm = (pts - bbox_lo) / (bbox_hi - bbox_lo).clamp_min(1e-8)
+                        pure_in_bbox = ((norm >= 0.0) & (norm < 1.0)).all(dim=-1).float().mean()
+                        payload["dc_debug/voxel_pure_in_bbox_frac"] = float(pure_in_bbox)
+                    wandb.log(payload, step=step, commit=False)
 
         dic = self.dc(
             tgt_x0=x0,
