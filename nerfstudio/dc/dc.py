@@ -490,7 +490,32 @@ class DC(object):
                     # Probabilistic union / additive support: cache only
                     # raises the mask, never lowers it. Per-view edit peaks
                     # are preserved (where M_int → 1 the contribution → 0).
-                    fused = grad_mask + blend * ext * (1.0 - grad_mask)
+                    #
+                    # When a cross-attention mask is available, the cache
+                    # contribution is also gated by it:
+                    #   M = M_int + b · M_ext · (1 − M_int) · M_attn
+                    # Without this gate, screen fusion injects cache support
+                    # wherever the cache has a value — including regions the
+                    # prompt's semantic attention deliberately excludes (e.g.,
+                    # elf clothes when the prompt is face-only). The gate
+                    # restricts cache support to semantically-on-target
+                    # regions while preserving the cross-view-consistency
+                    # benefit on edits where M_attn is broad (stormtrooper
+                    # body, clown body).
+                    contribution = blend * ext * (1.0 - grad_mask)
+                    if cross_attention_mask is not None:
+                        ca = cross_attention_mask
+                        if ca.shape[-2:] != contribution.shape[-2:]:
+                            ca = F.interpolate(
+                                ca,
+                                size=contribution.shape[-2:],
+                                mode="bilinear",
+                                align_corners=False,
+                            )
+                        contribution = contribution * ca.to(
+                            device=contribution.device, dtype=contribution.dtype
+                        ).clamp(0.0, 1.0)
+                    fused = grad_mask + contribution
                 elif mode == "max":
                     # Hard upper-envelope.
                     fused = torch.maximum(grad_mask, blend * ext)
