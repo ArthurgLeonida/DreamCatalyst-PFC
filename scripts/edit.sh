@@ -59,6 +59,11 @@ MASK_VOXEL_CACHE_BBOX_INFLATION="${MASK_VOXEL_CACHE_BBOX_INFLATION:-0.2}"
 #   "blend"            — linear; replacement-style (legacy).
 #   "max", "min"       — diagnostic ablations.
 EXTERNAL_MASK_FUSION="${EXTERNAL_MASK_FUSION:-screen}"
+# For "screen" fusion: how strongly cache support is gated by the cross-
+# attention mask. 1.0 = full CA gating (best for face-only edits like elf);
+# 0.5 = softened gating (recovers cache support in moderate-attention
+# regions like stormtrooper head); 0.0 = no gating.
+EXTERNAL_MASK_SCREEN_ATTN_GATE_STRENGTH="${EXTERNAL_MASK_SCREEN_ATTN_GATE_STRENGTH:-1.0}"
 RUN_DIR=""
 TRAIN_LOG=""
 
@@ -134,7 +139,8 @@ if [ "${MASK_VOXEL_CACHE}" = "1" ]; then
     echo "   ├─ bbox src:   ${MASK_VOXEL_CACHE_BBOX_SOURCE} (q=${MASK_VOXEL_CACHE_BBOX_OBSERVE_QUANTILE}, infl=${MASK_VOXEL_CACHE_BBOX_INFLATION})"
     echo "   ├─ acc thr:    ${MASK_VOXEL_CACHE_ACCUMULATION_THRESHOLD}"
     echo "   ├─ blend:      ${MASK_VOXEL_CACHE_MAX_BLEND} (warmup ${MASK_VOXEL_CACHE_WARMUP_START}→${MASK_VOXEL_CACHE_WARMUP_END})"
-    echo "   └─ fusion:     ${EXTERNAL_MASK_FUSION}"
+    echo "   ├─ fusion:     ${EXTERNAL_MASK_FUSION}"
+    echo "   └─ ca gate:    ${EXTERNAL_MASK_SCREEN_ATTN_GATE_STRENGTH}"
 fi
 echo "============================================"
 
@@ -181,6 +187,7 @@ if [ "${MASK_VOXEL_CACHE}" = "1" ]; then
         --pipeline.mask-voxel-cache-bbox-observe-quantile "${MASK_VOXEL_CACHE_BBOX_OBSERVE_QUANTILE}"
         --pipeline.mask-voxel-cache-bbox-inflation "${MASK_VOXEL_CACHE_BBOX_INFLATION}"
         --pipeline.dc.external-mask-fusion "${EXTERNAL_MASK_FUSION}"
+        --pipeline.dc.external-mask-screen-attn-gate-strength "${EXTERNAL_MASK_SCREEN_ATTN_GATE_STRENGTH}"
     )
 fi
 

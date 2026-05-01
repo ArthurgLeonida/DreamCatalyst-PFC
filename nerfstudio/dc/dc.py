@@ -122,6 +122,19 @@ class DCConfig:
     #       Restrictive (intersection): both must agree to edit. Filters
     #       per-view false positives but kills cross-view support.
     external_mask_fusion: str = "screen"
+    # For "screen" fusion only: how strongly the cache's contribution is gated
+    # by the cross-attention mask. The gate is a convex blend between full
+    # gating and no gating:
+    #     gate = (1 − strength) + strength · M_attn
+    # so:
+    #   strength = 1.0 → full CA gating (default; best for face-only edits like
+    #                    elf where cache must not leak to clothes).
+    #   strength = 0.5 → softened gating (gate ∈ [0.5, 1.0]); recovers some
+    #                    cache support in moderate-attention regions
+    #                    (e.g. stormtrooper head) at a small cost to the
+    #                    elf-clothes fix.
+    #   strength = 0.0 → no CA gating (equivalent to plain screen).
+    external_mask_screen_attn_gate_strength: float = 1.0
 
 
 class DC(object):
@@ -512,9 +525,18 @@ class DC(object):
                                 mode="bilinear",
                                 align_corners=False,
                             )
-                        contribution = contribution * ca.to(
+                        ca = ca.to(
                             device=contribution.device, dtype=contribution.dtype
                         ).clamp(0.0, 1.0)
+                        # Convex-blend between "full gating" (gate = M_attn)
+                        # and "no gating" (gate = 1). Tunable so moderate-
+                        # attention regions (e.g. stormtrooper head) can keep
+                        # cache support without losing the elf-clothes fix
+                        # entirely.
+                        strength = float(self.config.external_mask_screen_attn_gate_strength)
+                        strength = min(max(strength, 0.0), 1.0)
+                        gate = (1.0 - strength) + strength * ca
+                        contribution = contribution * gate
                     fused = grad_mask + contribution
                 elif mode == "max":
                     # Hard upper-envelope.
