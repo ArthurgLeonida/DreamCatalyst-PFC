@@ -47,6 +47,18 @@ MASK_VOXEL_CACHE_WARMUP_START="${MASK_VOXEL_CACHE_WARMUP_START:-700}"
 MASK_VOXEL_CACHE_WARMUP_END="${MASK_VOXEL_CACHE_WARMUP_END:-1500}"
 MASK_VOXEL_CACHE_MAX_BLEND="${MASK_VOXEL_CACHE_MAX_BLEND:-0.5}"
 MASK_VOXEL_CACHE_ACCUMULATION_THRESHOLD="${MASK_VOXEL_CACHE_ACCUMULATION_THRESHOLD:-0.3}"
+# Bbox-construction env vars (introduced after the camera-positions AABB
+# was empirically wrong for object-centric capture — see dc_pipeline.py
+# and the project briefing). Defaults match the in-code defaults.
+MASK_VOXEL_CACHE_BBOX_SOURCE="${MASK_VOXEL_CACHE_BBOX_SOURCE:-observed}"
+MASK_VOXEL_CACHE_BBOX_OBSERVE_STEPS="${MASK_VOXEL_CACHE_BBOX_OBSERVE_STEPS:-50}"
+MASK_VOXEL_CACHE_BBOX_OBSERVE_QUANTILE="${MASK_VOXEL_CACHE_BBOX_OBSERVE_QUANTILE:-0.05}"
+MASK_VOXEL_CACHE_BBOX_INFLATION="${MASK_VOXEL_CACHE_BBOX_INFLATION:-0.2}"
+# How the cache mask is fused with the internal hybrid mask.
+#   "screen" (default) — additive support; cache only raises the mask.
+#   "blend"            — linear; replacement-style (legacy).
+#   "max", "min"       — diagnostic ablations.
+EXTERNAL_MASK_FUSION="${EXTERNAL_MASK_FUSION:-screen}"
 RUN_DIR=""
 TRAIN_LOG=""
 
@@ -117,6 +129,13 @@ echo " Tgt:       ${TGT_PROMPT}"
 echo " Load from: ${LOAD_DIR}"
 echo " GPUs:      ${CUDA_VISIBLE_DEVICES}"
 echo " Voxel 3D:  ${MASK_VOXEL_CACHE}"
+if [ "${MASK_VOXEL_CACHE}" = "1" ]; then
+    echo "   ├─ res:        ${MASK_VOXEL_CACHE_RESOLUTION}"
+    echo "   ├─ bbox src:   ${MASK_VOXEL_CACHE_BBOX_SOURCE} (q=${MASK_VOXEL_CACHE_BBOX_OBSERVE_QUANTILE}, infl=${MASK_VOXEL_CACHE_BBOX_INFLATION})"
+    echo "   ├─ acc thr:    ${MASK_VOXEL_CACHE_ACCUMULATION_THRESHOLD}"
+    echo "   ├─ blend:      ${MASK_VOXEL_CACHE_MAX_BLEND} (warmup ${MASK_VOXEL_CACHE_WARMUP_START}→${MASK_VOXEL_CACHE_WARMUP_END})"
+    echo "   └─ fusion:     ${EXTERNAL_MASK_FUSION}"
+fi
 echo "============================================"
 
 if [ ! -f "${DATA_DIR}/transforms.json" ]; then
@@ -157,6 +176,11 @@ if [ "${MASK_VOXEL_CACHE}" = "1" ]; then
         --pipeline.mask-voxel-cache-warmup-end "${MASK_VOXEL_CACHE_WARMUP_END}"
         --pipeline.mask-voxel-cache-max-blend "${MASK_VOXEL_CACHE_MAX_BLEND}"
         --pipeline.mask-voxel-cache-accumulation-threshold "${MASK_VOXEL_CACHE_ACCUMULATION_THRESHOLD}"
+        --pipeline.mask-voxel-cache-bbox-source "${MASK_VOXEL_CACHE_BBOX_SOURCE}"
+        --pipeline.mask-voxel-cache-bbox-observe-steps "${MASK_VOXEL_CACHE_BBOX_OBSERVE_STEPS}"
+        --pipeline.mask-voxel-cache-bbox-observe-quantile "${MASK_VOXEL_CACHE_BBOX_OBSERVE_QUANTILE}"
+        --pipeline.mask-voxel-cache-bbox-inflation "${MASK_VOXEL_CACHE_BBOX_INFLATION}"
+        --pipeline.dc.external-mask-fusion "${EXTERNAL_MASK_FUSION}"
     )
 fi
 

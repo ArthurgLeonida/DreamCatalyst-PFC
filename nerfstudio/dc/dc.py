@@ -98,6 +98,31 @@ class DCConfig:
 
     latent_mean_anchor_weight: float = 0.0
 
+    # How an externally-supplied mask (e.g. the 3D voxel cache) is fused with
+    # the internal per-view hybrid mask. The cache is averaged across views
+    # so its values smooth out per-view focus peaks; with a naive linear
+    # blend this *reduces* the mask wherever the internal mask was already
+    # high, causing under-editing on creative scenes (stormtrooper armor,
+    # elf face). The "screen" mode (default) sidesteps this by additive-only
+    # support: cache can raise the mask but never lower it.
+    #
+    # Modes (all use `b = external_mask_blend ∈ [0, 1]`):
+    #   "screen" (default): M = M_int + b · M_ext · (1 − M_int)
+    #       Probabilistic-union form. Cache contribution shrinks to zero as
+    #       the internal mask saturates toward 1, so per-view edit peaks are
+    #       fully preserved. Cache supplies cross-view consensus only where
+    #       the internal mask is weak (e.g. the occluded arm in a clown view).
+    #   "blend":            M = (1 − b) · M_int + b · M_ext
+    #       Linear blend (legacy / replacement-style). Reduces edit strength
+    #       where internal > cache value; useful as a baseline ablation.
+    #   "max":              M = max(M_int, b · M_ext)
+    #       Hard upper-envelope. Same "never lower" property as screen but
+    #       discontinuous at the crossover; good for diagnostics.
+    #   "min":              M = min(M_int, M_ext)
+    #       Restrictive (intersection): both must agree to edit. Filters
+    #       per-view false positives but kills cross-view support.
+    external_mask_fusion: str = "screen"
+
 
 class DC(object):
     def __init__(self, config: DCConfig, use_wandb=False):
@@ -424,14 +449,13 @@ class DC(object):
 
         internal_grad_mask = grad_mask.detach().clone() if grad_mask is not None else None
 
-        # Optional external (e.g. 3D-voxel-cache-derived) mask override.
-        # Blended with the internal hybrid mask via `external_mask_blend ∈ [0, 1]`:
-        #   blend = 0 → use the internal per-view hybrid (current default behavior).
-        #   blend = 1 → use the external mask exclusively.
-        # The pipeline ramps `blend` from 0 toward 1 over a warmup window so the
-        # 3D cache has time to populate from many views before it dominates.
+        # Optional external (e.g. 3D-voxel-cache-derived) mask, fused with
+        # the internal per-view hybrid mask. The fusion mode is chosen by
+        # `self.config.external_mask_fusion` (see DCConfig docstring for the
+        # full taxonomy and motivation). The same `external_mask_blend ∈ [0, 1]`
+        # warmup parameter is reused as the fusion strength `b`.
         # If a validity map is provided, invalid cache pixels fall back to the
-        # internal mask instead of injecting the cache fallback value.
+        # internal mask instead of injecting any cache contribution.
         if external_grad_mask is not None:
             blend = min(max(float(external_mask_blend), 0.0), 1.0)
             ext = external_grad_mask
@@ -458,8 +482,28 @@ class DC(object):
             if grad_mask is None:
                 grad_mask = ext
             else:
-                blended_mask = (1.0 - blend) * grad_mask + blend * ext
-                grad_mask = torch.where(valid, blended_mask, grad_mask) if valid is not None else blended_mask
+                mode = str(self.config.external_mask_fusion).lower()
+                if mode == "blend":
+                    # Linear blend (legacy): replacement-style.
+                    fused = (1.0 - blend) * grad_mask + blend * ext
+                elif mode == "screen":
+                    # Probabilistic union / additive support: cache only
+                    # raises the mask, never lowers it. Per-view edit peaks
+                    # are preserved (where M_int → 1 the contribution → 0).
+                    fused = grad_mask + blend * ext * (1.0 - grad_mask)
+                elif mode == "max":
+                    # Hard upper-envelope.
+                    fused = torch.maximum(grad_mask, blend * ext)
+                elif mode == "min":
+                    # Intersection: filter false positives, kill cross-view
+                    # support. Diagnostic / ablation only.
+                    fused = torch.minimum(grad_mask, ext)
+                else:
+                    raise ValueError(
+                        f"Unknown external_mask_fusion={mode!r}; expected "
+                        f"'screen', 'blend', 'max', or 'min'."
+                    )
+                grad_mask = torch.where(valid, fused, grad_mask) if valid is not None else fused
             grad_mask = grad_mask.clamp(0.0, 1.0)
 
         # Edit strength is computed from the raw eps_raw snapshot (pre-STG / pre-TAG /

@@ -31,6 +31,12 @@ DC_CUSTOM_PARAMS = dict(
 
     latent_mean_anchor_weight=0.005,
 
+    # How an externally-supplied mask (3D voxel cache) is fused with the
+    # internal hybrid mask. See DCConfig docstring for the math; "screen"
+    # is additive-only support that preserves per-view edit-signal peaks
+    # while supplying cross-view consensus where the internal mask is weak.
+    external_mask_fusion="screen",
+
     # ---------------------------------------------------------------------
     # 2. TAG branch
     # ---------------------------------------------------------------------
