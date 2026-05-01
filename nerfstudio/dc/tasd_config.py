@@ -18,14 +18,14 @@ DC_CUSTOM_PARAMS = dict(
     outside_mask_anchor_weight=0.2,
     outside_mask_anchor_edit_strength_adaptive=True,
 
-    gradient_mask_blur=1.0,
+    gradient_mask_blur=0.5,
     gradient_mask_gamma=1.2,
     gradient_mask_ema_beta=0.0,
     gradient_mask_warmup=0,
 
     cross_attention_mask_enabled=True,
     cross_attention_mask_layers=[1, 2],
-    cross_attention_mask_weight=0.7,
+    cross_attention_mask_weight=0.85,
     cross_attention_mask_blur=0.5,
     cross_attention_mask_gamma=1.2,
 
