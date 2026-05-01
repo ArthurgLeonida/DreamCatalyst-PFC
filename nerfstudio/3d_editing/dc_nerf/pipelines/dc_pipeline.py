@@ -18,6 +18,7 @@ from dc_nerf.data.datamanagers.dc_datamanager import DCDataManagerConfig
 from dc_nerf.data.datamanagers.dc_splat_datamanager import DCSplatDataManagerConfig
 from dc.dc import DC, DCConfig, tensor_to_pil
 from dc.mask_voxel_cache import MaskVoxelCache
+from dc.method_config import VOXEL_CACHE_PARAMS
 from dc.utils.imageutil import merge_images
 from dc.utils.sysutil import clean_gpu
 from dc.utils.free_lunch import register_free_upblock2d, register_free_crossattn_upblock2d
@@ -43,18 +44,20 @@ class DCPipelineConfig(VanillaPipelineConfig):
     # voxel grid via depth backprojection, EMA-aggregated across views, and
     # queried back per-view to override (or blend with) the internal mask.
     # See `nerfstudio/dc/mask_voxel_cache.py` for the math + paper references.
-    mask_voxel_cache_enabled: bool = False
-    mask_voxel_cache_resolution: int = 128
-    mask_voxel_cache_ema_beta: float = 0.9
+    mask_voxel_cache_enabled: bool = VOXEL_CACHE_PARAMS["mask_voxel_cache_enabled"]
+    mask_voxel_cache_resolution: int = VOXEL_CACHE_PARAMS["mask_voxel_cache_resolution"]
+    mask_voxel_cache_ema_beta: float = VOXEL_CACHE_PARAMS["mask_voxel_cache_ema_beta"]
     # Warmup ramp for the external-mask blend factor inside DC.__call__.
     # `blend(step) = clamp((step - start) / (end - start), 0, 1) * max_blend`.
     # During [0, start] iterations the cache is built but not yet used in the
     # gradient. During [start, end] the cache phases in. After `end`, blend
     # stays at `max_blend`.
-    mask_voxel_cache_warmup_start: int = 700
-    mask_voxel_cache_warmup_end: int = 1500
-    mask_voxel_cache_max_blend: float = 0.5
-    mask_voxel_cache_accumulation_threshold: float = 0.3
+    mask_voxel_cache_warmup_start: int = VOXEL_CACHE_PARAMS["mask_voxel_cache_warmup_start"]
+    mask_voxel_cache_warmup_end: int = VOXEL_CACHE_PARAMS["mask_voxel_cache_warmup_end"]
+    mask_voxel_cache_max_blend: float = VOXEL_CACHE_PARAMS["mask_voxel_cache_max_blend"]
+    mask_voxel_cache_accumulation_threshold: float = VOXEL_CACHE_PARAMS[
+        "mask_voxel_cache_accumulation_threshold"
+    ]
     # Source for the cache's world-space bbox.
     #   "observed" (default) — observe `bbox_observe_steps` iterations of
     #                          backprojected world points first, take their
@@ -72,11 +75,13 @@ class DCPipelineConfig(VanillaPipelineConfig):
     #   "scene_box"          — use `dataparser_outputs.scene_box.aabb`. Fast
     #                          but only correct when the dataparser sets
     #                          scene_box in the same frame as the rays.
-    mask_voxel_cache_bbox_source: str = "observed"
+    mask_voxel_cache_bbox_source: str = VOXEL_CACHE_PARAMS["mask_voxel_cache_bbox_source"]
     # For "observed" source: number of iterations to accumulate world points
     # before constructing the cache. Cache is dormant during this window, then
     # built once at iteration `bbox_observe_steps` and used onward.
-    mask_voxel_cache_bbox_observe_steps: int = 50
+    mask_voxel_cache_bbox_observe_steps: int = VOXEL_CACHE_PARAMS[
+        "mask_voxel_cache_bbox_observe_steps"
+    ]
     # Per-iteration quantile clip applied to observed world points. Robust
     # alternative to min/max — clips far-depth outliers from low-confidence
     # rays so the bbox tightly fits the actual subject region.
@@ -86,12 +91,16 @@ class DCPipelineConfig(VanillaPipelineConfig):
     # observed bbox extent ballooned to ~240 units along x/z (subject is ~2),
     # making 64³ voxels too coarse to distinguish body parts. Percentile
     # clipping at 5/95 collapses the bbox to the actual surface support.
-    mask_voxel_cache_bbox_observe_quantile: float = 0.05
+    mask_voxel_cache_bbox_observe_quantile: float = VOXEL_CACHE_PARAMS[
+        "mask_voxel_cache_bbox_observe_quantile"
+    ]
     # Inflation factor around the chosen AABB. With "observed" source the
     # bbox already contains all observed points, so a small margin (10–25%)
     # is enough. With "cameras" or "scene_box", more inflation is usually
     # needed.
-    mask_voxel_cache_bbox_inflation: float = 0.2
+    mask_voxel_cache_bbox_inflation: float = VOXEL_CACHE_PARAMS[
+        "mask_voxel_cache_bbox_inflation"
+    ]
 
 
 class DCPipeline(ModifiedVanillaPipeline):

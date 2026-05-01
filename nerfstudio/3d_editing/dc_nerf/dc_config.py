@@ -20,7 +20,7 @@ from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
 from nerfstudio.plugins.types import MethodSpecification
 from dc.dc import DCConfig
-from dc.tasd_config import DC_CUSTOM_PARAMS
+from dc.method_config import DC_CUSTOM_PARAMS
 
 nerfacto_method = MethodSpecification(
     config=TrainerConfig(

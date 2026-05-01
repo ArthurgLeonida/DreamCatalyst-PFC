@@ -95,7 +95,7 @@ Uses SDEdit (SD 1.5, 20 denoising steps with `skip=7`) to produce edited 2D imag
 
 ## Novelties
 
-The main DDS orchestration lives in `nerfstudio/dc/dc.py`; reusable novelty math lives in `nerfstudio/dc/guidance_utils.py`; settings are configured centrally in `nerfstudio/dc/tasd_config.py` (`DC_CUSTOM_PARAMS`). Every novelty defaults to *off*, so enabling it produces a clean ablation.
+The main DDS orchestration lives in `nerfstudio/dc/dc.py`; reusable novelty math lives in `nerfstudio/dc/guidance_utils.py`; settings are configured centrally in `nerfstudio/dc/method_config.py` (`DC_CUSTOM_PARAMS` and `VOXEL_CACHE_PARAMS`).
 
 ### Localization branch (main research direction)
 
@@ -132,7 +132,7 @@ The main DDS orchestration lives in `nerfstudio/dc/dc.py`; reusable novelty math
 ### Central config
 
 ```python
-# nerfstudio/dc/tasd_config.py
+# nerfstudio/dc/method_config.py
 DC_CUSTOM_PARAMS = dict(
     # Localization
     psi=0.075,

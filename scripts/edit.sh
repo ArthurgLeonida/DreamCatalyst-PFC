@@ -1,31 +1,14 @@
 #!/usr/bin/env bash
-# ==============================================================================
-#  DreamCatalyst-NS — Editing script (Step 3: DDS guidance)
-# ==============================================================================
-#  Usage:
-#    bash scripts/edit.sh <scene> <src_prompt> <tgt_prompt> <load_dir> [max_iters] [rep] [downscale]
-#
-#  rep: splat (default) or nerf
-#  downscale: must match Step 2 training downscale (default: 1)
-#  After editing, metrics are automatically evaluated and saved inside the
-#  experiment folder as metrics.json. Disable with: EVAL_AFTER_EDIT=0 bash ...
-#
-#  WandB-aware auto-eval:
-#  when VIS_MODE=wandb, edit.sh stores WandB files under the method folder and
-#  evaluate.py resumes the same training run to attach eval metrics to it.
-#
-#  Examples:
-#    bash scripts/edit.sh bicycle \
-#        "a photo of a bicycle leaning against a bench" \
-#        "a photo of a motorcycle leaning against a bench" \
-#        outputs/bicycle/splatfacto/2026-03-02_045741/nerfstudio_models/
-#
-#    bash scripts/edit.sh bicycle \
-#        "a photo of a bicycle" "a photo of a motorcycle" \
-#        outputs/bicycle/nerfacto/.../nerfstudio_models/ 3000 nerf
-# ==============================================================================
-
 set -euo pipefail
+
+# Usage:
+#   bash scripts/edit.sh <scene> <src_prompt> <tgt_prompt> <load_dir> [max_iters] [rep] [downscale]
+#
+# Runtime knobs kept here:
+#   RUN_NAME, PROJECT_NAME, VIS_MODE, EVAL_AFTER_EDIT, EVAL_DEVICE, CUDA_VISIBLE_DEVICES
+#
+# Method knobs live in:
+#   nerfstudio/dc/method_config.py
 
 SCENE="${1:?Usage: $0 <scene> <src_prompt> <tgt_prompt> <load_dir> [max_iters] [rep] [downscale]}"
 SRC_PROMPT="${2:?Missing src_prompt}"
@@ -34,40 +17,16 @@ LOAD_DIR="${4:?Missing load_dir (path to init model nerfstudio_models/)}"
 MAX_ITERS="${5:-3000}"
 REP="${6:-nerf}"        # splat | nerf
 DOWN_SCALE="${7:-1}"
+
 DATA_DIR="data/${SCENE}_processed"
 VIS_MODE="${VIS_MODE:-wandb}"
 PROJECT_NAME="${PROJECT_NAME:-dreamcatalyst-pfc}"
 EXPERIMENT_NAME="${RUN_NAME:-${SCENE}_dc_edit}"
 EVAL_AFTER_EDIT="${EVAL_AFTER_EDIT:-1}"
 EVAL_DEVICE="${EVAL_DEVICE:-cuda}"
-MASK_VOXEL_CACHE="${MASK_VOXEL_CACHE:-0}"
-MASK_VOXEL_CACHE_RESOLUTION="${MASK_VOXEL_CACHE_RESOLUTION:-128}"
-MASK_VOXEL_CACHE_EMA_BETA="${MASK_VOXEL_CACHE_EMA_BETA:-0.9}"
-MASK_VOXEL_CACHE_WARMUP_START="${MASK_VOXEL_CACHE_WARMUP_START:-700}"
-MASK_VOXEL_CACHE_WARMUP_END="${MASK_VOXEL_CACHE_WARMUP_END:-1500}"
-MASK_VOXEL_CACHE_MAX_BLEND="${MASK_VOXEL_CACHE_MAX_BLEND:-0.5}"
-MASK_VOXEL_CACHE_ACCUMULATION_THRESHOLD="${MASK_VOXEL_CACHE_ACCUMULATION_THRESHOLD:-0.3}"
-# Bbox-construction env vars (introduced after the camera-positions AABB
-# was empirically wrong for object-centric capture — see dc_pipeline.py
-# and the project briefing). Defaults match the in-code defaults.
-MASK_VOXEL_CACHE_BBOX_SOURCE="${MASK_VOXEL_CACHE_BBOX_SOURCE:-observed}"
-MASK_VOXEL_CACHE_BBOX_OBSERVE_STEPS="${MASK_VOXEL_CACHE_BBOX_OBSERVE_STEPS:-50}"
-MASK_VOXEL_CACHE_BBOX_OBSERVE_QUANTILE="${MASK_VOXEL_CACHE_BBOX_OBSERVE_QUANTILE:-0.05}"
-MASK_VOXEL_CACHE_BBOX_INFLATION="${MASK_VOXEL_CACHE_BBOX_INFLATION:-0.2}"
-# How the cache mask is fused with the internal hybrid mask.
-#   "screen" (default) — additive support; cache only raises the mask.
-#   "blend"            — linear; replacement-style (legacy).
-#   "max", "min"       — diagnostic ablations.
-EXTERNAL_MASK_FUSION="${EXTERNAL_MASK_FUSION:-screen}"
-# For "screen" fusion: how strongly cache support is gated by the cross-
-# attention mask. 1.0 = full CA gating (best for face-only edits like elf);
-# 0.5 = softened gating (recovers cache support in moderate-attention
-# regions like stormtrooper head); 0.0 = no gating.
-EXTERNAL_MASK_SCREEN_ATTN_GATE_STRENGTH="${EXTERNAL_MASK_SCREEN_ATTN_GATE_STRENGTH:-1.0}"
 RUN_DIR=""
 TRAIN_LOG=""
 
-# ── Resolve method from representation ────────────────────────────────────────
 case "${REP}" in
     splat|3dgs|gaussian)
         METHOD="dc_splat"
@@ -76,7 +35,7 @@ case "${REP}" in
         ;;
     nerf|nerfacto)
         METHOD="dc"
-        NUM_GPUS=1       # 80GB H100 can easily fit both!
+        NUM_GPUS=1
         DM_CONFIG="dc-data-manager-config"
         ;;
     *)
@@ -108,6 +67,44 @@ extract_run_dir_from_train_log() {
     dirname "${config_path}"
 }
 
+print_voxel_config() {
+    python - <<'PY'
+import importlib.util
+from pathlib import Path
+
+path = Path("nerfstudio/dc/method_config.py")
+spec = importlib.util.spec_from_file_location("method_config", path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+voxel = module.VOXEL_CACHE_PARAMS
+dc = module.DC_CUSTOM_PARAMS
+enabled = 1 if voxel.get("mask_voxel_cache_enabled") else 0
+
+print(f" Voxel 3D:  {enabled}")
+if enabled:
+    branch = "\u251c\u2500"
+    last = "\u2514\u2500"
+    arrow = "\u2192"
+    print(f"   {branch} res:        {voxel['mask_voxel_cache_resolution']}")
+    print(
+        f"   {branch} bbox src:   "
+        f"{voxel['mask_voxel_cache_bbox_source']} "
+        f"(q={voxel['mask_voxel_cache_bbox_observe_quantile']}, "
+        f"infl={voxel['mask_voxel_cache_bbox_inflation']})"
+    )
+    print(f"   {branch} acc thr:    {voxel['mask_voxel_cache_accumulation_threshold']}")
+    print(
+        f"   {branch} blend:      "
+        f"{voxel['mask_voxel_cache_max_blend']} "
+        f"(warmup {voxel['mask_voxel_cache_warmup_start']}{arrow}"
+        f"{voxel['mask_voxel_cache_warmup_end']})"
+    )
+    print(f"   {branch} fusion:     {dc['external_mask_fusion']}")
+    print(f"   {last} ca gate:    {dc['external_mask_screen_attn_gate_strength']}")
+PY
+}
+
 run_training() {
     if [ -n "${TRAIN_WANDB_DIR}" ]; then
         env WANDB_DIR="${TRAIN_WANDB_DIR}" "${CMD[@]}"
@@ -116,7 +113,6 @@ run_training() {
     fi
 }
 
-# ── Auto-select GPU(s) unless CUDA_VISIBLE_DEVICES is already set ────────────
 if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
     echo "[edit.sh] Selecting ${NUM_GPUS} best available GPU(s)..."
     GPU_IDS=$(python scripts/pick_gpu.py "${NUM_GPUS}" 2>/dev/null | tail -1 || echo "0")
@@ -133,30 +129,21 @@ echo " Src:       ${SRC_PROMPT}"
 echo " Tgt:       ${TGT_PROMPT}"
 echo " Load from: ${LOAD_DIR}"
 echo " GPUs:      ${CUDA_VISIBLE_DEVICES}"
-echo " Voxel 3D:  ${MASK_VOXEL_CACHE}"
-if [ "${MASK_VOXEL_CACHE}" = "1" ]; then
-    echo "   ├─ res:        ${MASK_VOXEL_CACHE_RESOLUTION}"
-    echo "   ├─ bbox src:   ${MASK_VOXEL_CACHE_BBOX_SOURCE} (q=${MASK_VOXEL_CACHE_BBOX_OBSERVE_QUANTILE}, infl=${MASK_VOXEL_CACHE_BBOX_INFLATION})"
-    echo "   ├─ acc thr:    ${MASK_VOXEL_CACHE_ACCUMULATION_THRESHOLD}"
-    echo "   ├─ blend:      ${MASK_VOXEL_CACHE_MAX_BLEND} (warmup ${MASK_VOXEL_CACHE_WARMUP_START}→${MASK_VOXEL_CACHE_WARMUP_END})"
-    echo "   ├─ fusion:     ${EXTERNAL_MASK_FUSION}"
-    echo "   └─ ca gate:    ${EXTERNAL_MASK_SCREEN_ATTN_GATE_STRENGTH}"
-fi
+print_voxel_config
 echo "============================================"
 
 if [ ! -f "${DATA_DIR}/transforms.json" ]; then
     echo "ERROR: ${DATA_DIR}/transforms.json not found."
-    echo "Run:  bash scripts/process_data.sh ${SCENE}"
+    echo "Run: bash scripts/process_data.sh ${SCENE}"
     exit 1
 fi
 
 if [ ! -d "${LOAD_DIR}" ]; then
     echo "ERROR: ${LOAD_DIR} not found."
-    echo "Train first:  bash scripts/train.sh ${SCENE} 30000"
+    echo "Train first: bash scripts/train.sh ${SCENE} 30000"
     exit 1
 fi
 
-# ── Build ns-train command ────────────────────────────────────────────────────
 CMD=(ns-train "${METHOD}" \
     --machine.seed 42 \
     --max-num-iterations "${MAX_ITERS}" \
@@ -171,30 +158,9 @@ CMD=(ns-train "${METHOD}" \
     --pipeline.dc.max-iteration "${MAX_ITERS}" \
     --pipeline.dc.guidance-scale 7.5 \
     --pipeline.dc-device "cuda:0" \
-    --pipeline.dc.sd-pretrained-model-or-path timbrooks/instruct-pix2pix)
-
-if [ "${MASK_VOXEL_CACHE}" = "1" ]; then
-    CMD+=(
-        --pipeline.mask-voxel-cache-enabled True
-        --pipeline.mask-voxel-cache-resolution "${MASK_VOXEL_CACHE_RESOLUTION}"
-        --pipeline.mask-voxel-cache-ema-beta "${MASK_VOXEL_CACHE_EMA_BETA}"
-        --pipeline.mask-voxel-cache-warmup-start "${MASK_VOXEL_CACHE_WARMUP_START}"
-        --pipeline.mask-voxel-cache-warmup-end "${MASK_VOXEL_CACHE_WARMUP_END}"
-        --pipeline.mask-voxel-cache-max-blend "${MASK_VOXEL_CACHE_MAX_BLEND}"
-        --pipeline.mask-voxel-cache-accumulation-threshold "${MASK_VOXEL_CACHE_ACCUMULATION_THRESHOLD}"
-        --pipeline.mask-voxel-cache-bbox-source "${MASK_VOXEL_CACHE_BBOX_SOURCE}"
-        --pipeline.mask-voxel-cache-bbox-observe-steps "${MASK_VOXEL_CACHE_BBOX_OBSERVE_STEPS}"
-        --pipeline.mask-voxel-cache-bbox-observe-quantile "${MASK_VOXEL_CACHE_BBOX_OBSERVE_QUANTILE}"
-        --pipeline.mask-voxel-cache-bbox-inflation "${MASK_VOXEL_CACHE_BBOX_INFLATION}"
-        --pipeline.dc.external-mask-fusion "${EXTERNAL_MASK_FUSION}"
-        --pipeline.dc.external-mask-screen-attn-gate-strength "${EXTERNAL_MASK_SCREEN_ATTN_GATE_STRENGTH}"
-    )
-fi
-
-CMD+=(
-    pipeline.datamanager:"${DM_CONFIG}"
-    --pipeline.datamanager.dataparser.downscale-factor "${DOWN_SCALE}"
-)
+    --pipeline.dc.sd-pretrained-model-or-path timbrooks/instruct-pix2pix \
+    pipeline.datamanager:"${DM_CONFIG}" \
+    --pipeline.datamanager.dataparser.downscale-factor "${DOWN_SCALE}")
 
 TRAIN_LOG="$(mktemp -t edit-train-XXXXXX.log)"
 echo "[edit.sh] Capturing training log to ${TRAIN_LOG}"
@@ -232,11 +198,7 @@ if [ "${EVAL_AFTER_EDIT}" = "1" ]; then
         fi
 
         if env -u WANDB_MODE "${EVAL_CMD[@]}"; then
-            if [ "${VIS_MODE}" = "wandb" ]; then
-                echo " Metrics saved to: ${RUN_DIR}/metrics.json. WandB logging attempted."
-            else
-                echo " Metrics saved to: ${RUN_DIR}/metrics.json."
-            fi
+            echo " Metrics saved to: ${RUN_DIR}/metrics.json."
         else
             echo "WARNING: Evaluation failed, but the edit run completed successfully."
             echo "         You can retry manually with:"
