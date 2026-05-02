@@ -94,6 +94,7 @@ if enabled:
         f"infl={voxel['mask_voxel_cache_bbox_inflation']})"
     )
     print(f"   {branch} acc thr:    {voxel['mask_voxel_cache_accumulation_threshold']}")
+    print(f"   {branch} upd thr:    {voxel['mask_voxel_cache_update_threshold']}")
     print(
         f"   {branch} blend:      "
         f"{voxel['mask_voxel_cache_max_blend']} "

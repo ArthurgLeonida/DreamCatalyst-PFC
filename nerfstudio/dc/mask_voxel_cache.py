@@ -153,6 +153,7 @@ class MaskVoxelCache:
         points_world: torch.Tensor,
         mask_values: torch.Tensor,
         in_bounds: Optional[torch.Tensor] = None,
+        value_threshold: float = 0.0,
     ) -> None:
         """EMA-update voxels at backprojected 3D positions.
 
@@ -170,6 +171,16 @@ class MaskVoxelCache:
             mask_values: [N] mask values in [0, 1].
             in_bounds: [N] optional bool mask; if provided, points marked
                 False are skipped.
+            value_threshold: optional confidence gate. Pixels with
+                `mask_values < value_threshold` are skipped — the cache
+                only learns from confident edit signals. Prevents stale
+                low priors from accumulating in voxels where the model
+                hasn't yet started editing (e.g. stormtrooper helmet
+                voxels during iters 0–1400, where the per-view mask is
+                low because the model is busy on the body). When the
+                model later begins editing those voxels, the cache
+                starts fresh from the fallback rather than having to
+                fight a low EMA prior. Set 0.0 to disable.
         """
         points_world = points_world.reshape(-1, 3).to(self.device)
         mask_values = mask_values.reshape(-1).to(self.device).float().clamp(0.0, 1.0)
@@ -181,6 +192,12 @@ class MaskVoxelCache:
             valid = default_in_bounds
         else:
             valid = in_bounds.reshape(-1).to(self.device).bool() & default_in_bounds
+        # Confidence gate: only learn from values above the threshold. This
+        # keeps the cache silent (unobserved → validity=False in fusion) on
+        # voxels the model isn't actively editing yet.
+        if value_threshold > 0.0:
+            confident = mask_values >= float(value_threshold)
+            valid = valid & confident
         idx = idx[valid]
         mask_values = mask_values[valid]
         if idx.numel() == 0:

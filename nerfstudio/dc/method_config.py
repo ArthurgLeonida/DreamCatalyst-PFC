@@ -89,6 +89,14 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_warmup_end=1200,
     mask_voxel_cache_max_blend=0.5,
     mask_voxel_cache_accumulation_threshold=0.3,
+    # Confidence gate on cache UPDATES — pixels with internal mask below this
+    # are skipped, so voxels where the model isn't actively editing yet stay
+    # unobserved instead of accumulating stale low priors that suppress
+    # late-emerging edits (e.g. stormtrooper helmet appearing only at iter
+    # ~1400). 0.0 disables the gate. 0.3 is a safe universal default — body
+    # / face / clown body all easily clear it; helmet / elf clothes / silent
+    # background do not.
+    mask_voxel_cache_update_threshold=0.3,
     mask_voxel_cache_bbox_source="observed",
     mask_voxel_cache_bbox_observe_steps=50,
     mask_voxel_cache_bbox_observe_quantile=0.05,

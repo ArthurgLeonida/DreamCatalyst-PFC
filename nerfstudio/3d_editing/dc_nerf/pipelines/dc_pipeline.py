@@ -58,6 +58,16 @@ class DCPipelineConfig(VanillaPipelineConfig):
     mask_voxel_cache_accumulation_threshold: float = VOXEL_CACHE_PARAMS[
         "mask_voxel_cache_accumulation_threshold"
     ]
+    # Confidence gate on cache updates — pixels with internal mask below
+    # this threshold are skipped from the EMA accumulation. Prevents the
+    # cache from learning "this region is not edited" priors on voxels
+    # where the model has not yet committed any edit signal (e.g. the
+    # stormtrooper helmet stays unobserved during iters 0–1400; once
+    # internal_grad_mask(head) rises past the threshold, learning kicks
+    # in fresh against the fallback rather than against a stale low EMA).
+    mask_voxel_cache_update_threshold: float = VOXEL_CACHE_PARAMS[
+        "mask_voxel_cache_update_threshold"
+    ]
     # Source for the cache's world-space bbox.
     #   "observed" (default) — observe `bbox_observe_steps` iterations of
     #                          backprojected world points first, take their
@@ -542,6 +552,7 @@ class DCPipeline(ModifiedVanillaPipeline):
                 mask_world_points,
                 new_mask,
                 in_bounds=mask_world_points_valid,
+                value_threshold=self.config.mask_voxel_cache_update_threshold,
             )
             if self.use_wandb and step % self.config.log_step == 0:
                 import wandb
