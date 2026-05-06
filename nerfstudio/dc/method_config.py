@@ -19,17 +19,17 @@ DC_CUSTOM_PARAMS = dict(
     psi=0.075,
     source_blend_localization_enabled=True,
     gradient_mask_enabled=False,
-    outside_mask_anchor_weight=0.2,
+    outside_mask_anchor_weight=0.15,
     outside_mask_anchor_edit_strength_adaptive=True,
 
     gradient_mask_blur=0.5,
     gradient_mask_gamma=1.2,
-    gradient_mask_ema_beta=0.0,
+    gradient_mask_ema_beta=0,
     gradient_mask_warmup=0,
 
     cross_attention_mask_enabled=True,
     cross_attention_mask_layers=[1, 2],
-    cross_attention_mask_weight=0.85,
+    cross_attention_mask_weight=0.7,
     cross_attention_mask_blur=0.5,
     cross_attention_mask_gamma=1.2,
 
@@ -41,8 +41,17 @@ DC_CUSTOM_PARAMS = dict(
     # while supplying cross-view consensus where the internal mask is weak.
     external_mask_fusion="screen",
     # For screen fusion only, gate the voxel-cache contribution by the
-    # cross-attention mask. 1.0 = full semantic gating, 0.0 = no CA gate.
-    external_mask_screen_attn_gate_strength=1.0,
+    # selected screen-gate signal. 1.0 = full gating, 0.0 = no gate.
+    external_mask_screen_attn_gate_strength=0.3,
+    # Which signal opens the screen-mode cache gate. Options:
+    #   "ca"          : M_attn (semantic; late-confirmation signal)
+    #   "self"        : M_self (responsive to raw DDS delta; circular risk)
+    #   "hybrid_max"  : max(M_self, M_attn) — most aggressive, recovers
+    #                   late-forming features (helmet) but may amplify
+    #                   per-view artifacts
+    #   "hybrid_mean" : 0.5(M_self + M_attn) — balanced; recommended
+    #                   first probe for the self-gate idea
+    external_mask_screen_gate_source="hybrid_mean",
 
     # ---------------------------------------------------------------------
     # 2. TAG branch
@@ -55,7 +64,7 @@ DC_CUSTOM_PARAMS = dict(
     # 3. STG branch
     # ---------------------------------------------------------------------
     stg_enabled=True,
-    stg_scale=2,
+    stg_scale=2.35,
     stg_skip_layers=[2],
     stg_schedule_enabled=True,
     stg_schedule_start_ratio=0.4,
@@ -85,18 +94,11 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_enabled=True,
     mask_voxel_cache_resolution=64,
     mask_voxel_cache_ema_beta=0.9,
-    mask_voxel_cache_warmup_start=500,
-    mask_voxel_cache_warmup_end=1200,
-    mask_voxel_cache_max_blend=0.5,
+    mask_voxel_cache_warmup_start=1500,
+    mask_voxel_cache_warmup_end=2700,
+    mask_voxel_cache_max_blend=0.4,
     mask_voxel_cache_accumulation_threshold=0.3,
-    # Confidence gate on cache UPDATES — pixels with internal mask below this
-    # are skipped, so voxels where the model isn't actively editing yet stay
-    # unobserved instead of accumulating stale low priors that suppress
-    # late-emerging edits (e.g. stormtrooper helmet appearing only at iter
-    # ~1400). 0.0 disables the gate. 0.3 is a safe universal default — body
-    # / face / clown body all easily clear it; helmet / elf clothes / silent
-    # background do not.
-    mask_voxel_cache_update_threshold=0.3,
+    mask_voxel_cache_update_threshold=0.2,
     mask_voxel_cache_bbox_source="observed",
     mask_voxel_cache_bbox_observe_steps=50,
     mask_voxel_cache_bbox_observe_quantile=0.05,

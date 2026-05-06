@@ -123,18 +123,34 @@ class DCConfig:
     #       per-view false positives but kills cross-view support.
     external_mask_fusion: str = "screen"
     # For "screen" fusion only: how strongly the cache's contribution is gated
-    # by the cross-attention mask. The gate is a convex blend between full
+    # by the selected gate signal. The gate is a convex blend between full
     # gating and no gating:
-    #     gate = (1 − strength) + strength · M_attn
+    #     gate = (1 - strength) + strength * gate_signal
     # so:
-    #   strength = 1.0 → full CA gating (default; best for face-only edits like
-    #                    elf where cache must not leak to clothes).
-    #   strength = 0.5 → softened gating (gate ∈ [0.5, 1.0]); recovers some
-    #                    cache support in moderate-attention regions
-    #                    (e.g. stormtrooper head) at a small cost to the
-    #                    elf-clothes fix.
-    #   strength = 0.0 → no CA gating (equivalent to plain screen).
+    #   strength = 1.0: full gating by gate_signal.
+    #   strength = 0.5: softened gating (gate in [0.5, 1.0]).
+    #   strength = 0.0: no gating (equivalent to plain screen).
     external_mask_screen_attn_gate_strength: float = 1.0
+    # Which signal opens the screen-mode cache gate. Background:
+    # CA mask (`M_attn`) is a *late confirmation* signal — it brightens on
+    # a region only after the diffusion model semantically commits to
+    # editing it. For late-forming objects (e.g. stormtrooper helmet,
+    # which only emerges after iter ~1400 because the model spends the
+    # early budget on the body), CA-only gating gives no cache support
+    # during discovery, so the helmet edit never gets the cross-view
+    # consensus boost the body got. Self-mask (`M_self`) is *responsive*:
+    # it fires on the raw DDS delta the moment the model attempts an
+    # edit, before commitment. Gating by `M_self` lets the cache help
+    # discover late-forming structure but risks self-reinforcing
+    # per-view artifacts.
+    #
+    # Modes (the `gate` factor multiplied into the cache contribution):
+    #   "ca"           : gate_signal = M_attn          (current default)
+    #   "self"         : gate_signal = M_self          (responsive but circular)
+    #   "hybrid_max"   : gate_signal = max(M_self, M_attn)  (most aggressive)
+    #   "hybrid_mean"  : gate_signal = 0.5(M_self + M_attn) (balanced — recommended for universal config probes)
+    # Where `gate = (1 - strength) + strength * gate_signal`.
+    external_mask_screen_gate_source: str = "ca"
 
 
 class DC(object):
@@ -516,27 +532,57 @@ class DC(object):
                     # benefit on edits where M_attn is broad (stormtrooper
                     # body, clown body).
                     contribution = blend * ext * (1.0 - grad_mask)
-                    if cross_attention_mask is not None:
-                        ca = cross_attention_mask
-                        if ca.shape[-2:] != contribution.shape[-2:]:
-                            ca = F.interpolate(
-                                ca,
-                                size=contribution.shape[-2:],
-                                mode="bilinear",
-                                align_corners=False,
+                    if cross_attention_mask is not None or self_grad_mask is not None:
+                        target_shape = contribution.shape[-2:]
+
+                        def _to_target(m):
+                            if m is None:
+                                return None
+                            if m.shape[-2:] != target_shape:
+                                m = F.interpolate(
+                                    m,
+                                    size=target_shape,
+                                    mode="bilinear",
+                                    align_corners=False,
+                                )
+                            return m.to(
+                                device=contribution.device,
+                                dtype=contribution.dtype,
+                            ).clamp(0.0, 1.0)
+
+                        ca = _to_target(cross_attention_mask)
+                        sm = _to_target(self_grad_mask)
+
+                        # Choose which signal opens the gate. See DCConfig
+                        # docstring for motivation. Hybrid modes fall back to
+                        # whichever signal is available; unknown names fail
+                        # loudly so experiment runs cannot silently use CA.
+                        gate_source = str(self.config.external_mask_screen_gate_source).lower()
+                        if gate_source == "ca":
+                            gate_signal = ca if ca is not None else sm
+                        elif gate_source == "self":
+                            gate_signal = sm if sm is not None else ca
+                        elif gate_source == "hybrid_max":
+                            if sm is not None and ca is not None:
+                                gate_signal = torch.maximum(sm, ca)
+                            else:
+                                gate_signal = sm if sm is not None else ca
+                        elif gate_source == "hybrid_mean":
+                            if sm is not None and ca is not None:
+                                gate_signal = 0.5 * (sm + ca)
+                            else:
+                                gate_signal = sm if sm is not None else ca
+                        else:
+                            raise ValueError(
+                                f"Unknown external_mask_screen_gate_source={gate_source!r}; "
+                                "expected 'ca', 'self', 'hybrid_max', or 'hybrid_mean'."
                             )
-                        ca = ca.to(
-                            device=contribution.device, dtype=contribution.dtype
-                        ).clamp(0.0, 1.0)
-                        # Convex-blend between "full gating" (gate = M_attn)
-                        # and "no gating" (gate = 1). Tunable so moderate-
-                        # attention regions (e.g. stormtrooper head) can keep
-                        # cache support without losing the elf-clothes fix
-                        # entirely.
-                        strength = float(self.config.external_mask_screen_attn_gate_strength)
-                        strength = min(max(strength, 0.0), 1.0)
-                        gate = (1.0 - strength) + strength * ca
-                        contribution = contribution * gate
+
+                        if gate_signal is not None:
+                            strength = float(self.config.external_mask_screen_attn_gate_strength)
+                            strength = min(max(strength, 0.0), 1.0)
+                            gate = (1.0 - strength) + strength * gate_signal
+                            contribution = contribution * gate
                     fused = grad_mask + contribution
                 elif mode == "max":
                     # Hard upper-envelope.

@@ -102,7 +102,8 @@ if enabled:
         f"{voxel['mask_voxel_cache_warmup_end']})"
     )
     print(f"   {branch} fusion:     {dc['external_mask_fusion']}")
-    print(f"   {last} ca gate:    {dc['external_mask_screen_attn_gate_strength']}")
+    print(f"   {branch} gate src:   {dc['external_mask_screen_gate_source']}")
+    print(f"   {last} gate str:   {dc['external_mask_screen_attn_gate_strength']}")
 PY
 }
 
