@@ -148,9 +148,19 @@ class DCConfig:
     #   "ca"           : gate_signal = M_attn          (current default)
     #   "self"         : gate_signal = M_self          (responsive but circular)
     #   "hybrid_max"   : gate_signal = max(M_self, M_attn)  (most aggressive)
-    #   "hybrid_mean"  : gate_signal = 0.5(M_self + M_attn) (balanced — recommended for universal config probes)
+    #   "hybrid_mean"  : gate_signal = 0.5(M_self + M_attn) (averaged; can underperform
+    #                                                       pure CA when M_self < M_attn
+    #                                                       in target region)
+    #   "self_boost"   : gate_signal = M_attn + λ · max(M_self − M_attn, 0)
+    #                    Monotone over CA: gate_signal ≥ M_attn always. Self contributes
+    #                    only where it discovers signal CA missed (e.g. early helmet
+    #                    formation). λ is `external_mask_screen_self_boost_lambda`.
     # Where `gate = (1 - strength) + strength * gate_signal`.
     external_mask_screen_gate_source: str = "ca"
+    # For "self_boost" mode only: how strongly self-mask is allowed to lift
+    # the gate above CA when M_self > M_attn. λ=0 collapses to pure CA;
+    # λ=1.0 fully uses self where self exceeds CA; λ>1 over-boosts (risky).
+    external_mask_screen_self_boost_lambda: float = 1.0
 
 
 class DC(object):
@@ -572,10 +582,24 @@ class DC(object):
                                 gate_signal = 0.5 * (sm + ca)
                             else:
                                 gate_signal = sm if sm is not None else ca
+                        elif gate_source == "self_boost":
+                            # Monotone over CA: M_gate ≥ M_attn always.
+                            #   M_gate = M_attn + λ · max(M_self − M_attn, 0)
+                            # Self contributes only where it exceeds CA, so this
+                            # never regresses below pure-CA behavior. Designed
+                            # for late-forming features (helmet) where M_self
+                            # spikes ahead of M_attn during discovery.
+                            if sm is not None and ca is not None:
+                                lam = float(self.config.external_mask_screen_self_boost_lambda)
+                                lam = max(lam, 0.0)
+                                gate_signal = ca + lam * (sm - ca).clamp_min(0.0)
+                                gate_signal = gate_signal.clamp(0.0, 1.0)
+                            else:
+                                gate_signal = ca if ca is not None else sm
                         else:
                             raise ValueError(
                                 f"Unknown external_mask_screen_gate_source={gate_source!r}; "
-                                "expected 'ca', 'self', 'hybrid_max', or 'hybrid_mean'."
+                                "expected 'ca', 'self', 'hybrid_max', 'hybrid_mean', or 'self_boost'."
                             )
 
                         if gate_signal is not None:

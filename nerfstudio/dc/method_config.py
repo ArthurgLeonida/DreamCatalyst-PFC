@@ -49,9 +49,16 @@ DC_CUSTOM_PARAMS = dict(
     #   "hybrid_max"  : max(M_self, M_attn) — most aggressive, recovers
     #                   late-forming features (helmet) but may amplify
     #                   per-view artifacts
-    #   "hybrid_mean" : 0.5(M_self + M_attn) — balanced; recommended
-    #                   first probe for the self-gate idea
-    external_mask_screen_gate_source="hybrid_mean",
+    #   "hybrid_mean" : 0.5(M_self + M_attn) — averaged; can underperform
+    #                   pure CA when M_self < M_attn in target region
+    #   "self_boost"  : M_attn + λ · max(M_self − M_attn, 0) — monotone over
+    #                   CA (gate ≥ M_attn always); self contributes only
+    #                   where it discovers signal CA missed. Best universal
+    #                   candidate for late-forming features (helmet).
+    external_mask_screen_gate_source="self_boost",
+    # For "self_boost" mode only: how strongly self lifts the gate above
+    # CA when M_self > M_attn. 0 = pure CA, 1 = full self-boost.
+    external_mask_screen_self_boost_lambda=1.0,
 
     # ---------------------------------------------------------------------
     # 2. TAG branch
