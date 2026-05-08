@@ -11,12 +11,25 @@ def compute_tag_eta(eta_tag: float, t_normalized: float, adaptive_tag: bool) -> 
     return 1.0 + (eta_tag - 1.0) * t_normalized ** (1 / math.e)
 
 
-def compute_ca_mask_weight(weight: float, t_normalized: float, reverse_tag_schedule: bool) -> float:
+def compute_ca_mask_weight(
+    weight: float,
+    t_normalized: float,
+    reverse_tag_schedule: bool,
+    min_step_ratio: float,
+    max_step_ratio: float,
+    schedule_power: float,
+) -> float:
     """Return the Cross-Attention mask weight for the current timestep."""
     weight = min(max(float(weight), 0.0), 1.0)
     if not reverse_tag_schedule:
         return weight
-    return weight * (1.0 - t_normalized ** (1 / math.e))
+
+    min_t = min(max(float(min_step_ratio), 0.0), 1.0)
+    max_t = min(max(float(max_step_ratio), min_t + 1e-8), 1.0)
+    t = min(max(float(t_normalized), min_t), max_t)
+    progress = (max_t - t) / max(max_t - min_t, 1e-8)
+    exponent = max(float(schedule_power), 1e-8) * math.e
+    return weight * (progress ** exponent)
 
 
 def apply_tag(noise_pred: torch.Tensor, latents_noisy: torch.Tensor, eta: float) -> torch.Tensor:

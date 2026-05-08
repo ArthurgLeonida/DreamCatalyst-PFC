@@ -91,7 +91,11 @@ if ca_enabled:
     print(f"   {branch} weight:     {dc['cross_attention_mask_weight']}")
     print(f"   {branch} gamma:      {dc['cross_attention_mask_gamma']}")
     if sched:
-        print(f"   {last} schedule:   reverse_tag 0{arrow}{dc['cross_attention_mask_weight']}")
+        print(
+            f"   {last} schedule:   "
+            f"reverse_tag 0{arrow}{dc['cross_attention_mask_weight']} "
+            f"(power={dc['cross_attention_mask_weight_schedule_power']})"
+        )
     else:
         print(f"   {last} schedule:   off")
 print(f" Voxel 3D:  {enabled}")

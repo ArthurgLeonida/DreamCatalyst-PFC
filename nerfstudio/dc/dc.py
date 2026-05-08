@@ -96,10 +96,12 @@ class DCConfig:
     cross_attention_mask_weight: float = 1.0
     cross_attention_mask_blur: float = 0.0
     cross_attention_mask_gamma: float = 1.0
-    # Optional reverse-TAG CA schedule:
-    #     w_CA(t) = cross_attention_mask_weight * (1 - t_norm^(1/e))
+    # Optional active-range reverse-TAG CA schedule:
+    #     progress = (max_t - t_norm) / (max_t - min_t)
+    #     w_CA(t) = cross_attention_mask_weight * progress^(power * e)
     # This keeps CA soft at high-noise steps and strengthens it later.
     cross_attention_mask_weight_schedule_enabled: bool = False
+    cross_attention_mask_weight_schedule_power: float = 0.75
 
     latent_mean_anchor_weight: float = 0.0
 
@@ -457,6 +459,9 @@ class DC(object):
             self.config.cross_attention_mask_weight,
             t_normalized,
             self.config.cross_attention_mask_weight_schedule_enabled,
+            self.config.min_step_ratio,
+            self.config.max_step_ratio,
+            self.config.cross_attention_mask_weight_schedule_power,
         )
 
         grad_mask = None

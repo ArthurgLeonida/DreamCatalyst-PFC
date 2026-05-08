@@ -33,6 +33,7 @@ DC_CUSTOM_PARAMS = dict(
     cross_attention_mask_blur=0.5,
     cross_attention_mask_gamma=1.2,
     cross_attention_mask_weight_schedule_enabled=True,
+    cross_attention_mask_weight_schedule_power=0.75,
 
     latent_mean_anchor_weight=0.005,
 
