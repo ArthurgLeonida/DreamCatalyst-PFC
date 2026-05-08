@@ -51,8 +51,6 @@ def log_dc_debug_to_wandb(
     grad_mask: Optional[torch.Tensor],
     self_grad_mask: Optional[torch.Tensor],
     cross_attention_mask: Optional[torch.Tensor],
-    source_object_mask: Optional[torch.Tensor],
-    object_support_mask: Optional[torch.Tensor],
     tensor_to_pil_fn,
     resize_image_fn,
 ):
@@ -122,30 +120,6 @@ def log_dc_debug_to_wandb(
         log_payload["dc_debug/cross_attention_mask_mean"] = cross_mask_stats["mean"]
         log_payload["dc_debug/cross_attention_mask_max"] = cross_mask_stats["max"]
         log_payload["dc_debug/cross_attention_mask_coverage_0.5"] = cross_mask_stats["coverage_0.5"]
-
-    if source_object_mask is not None:
-        source_object_stats = summarize_mask(source_object_mask)
-        log_payload["dc_debug/source_object_mask"] = make_wandb_image(
-            source_object_mask,
-            tensor_to_pil_fn,
-            resize_image_fn,
-            caption,
-        )
-        log_payload["dc_debug/source_object_mask_mean"] = source_object_stats["mean"]
-        log_payload["dc_debug/source_object_mask_max"] = source_object_stats["max"]
-        log_payload["dc_debug/source_object_mask_coverage_0.5"] = source_object_stats["coverage_0.5"]
-
-    if object_support_mask is not None:
-        object_support_stats = summarize_mask(object_support_mask)
-        log_payload["dc_debug/object_support_mask"] = make_wandb_image(
-            object_support_mask,
-            tensor_to_pil_fn,
-            resize_image_fn,
-            caption,
-        )
-        log_payload["dc_debug/object_support_mask_mean"] = object_support_stats["mean"]
-        log_payload["dc_debug/object_support_mask_max"] = object_support_stats["max"]
-        log_payload["dc_debug/object_support_mask_coverage_0.5"] = object_support_stats["coverage_0.5"]
 
     if grad_mask is not None:
         grad_mask_stats = summarize_mask(grad_mask)
