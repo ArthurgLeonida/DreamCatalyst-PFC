@@ -95,6 +95,13 @@ class DCConfig:
     cross_attention_mask_weight: float = 1.0
     cross_attention_mask_blur: float = 0.0
     cross_attention_mask_gamma: float = 1.0
+    # Optional object-level editable-region prior from source-prompt CA.
+    # This is deliberately broader than the target-token CA mask: it marks the
+    # source object that is allowed to change, while the DDS/IP2P signal still
+    # decides what changes inside that object. If beta > 0:
+    #   M_support = max(M_hybrid, beta * M_src_obj)
+    # and the voxel cache learns/queries this object-supported mask.
+    source_object_mask_weight: float = 0.0
 
     latent_mean_anchor_weight: float = 0.0
 
@@ -155,6 +162,8 @@ class DCConfig:
     #                    Monotone over CA: gate_signal ≥ M_attn always. Self contributes
     #                    only where it discovers signal CA missed (e.g. early helmet
     #                    formation). λ is `external_mask_screen_self_boost_lambda`.
+    #   "object"       : gate_signal = M_object_support, the source-object
+    #                    editable-region support described above.
     # Where `gate = (1 - strength) + strength * gate_signal`.
     external_mask_screen_gate_source: str = "ca"
     # For "self_boost" mode only: how strongly self-mask is allowed to lift
@@ -379,13 +388,23 @@ class DC(object):
         noisy_latents = dict()
         base_text_embeddings_by_name = dict()
         base_latent_model_inputs = dict()
-        cross_attention_mask = None
-        cross_attention_token_indices = None
+        target_cross_attention_mask = None
+        source_object_mask = None
+        object_support_mask = None
+        target_cross_attention_token_indices = None
+        source_object_token_indices = None
         if self.config.cross_attention_mask_enabled:
-            cross_attention_token_indices = get_cross_attention_token_indices(
+            target_cross_attention_token_indices = get_cross_attention_token_indices(
                 self.tokenizer,
                 self.tgt_prompt,
                 src_prompt=self.src_prompt,
+            )
+        source_object_weight = min(max(float(self.config.source_object_mask_weight), 0.0), 1.0)
+        if source_object_weight > 0:
+            source_object_token_indices = get_cross_attention_token_indices(
+                self.tokenizer,
+                self.src_prompt,
+                src_prompt=None,
             )
 
         uncond_image_latent = torch.zeros_like(src_encoded)
@@ -406,40 +425,47 @@ class DC(object):
             base_text_embeddings_by_name[name] = base_text_embeddings
             base_latent_model_inputs[name] = base_latent_model_input
 
-            if name == "tgt":
-                timestep_input = torch.cat([t] * 3).to(device)
-                if self.config.cross_attention_mask_enabled:
-                    noise_pred, cross_attention_mask = run_unet_with_cross_attention_capture(
-                        self.unet,
-                        self.config.cross_attention_mask_layers,
-                        cross_attention_token_indices,
-                        base_latent_model_input,
-                        timestep_input,
-                        base_text_embeddings,
-                        conditioned_batch_size=batch_size,
-                        build_attention_mask_fn=lambda maps: build_cross_attention_relevance_mask(
-                            maps,
-                            gamma=self.config.cross_attention_mask_gamma,
-                            sigma=self.config.cross_attention_mask_blur,
-                            target_shape=latents_noisy.shape[-2:],
-                        ),
-                    )
+            timestep_input = torch.cat([t] * 3).to(device)
+            capture_target_ca = name == "tgt" and self.config.cross_attention_mask_enabled
+            capture_source_object_ca = name == "src" and source_object_token_indices is not None
+
+            if capture_target_ca or capture_source_object_ca:
+                token_indices = (
+                    target_cross_attention_token_indices
+                    if capture_target_ca
+                    else source_object_token_indices
+                )
+                noise_pred, captured_mask = run_unet_with_cross_attention_capture(
+                    self.unet,
+                    self.config.cross_attention_mask_layers,
+                    token_indices,
+                    base_latent_model_input,
+                    timestep_input,
+                    base_text_embeddings,
+                    conditioned_batch_size=batch_size,
+                    build_attention_mask_fn=lambda maps: build_cross_attention_relevance_mask(
+                        maps,
+                        gamma=self.config.cross_attention_mask_gamma,
+                        sigma=self.config.cross_attention_mask_blur,
+                        target_shape=latents_noisy.shape[-2:],
+                    ),
+                )
+                if capture_target_ca:
+                    target_cross_attention_mask = captured_mask
                 else:
-                    noise_pred = self.unet.forward(
-                        base_latent_model_input,
-                        timestep_input,
-                        encoder_hidden_states=base_text_embeddings,
-                    ).sample
-                noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
-                noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_image) + \
-                    self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
+                    source_object_mask = captured_mask
             else:
-                timestep_input = torch.cat([t] * 3).to(device)
                 noise_pred = self.unet.forward(
                     base_latent_model_input,
                     timestep_input,
                     encoder_hidden_states=base_text_embeddings,
                 ).sample
+
+            if name == "tgt":
+                noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
+                noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_image) + \
+                    self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
+            else:
                 noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
                 noise_pred = noise_pred_uncond + self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
 
@@ -468,22 +494,47 @@ class DC(object):
             )
             grad_mask = self_grad_mask
 
-        if cross_attention_mask is not None:
+        if target_cross_attention_mask is not None:
             target_shape = grad_mask.shape[-2:] if grad_mask is not None else eps_raw["tgt"].shape[-2:]
-            if cross_attention_mask.shape[-2:] != target_shape:
-                cross_attention_mask = F.interpolate(
-                    cross_attention_mask,
+            if target_cross_attention_mask.shape[-2:] != target_shape:
+                target_cross_attention_mask = F.interpolate(
+                    target_cross_attention_mask,
                     size=target_shape,
                     mode="bilinear",
                     align_corners=False,
                 )
             if grad_mask is None:
-                grad_mask = cross_attention_mask
+                grad_mask = target_cross_attention_mask
             else:
                 weight = float(self.config.cross_attention_mask_weight)
                 weight = min(max(weight, 0.0), 1.0)
                 self_mask = grad_mask
-                grad_mask = self_mask * ((1.0 - weight) + weight * cross_attention_mask)
+                grad_mask = self_mask * ((1.0 - weight) + weight * target_cross_attention_mask)
+            grad_mask = grad_mask.clamp(0.0, 1.0)
+
+        if source_object_mask is not None and source_object_weight > 0:
+            target_shape = grad_mask.shape[-2:] if grad_mask is not None else eps_raw["tgt"].shape[-2:]
+            if source_object_mask.shape[-2:] != target_shape:
+                source_object_mask = F.interpolate(
+                    source_object_mask,
+                    size=target_shape,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            source_object_mask = source_object_mask.to(
+                device=eps_raw["tgt"].device,
+                dtype=eps_raw["tgt"].dtype,
+            ).clamp(0.0, 1.0)
+            object_support_mask = (source_object_weight * source_object_mask).clamp(0.0, 1.0)
+            if target_cross_attention_mask is not None:
+                object_support_mask = torch.maximum(object_support_mask, target_cross_attention_mask)
+            if grad_mask is None:
+                grad_mask = object_support_mask
+            else:
+                # Treat the source-object CA as an editable-region floor rather
+                # than a part-level target mask: it can open the object volume,
+                # but it never lowers the DDS-derived hybrid mask.
+                grad_mask = torch.maximum(grad_mask, object_support_mask)
             grad_mask = grad_mask.clamp(0.0, 1.0)
 
         internal_grad_mask = grad_mask.detach().clone() if grad_mask is not None else None
@@ -542,7 +593,7 @@ class DC(object):
                     # benefit on edits where M_attn is broad (stormtrooper
                     # body, clown body).
                     contribution = blend * ext * (1.0 - grad_mask)
-                    if cross_attention_mask is not None or self_grad_mask is not None:
+                    if target_cross_attention_mask is not None or self_grad_mask is not None or object_support_mask is not None:
                         target_shape = contribution.shape[-2:]
 
                         def _to_target(m):
@@ -560,8 +611,9 @@ class DC(object):
                                 dtype=contribution.dtype,
                             ).clamp(0.0, 1.0)
 
-                        ca = _to_target(cross_attention_mask)
+                        target_ca = _to_target(target_cross_attention_mask)
                         sm = _to_target(self_grad_mask)
+                        obj = _to_target(object_support_mask)
 
                         # Choose which signal opens the gate. See DCConfig
                         # docstring for motivation. Hybrid modes fall back to
@@ -569,19 +621,19 @@ class DC(object):
                         # loudly so experiment runs cannot silently use CA.
                         gate_source = str(self.config.external_mask_screen_gate_source).lower()
                         if gate_source == "ca":
-                            gate_signal = ca if ca is not None else sm
+                            gate_signal = target_ca if target_ca is not None else sm
                         elif gate_source == "self":
-                            gate_signal = sm if sm is not None else ca
+                            gate_signal = sm if sm is not None else target_ca
                         elif gate_source == "hybrid_max":
-                            if sm is not None and ca is not None:
-                                gate_signal = torch.maximum(sm, ca)
+                            if sm is not None and target_ca is not None:
+                                gate_signal = torch.maximum(sm, target_ca)
                             else:
-                                gate_signal = sm if sm is not None else ca
+                                gate_signal = sm if sm is not None else target_ca
                         elif gate_source == "hybrid_mean":
-                            if sm is not None and ca is not None:
-                                gate_signal = 0.5 * (sm + ca)
+                            if sm is not None and target_ca is not None:
+                                gate_signal = 0.5 * (sm + target_ca)
                             else:
-                                gate_signal = sm if sm is not None else ca
+                                gate_signal = sm if sm is not None else target_ca
                         elif gate_source == "self_boost":
                             # Monotone over CA: M_gate ≥ M_attn always.
                             #   M_gate = M_attn + λ · max(M_self − M_attn, 0)
@@ -589,17 +641,21 @@ class DC(object):
                             # never regresses below pure-CA behavior. Designed
                             # for late-forming features (helmet) where M_self
                             # spikes ahead of M_attn during discovery.
-                            if sm is not None and ca is not None:
+                            if sm is not None and target_ca is not None:
                                 lam = float(self.config.external_mask_screen_self_boost_lambda)
                                 lam = max(lam, 0.0)
-                                gate_signal = ca + lam * (sm - ca).clamp_min(0.0)
+                                gate_signal = target_ca + lam * (sm - target_ca).clamp_min(0.0)
                                 gate_signal = gate_signal.clamp(0.0, 1.0)
                             else:
-                                gate_signal = ca if ca is not None else sm
+                                gate_signal = target_ca if target_ca is not None else sm
+                        elif gate_source == "object":
+                            gate_signal = obj if obj is not None else target_ca
+                            if gate_signal is None:
+                                gate_signal = sm
                         else:
                             raise ValueError(
                                 f"Unknown external_mask_screen_gate_source={gate_source!r}; "
-                                "expected 'ca', 'self', 'hybrid_max', 'hybrid_mean', or 'self_boost'."
+                                "expected 'ca', 'self', 'hybrid_max', 'hybrid_mean', 'self_boost', or 'object'."
                             )
 
                         if gate_signal is not None:
@@ -713,7 +769,9 @@ class DC(object):
                 pred_x0_src=self.decode_latent(pred_x0s["src"]),
                 grad_mask=grad_mask,
                 self_grad_mask=self_grad_mask,
-                cross_attention_mask=cross_attention_mask,
+                cross_attention_mask=target_cross_attention_mask,
+                source_object_mask=source_object_mask,
+                object_support_mask=object_support_mask,
                 tensor_to_pil_fn=tensor_to_pil,
                 resize_image_fn=resize_image,
             )
@@ -726,7 +784,9 @@ class DC(object):
                 "grad_mask": grad_mask,
                 "internal_grad_mask": internal_grad_mask,
                 "self_grad_mask": self_grad_mask,
-                "cross_attention_mask": cross_attention_mask,
+                "cross_attention_mask": target_cross_attention_mask,
+                "source_object_mask": source_object_mask,
+                "object_support_mask": object_support_mask,
                 "edit_strength": current_edit_strength,
                 "stg_scale": current_stg_scale if self.config.stg_enabled else 0.0,
             }

@@ -32,6 +32,10 @@ DC_CUSTOM_PARAMS = dict(
     cross_attention_mask_weight=0.7,
     cross_attention_mask_blur=0.5,
     cross_attention_mask_gamma=1.2,
+    # Source-object editable-region prior. Instead of asking CA to decide the
+    # exact edited part, this opens the source object volume as the region where
+    # IP2P/DDS is allowed to make changes, while preserving the background.
+    source_object_mask_weight=0.7,
 
     latent_mean_anchor_weight=0.005,
 
@@ -42,7 +46,7 @@ DC_CUSTOM_PARAMS = dict(
     external_mask_fusion="screen",
     # For screen fusion only, gate the voxel-cache contribution by the
     # selected screen-gate signal. 1.0 = full gating, 0.0 = no gate.
-    external_mask_screen_attn_gate_strength=0.3,
+    external_mask_screen_attn_gate_strength=1.0,
     # Which signal opens the screen-mode cache gate. Options:
     #   "ca"          : M_attn (semantic; late-confirmation signal)
     #   "self"        : M_self (responsive to raw DDS delta; circular risk)
@@ -55,7 +59,9 @@ DC_CUSTOM_PARAMS = dict(
     #                   CA (gate ≥ M_attn always); self contributes only
     #                   where it discovers signal CA missed. Best universal
     #                   candidate for late-forming features (helmet).
-    external_mask_screen_gate_source="self_boost",
+    #   "object"      : source-object editable support (recommended for the
+    #                   voxel-cache object-region formulation).
+    external_mask_screen_gate_source="object",
     # For "self_boost" mode only: how strongly self lifts the gate above
     # CA when M_self > M_attn. 0 = pure CA, 1 = full self-boost.
     external_mask_screen_self_boost_lambda=1.0,

@@ -103,6 +103,7 @@ if enabled:
     )
     print(f"   {branch} fusion:     {dc['external_mask_fusion']}")
     print(f"   {branch} gate src:   {dc['external_mask_screen_gate_source']}")
+    print(f"   {branch} obj prior:  {dc.get('source_object_mask_weight', 0.0)}")
     print(f"   {last} gate str:   {dc['external_mask_screen_attn_gate_strength']}")
 PY
 }
