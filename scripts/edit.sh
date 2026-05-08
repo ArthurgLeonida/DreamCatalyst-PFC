@@ -80,7 +80,20 @@ spec.loader.exec_module(module)
 voxel = module.VOXEL_CACHE_PARAMS
 dc = module.DC_CUSTOM_PARAMS
 enabled = 1 if voxel.get("mask_voxel_cache_enabled") else 0
+ca_enabled = 1 if dc.get("cross_attention_mask_enabled") else 0
 
+print(f" CA mask:   {ca_enabled}")
+if ca_enabled:
+    branch = "\u251c\u2500"
+    last = "\u2514\u2500"
+    arrow = "\u2192"
+    sched = 1 if dc.get("cross_attention_mask_weight_schedule_enabled") else 0
+    print(f"   {branch} weight:     {dc['cross_attention_mask_weight']}")
+    print(f"   {branch} gamma:      {dc['cross_attention_mask_gamma']}")
+    if sched:
+        print(f"   {last} schedule:   reverse_tag 0{arrow}{dc['cross_attention_mask_weight']}")
+    else:
+        print(f"   {last} schedule:   off")
 print(f" Voxel 3D:  {enabled}")
 if enabled:
     branch = "\u251c\u2500"

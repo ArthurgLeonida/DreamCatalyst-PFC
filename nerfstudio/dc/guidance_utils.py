@@ -11,6 +11,14 @@ def compute_tag_eta(eta_tag: float, t_normalized: float, adaptive_tag: bool) -> 
     return 1.0 + (eta_tag - 1.0) * t_normalized ** (1 / math.e)
 
 
+def compute_ca_mask_weight(weight: float, t_normalized: float, reverse_tag_schedule: bool) -> float:
+    """Return the Cross-Attention mask weight for the current timestep."""
+    weight = min(max(float(weight), 0.0), 1.0)
+    if not reverse_tag_schedule:
+        return weight
+    return weight * (1.0 - t_normalized ** (1 / math.e))
+
+
 def apply_tag(noise_pred: torch.Tensor, latents_noisy: torch.Tensor, eta: float) -> torch.Tensor:
     """Apply tangential amplification around the noisy latent direction."""
     if eta == 1.0:

@@ -18,6 +18,7 @@ from dc.guidance_utils import (
     apply_source_blend,
     apply_stg,
     apply_tag,
+    compute_ca_mask_weight,
     compute_edit_strength,
     compute_preserve_weight,
     compute_stg_scale,
@@ -95,6 +96,10 @@ class DCConfig:
     cross_attention_mask_weight: float = 1.0
     cross_attention_mask_blur: float = 0.0
     cross_attention_mask_gamma: float = 1.0
+    # Optional reverse-TAG CA schedule:
+    #     w_CA(t) = cross_attention_mask_weight * (1 - t_norm^(1/e))
+    # This keeps CA soft at high-noise steps and strengthens it later.
+    cross_attention_mask_weight_schedule_enabled: bool = False
 
     latent_mean_anchor_weight: float = 0.0
 
@@ -448,6 +453,11 @@ class DC(object):
         # EMA mask at post-increment iteration N.
         iteration_for_stg = self.iteration
         self.iteration += 1
+        current_cross_attention_mask_weight = compute_ca_mask_weight(
+            self.config.cross_attention_mask_weight,
+            t_normalized,
+            self.config.cross_attention_mask_weight_schedule_enabled,
+        )
 
         grad_mask = None
         self_grad_mask = None
@@ -476,8 +486,7 @@ class DC(object):
             if grad_mask is None:
                 grad_mask = target_cross_attention_mask
             else:
-                weight = float(self.config.cross_attention_mask_weight)
-                weight = min(max(weight, 0.0), 1.0)
+                weight = current_cross_attention_mask_weight
                 self_mask = grad_mask
                 grad_mask = self_mask * ((1.0 - weight) + weight * target_cross_attention_mask)
             grad_mask = grad_mask.clamp(0.0, 1.0)
@@ -710,6 +719,7 @@ class DC(object):
                 grad_mask=grad_mask,
                 self_grad_mask=self_grad_mask,
                 cross_attention_mask=target_cross_attention_mask,
+                cross_attention_mask_weight_current=current_cross_attention_mask_weight,
                 tensor_to_pil_fn=tensor_to_pil,
                 resize_image_fn=resize_image,
             )
@@ -723,6 +733,7 @@ class DC(object):
                 "internal_grad_mask": internal_grad_mask,
                 "self_grad_mask": self_grad_mask,
                 "cross_attention_mask": target_cross_attention_mask,
+                "cross_attention_mask_weight": current_cross_attention_mask_weight,
                 "edit_strength": current_edit_strength,
                 "stg_scale": current_stg_scale if self.config.stg_enabled else 0.0,
             }

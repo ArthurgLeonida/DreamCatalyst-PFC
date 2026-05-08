@@ -51,6 +51,7 @@ def log_dc_debug_to_wandb(
     grad_mask: Optional[torch.Tensor],
     self_grad_mask: Optional[torch.Tensor],
     cross_attention_mask: Optional[torch.Tensor],
+    cross_attention_mask_weight_current: Optional[float],
     tensor_to_pil_fn,
     resize_image_fn,
 ):
@@ -96,6 +97,10 @@ def log_dc_debug_to_wandb(
     }
     if current_edit_strength is not None:
         log_payload["dc_debug/edit_strength"] = float(current_edit_strength)
+    if cross_attention_mask_weight_current is not None:
+        log_payload["dc_debug/cross_attention_mask_weight_current"] = float(
+            cross_attention_mask_weight_current
+        )
 
     if self_grad_mask is not None:
         self_mask_stats = summarize_mask(self_grad_mask)
