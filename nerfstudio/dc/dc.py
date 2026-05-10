@@ -20,6 +20,7 @@ from dc.guidance_utils import (
     apply_tag,
     compute_ca_mask_weight,
     compute_edit_strength,
+    compute_gate_signal,
     compute_preserve_weight,
     compute_stg_scale,
     compute_tag_eta,
@@ -168,6 +169,9 @@ class DCConfig:
     # the gate above CA when M_self > M_attn. λ=0 collapses to pure CA;
     # λ=1.0 fully uses self where self exceeds CA; λ>1 over-boosts (risky).
     external_mask_screen_self_boost_lambda: float = 1.0
+    # For 'bidirectional' fusion only: how strongly the cache suppresses the 
+    # internal mask where they disagree.
+    external_mask_interp_suppression_ratio: float = 0.4
 
 
 class DC(object):
@@ -535,22 +539,54 @@ class DC(object):
                 if mode == "blend":
                     # Linear blend (legacy): replacement-style.
                     fused = (1.0 - blend) * grad_mask + blend * ext
+                elif mode == "bidirectional":
+                    # Bidirectional interpolation: M_hyb + b*gate*(M3d - M_hyb)
+                    # Can both increase AND decrease grad_mask toward M3d.
+                    # Use asymmetric blend to be conservative on suppression.
+                    diff = ext - grad_mask
+                    if target_cross_attention_mask is None and self_grad_mask is None:
+                        raise ValueError(
+                            "external_mask_fusion='bidirectional' requires at least one of "
+                            "target_cross_attention_mask or self_grad_mask to be available for "
+                            "gate computation. Enable cross_attention_mask or self-derived mask."
+                        )
+                    target_shape = diff.shape[-2:]
+
+                    def _to_target(m):
+                        if m is None:
+                            return None
+                        if m.shape[-2:] != target_shape:
+                            m = F.interpolate(
+                                m,
+                                size=target_shape,
+                                mode="bilinear",
+                                align_corners=False,
+                            )
+                        return m.to(
+                            device=diff.device, 
+                            dtype=diff.dtype
+                        ).clamp(0.0, 1.0)
+
+                    target_ca = _to_target(target_cross_attention_mask)
+                    sm = _to_target(self_grad_mask)
+
+                    gate_source = str(self.config.external_mask_screen_gate_source).lower()
+
+                    gate_signal = compute_gate_signal(
+                        gate_source=gate_source,
+                        target_ca=target_ca,
+                        sm=sm,
+                        self_boost_lambda=self.config.external_mask_screen_self_boost_lambda,
+                    )
+                    if gate_signal is not None:
+                        strength = min(max(float(self.config.external_mask_screen_attn_gate_strength), 0.0), 1.0)
+                        gate = (1.0 - strength) + strength * gate_signal
+                    
+                    b_up = blend
+                    b_down = blend * float(getattr(self.config, "external_mask_interp_suppression_ratio", 0.4))
+                    b_eff = torch.where(diff >= 0, b_up, b_down)
+                    fused = grad_mask + b_eff * gate * diff
                 elif mode == "screen":
-                    # Probabilistic union / additive support: cache only
-                    # raises the mask, never lowers it. Per-view edit peaks
-                    # are preserved (where M_int → 1 the contribution → 0).
-                    #
-                    # When a cross-attention mask is available, the cache
-                    # contribution is also gated by it:
-                    #   M = M_int + b · M_ext · (1 − M_int) · M_attn
-                    # Without this gate, screen fusion injects cache support
-                    # wherever the cache has a value — including regions the
-                    # prompt's semantic attention deliberately excludes (e.g.,
-                    # elf clothes when the prompt is face-only). The gate
-                    # restricts cache support to semantically-on-target
-                    # regions while preserving the cross-view-consistency
-                    # benefit on edits where M_attn is broad (stormtrooper
-                    # body, clown body).
                     contribution = blend * ext * (1.0 - grad_mask)
                     if target_cross_attention_mask is not None or self_grad_mask is not None:
                         target_shape = contribution.shape[-2:]
@@ -573,44 +609,14 @@ class DC(object):
                         target_ca = _to_target(target_cross_attention_mask)
                         sm = _to_target(self_grad_mask)
 
-                        # Choose which signal opens the gate. See DCConfig
-                        # docstring for motivation. Hybrid modes fall back to
-                        # whichever signal is available; unknown names fail
-                        # loudly so experiment runs cannot silently use CA.
                         gate_source = str(self.config.external_mask_screen_gate_source).lower()
-                        if gate_source == "ca":
-                            gate_signal = target_ca if target_ca is not None else sm
-                        elif gate_source == "self":
-                            gate_signal = sm if sm is not None else target_ca
-                        elif gate_source == "hybrid_max":
-                            if sm is not None and target_ca is not None:
-                                gate_signal = torch.maximum(sm, target_ca)
-                            else:
-                                gate_signal = sm if sm is not None else target_ca
-                        elif gate_source == "hybrid_mean":
-                            if sm is not None and target_ca is not None:
-                                gate_signal = 0.5 * (sm + target_ca)
-                            else:
-                                gate_signal = sm if sm is not None else target_ca
-                        elif gate_source == "self_boost":
-                            # Monotone over CA: M_gate ≥ M_attn always.
-                            #   M_gate = M_attn + λ · max(M_self − M_attn, 0)
-                            # Self contributes only where it exceeds CA, so this
-                            # never regresses below pure-CA behavior. Designed
-                            # for late-forming features (helmet) where M_self
-                            # spikes ahead of M_attn during discovery.
-                            if sm is not None and target_ca is not None:
-                                lam = float(self.config.external_mask_screen_self_boost_lambda)
-                                lam = max(lam, 0.0)
-                                gate_signal = target_ca + lam * (sm - target_ca).clamp_min(0.0)
-                                gate_signal = gate_signal.clamp(0.0, 1.0)
-                            else:
-                                gate_signal = target_ca if target_ca is not None else sm
-                        else:
-                            raise ValueError(
-                                f"Unknown external_mask_screen_gate_source={gate_source!r}; "
-                                "expected 'ca', 'self', 'hybrid_max', 'hybrid_mean', or 'self_boost'."
-                            )
+
+                        gate_signal = compute_gate_signal(
+                            gate_source=gate_source,
+                            target_ca=target_ca,
+                            sm=sm,
+                            self_boost_lambda=self.config.external_mask_screen_self_boost_lambda,
+                        )
 
                         if gate_signal is not None:
                             strength = float(self.config.external_mask_screen_attn_gate_strength)
@@ -628,13 +634,11 @@ class DC(object):
                 else:
                     raise ValueError(
                         f"Unknown external_mask_fusion={mode!r}; expected "
-                        f"'screen', 'blend', 'max', or 'min'."
+                        f"'screen', 'blend', 'max', 'min', or 'interp'."
                     )
                 grad_mask = torch.where(valid, fused, grad_mask) if valid is not None else fused
             grad_mask = grad_mask.clamp(0.0, 1.0)
 
-        # Edit strength is computed from the raw eps_raw snapshot (pre-STG / pre-TAG /
-        # pre-Perp-Neg), so it is available from step 1 — no warmup gating needed.
         current_edit_strength = compute_edit_strength(eps_raw["tgt"], eps_raw["src"])
         current_stg_scale = self._get_current_stg_scale(
             current_edit_strength=current_edit_strength,

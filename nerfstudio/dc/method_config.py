@@ -39,19 +39,24 @@ DC_CUSTOM_PARAMS = dict(
 
     external_mask_fusion="screen",
     external_mask_screen_attn_gate_strength=1.0, # For screen fusion only
+    external_mask_interp_suppression_ratio=0.4  # For bidirectional fusion only  
     
     # Which signal opens the screen-mode cache gate. Options:
-    #   "ca"          : M_attn (semantic; late-confirmation signal)
-    #   "self"        : M_self (responsive to raw DDS delta; circular risk)
-    #   "hybrid_max"  : max(M_self, M_attn) — most aggressive, recovers
-    #                   late-forming features (helmet) but may amplify
-    #                   per-view artifacts
-    #   "hybrid_mean" : 0.5(M_self + M_attn) — averaged; can underperform
-    #                   pure CA when M_self < M_attn in target region
-    #   "self_boost"  : M_attn + λ · max(M_self − M_attn, 0) — monotone over
-    #                   CA (gate ≥ M_attn always); self contributes only
-    #                   where it discovers signal CA missed. Best universal
-    #                   candidate for late-forming features (helmet).
+    #   "ca"            : M_attn (semantic; late-confirmation signal)
+    #   "self"          : M_self (responsive to raw DDS delta; circular risk)
+    #   "hybrid_max"    : max(M_self, M_attn) — most aggressive, recovers
+    #                     late-forming features (helmet) but may amplify
+    #                     per-view artifacts
+    #   "hybrid_mean"   : 0.5(M_self + M_attn) — averaged; can underperform
+    #                     pure CA when M_self < M_attn in target region
+    #   "self_boost"    : M_attn + λ · max(M_self − M_attn, 0) — monotone over
+    #                     CA (gate ≥ M_attn always); self contributes only
+    #                     where it discovers signal CA missed. Best universal
+    #                     candidate for late-forming features (helmet).
+    #   "bidirectional" : Scales the downward blend strength relative to 
+    #                     `external_mask_blend`. 1.0 = fully symmetric, 0.0 = 
+    #                     amplification-only (equivalent to screen). Default 0.4 
+    #                     is conservative: suppression is 40% as strong as amplification.
 
     external_mask_screen_gate_source="self_boost",
     external_mask_screen_self_boost_lambda=1.0, # For self_boost gate source only

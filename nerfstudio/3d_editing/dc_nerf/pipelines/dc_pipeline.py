@@ -469,10 +469,6 @@ class DCPipeline(ModifiedVanillaPipeline):
                     )
 
             if self.mask_voxel_cache is not None:
-                # Cache exists — query it. `cache_valid` is true only for
-                # observed, in-bounds, sufficiently accumulated voxels;
-                # invalid pixels fall back to the internal per-view mask
-                # inside DC.__call__.
                 queried, cache_valid = self.mask_voxel_cache.query(
                     mask_world_points,
                     in_bounds=mask_world_points_valid,
@@ -486,12 +482,6 @@ class DCPipeline(ModifiedVanillaPipeline):
                 )
                 external_mask_blend = self._voxel_cache_warmup_blend(voxel_cache_edit_step)
 
-            # ----------------------------------------------------------------
-            # Diagnostic logging — disentangle the failure modes that show up
-            # as a low `valid_ratio`. The pts_min/max and accumulation stats
-            # are always available; the in-bbox fraction requires an existing
-            # cache (so it's logged only after the observation window ends).
-            # ----------------------------------------------------------------
             if self.use_wandb and step % self.config.log_step == 0:
                 import wandb
                 with torch.no_grad():
