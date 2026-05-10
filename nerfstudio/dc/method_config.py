@@ -39,7 +39,7 @@ DC_CUSTOM_PARAMS = dict(
 
     external_mask_fusion="screen",
     external_mask_screen_attn_gate_strength=1.0, # For screen fusion only
-    external_mask_interp_suppression_ratio=0.4  # For bidirectional fusion only  
+    external_mask_interp_suppression_ratio=0.4,  # For bidirectional fusion only
     
     # Which signal opens the screen-mode cache gate. Options:
     #   "ca"            : M_attn (semantic; late-confirmation signal)

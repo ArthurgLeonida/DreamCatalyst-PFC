@@ -536,60 +536,19 @@ class DC(object):
                 grad_mask = ext
             else:
                 mode = str(self.config.external_mask_fusion).lower()
-                if mode == "blend":
-                    # Linear blend (legacy): replacement-style.
-                    fused = (1.0 - blend) * grad_mask + blend * ext
-                elif mode == "bidirectional":
-                    # Bidirectional interpolation: M_hyb + b*gate*(M3d - M_hyb)
-                    # Can both increase AND decrease grad_mask toward M3d.
-                    # Use asymmetric blend to be conservative on suppression.
-                    diff = ext - grad_mask
+                
+                # Check and compute gating signal once, before branching on fusion mode
+                gate_signal = None
+                if mode in ["bidirectional", "screen"]:
                     if target_cross_attention_mask is None and self_grad_mask is None:
-                        raise ValueError(
-                            "external_mask_fusion='bidirectional' requires at least one of "
-                            "target_cross_attention_mask or self_grad_mask to be available for "
-                            "gate computation. Enable cross_attention_mask or self-derived mask."
-                        )
-                    target_shape = diff.shape[-2:]
-
-                    def _to_target(m):
-                        if m is None:
-                            return None
-                        if m.shape[-2:] != target_shape:
-                            m = F.interpolate(
-                                m,
-                                size=target_shape,
-                                mode="bilinear",
-                                align_corners=False,
+                        if mode == "bidirectional":
+                            raise ValueError(
+                                "external_mask_fusion='bidirectional' requires at least one of "
+                                "target_cross_attention_mask or self_grad_mask to be available for "
+                                "gate computation. Enable cross_attention_mask or self-derived mask."
                             )
-                        return m.to(
-                            device=diff.device, 
-                            dtype=diff.dtype
-                        ).clamp(0.0, 1.0)
-
-                    target_ca = _to_target(target_cross_attention_mask)
-                    sm = _to_target(self_grad_mask)
-
-                    gate_source = str(self.config.external_mask_screen_gate_source).lower()
-
-                    gate_signal = compute_gate_signal(
-                        gate_source=gate_source,
-                        target_ca=target_ca,
-                        sm=sm,
-                        self_boost_lambda=self.config.external_mask_screen_self_boost_lambda,
-                    )
-                    if gate_signal is not None:
-                        strength = min(max(float(self.config.external_mask_screen_attn_gate_strength), 0.0), 1.0)
-                        gate = (1.0 - strength) + strength * gate_signal
-                    
-                    b_up = blend
-                    b_down = blend * float(getattr(self.config, "external_mask_interp_suppression_ratio", 0.4))
-                    b_eff = torch.where(diff >= 0, b_up, b_down)
-                    fused = grad_mask + b_eff * gate * diff
-                elif mode == "screen":
-                    contribution = blend * ext * (1.0 - grad_mask)
-                    if target_cross_attention_mask is not None or self_grad_mask is not None:
-                        target_shape = contribution.shape[-2:]
+                    else:
+                        target_shape = grad_mask.shape[-2:]
 
                         def _to_target(m):
                             if m is None:
@@ -601,10 +560,7 @@ class DC(object):
                                     mode="bilinear",
                                     align_corners=False,
                                 )
-                            return m.to(
-                                device=contribution.device,
-                                dtype=contribution.dtype,
-                            ).clamp(0.0, 1.0)
+                            return m.to(device=grad_mask.device, dtype=grad_mask.dtype).clamp(0.0, 1.0)
 
                         target_ca = _to_target(target_cross_attention_mask)
                         sm = _to_target(self_grad_mask)
@@ -618,11 +574,31 @@ class DC(object):
                             self_boost_lambda=self.config.external_mask_screen_self_boost_lambda,
                         )
 
-                        if gate_signal is not None:
-                            strength = float(self.config.external_mask_screen_attn_gate_strength)
-                            strength = min(max(strength, 0.0), 1.0)
-                            gate = (1.0 - strength) + strength * gate_signal
-                            contribution = contribution * gate
+                if mode == "blend":
+                    # Linear blend (legacy): replacement-style.
+                    fused = (1.0 - blend) * grad_mask + blend * ext
+                elif mode == "bidirectional":
+                    # Bidirectional interpolation: M_hyb + b*gate*(M3d - M_hyb)
+                    # Can both increase AND decrease grad_mask toward M3d.
+                    # Use asymmetric blend to be conservative on suppression.
+                    diff = ext - grad_mask
+                    
+                    if gate_signal is not None:
+                        strength = min(max(float(self.config.external_mask_screen_attn_gate_strength), 0.0), 1.0)
+                        gate = (1.0 - strength) + strength * gate_signal
+                    
+                    b_up = blend
+                    b_down = blend * float(getattr(self.config, "external_mask_interp_suppression_ratio", 0.4))
+                    b_eff = torch.where(diff >= 0, b_up, b_down)
+                    fused = grad_mask + b_eff * gate * diff
+                elif mode == "screen":
+                    contribution = blend * ext * (1.0 - grad_mask)
+                    
+                    if gate_signal is not None:
+                        strength = float(self.config.external_mask_screen_attn_gate_strength)
+                        strength = min(max(strength, 0.0), 1.0)
+                        gate = (1.0 - strength) + strength * gate_signal
+                        contribution = contribution * gate
                     fused = grad_mask + contribution
                 elif mode == "max":
                     # Hard upper-envelope.
@@ -634,7 +610,7 @@ class DC(object):
                 else:
                     raise ValueError(
                         f"Unknown external_mask_fusion={mode!r}; expected "
-                        f"'screen', 'blend', 'max', 'min', or 'interp'."
+                        f"'screen', 'blend', 'max', 'min', or 'bidirectional'."
                     )
                 grad_mask = torch.where(valid, fused, grad_mask) if valid is not None else fused
             grad_mask = grad_mask.clamp(0.0, 1.0)
