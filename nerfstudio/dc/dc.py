@@ -80,6 +80,24 @@ class DCConfig:
     stg_schedule_mode: str = "decay"
     stg_bump_peak_ratio: float = 0.5
     stg_edit_strength_adaptive: bool = False
+    # How STG and TAG compose when both are active.
+    #   "sequential" (default, current behavior):
+    #       eps_stg = eps_full + s · (eps_full − eps_weak)
+    #       eps_out = TAG(eps_stg)            # TAG sees the STG-amplified signal
+    #     Algebraically: eps_out = eps_full + (η−1)·eps_full_⊥
+    #                            + s·(eps_full − eps_weak)
+    #                            + s·(η−1)·(eps_full − eps_weak)_⊥
+    #     The last term is the *implicit* extra TAG-tangential boost on the
+    #     STG perturbation that compounding produces.
+    #   "parallel":
+    #       eps_out = TAG(eps_full) + s · (eps_full − eps_weak)
+    #     STG and TAG act independently on the raw CFG prediction. STG
+    #     contributes its full direction without TAG's tangential boost.
+    #     Algebraically: eps_out = eps_full + (η−1)·eps_full_⊥
+    #                            + s·(eps_full − eps_weak)
+    #     The difference seq − par = s·(η−1)·(eps_full − eps_weak)_⊥ is
+    #     exactly the compounding term above.
+    stg_tag_compose_mode: str = "sequential"
 
     # Self-derived relevance masking
     gradient_mask_enabled: bool = False
@@ -106,14 +124,6 @@ class DCConfig:
 
     latent_mean_anchor_weight: float = 0.0
 
-    # How an externally-supplied mask (e.g. the 3D voxel cache) is fused with
-    # the internal per-view hybrid mask. The cache is averaged across views
-    # so its values smooth out per-view focus peaks; with a naive linear
-    # blend this *reduces* the mask wherever the internal mask was already
-    # high, causing under-editing on creative scenes (stormtrooper armor,
-    # elf face). The "screen" mode (default) sidesteps this by additive-only
-    # support: cache can raise the mask but never lower it.
-    #
     # Modes (all use `b = external_mask_blend ∈ [0, 1]`):
     #   "screen" (default): M = M_int + b · M_ext · (1 − M_int)
     #       Probabilistic-union form. Cache contribution shrinks to zero as
@@ -401,8 +411,7 @@ class DC(object):
 
         uncond_image_latent = torch.zeros_like(src_encoded)
 
-        # Phase 1: clean CFG predictions only. These eps_raw tensors are the
-        # localization source of truth and are intentionally pre-STG/pre-TAG/pre-PN.
+        # Phase 1: clean CFG predictions only. 
         for latent, cond_text_embedding, name in zip(
             [tgt_x0, src_x0], [tgt_text_embedding, src_text_embedding], ["tgt", "src"]
         ):
@@ -452,11 +461,6 @@ class DC(object):
 
             eps_raw[name] = noise_pred.detach().clone()
 
-        # STG schedule uses the pre-increment iteration so progress starts at 0
-        # on the first call. After the increment, self.iteration drives the mask
-        # warmup check below: with gradient_mask_warmup=N, the self-mask stays as
-        # all-ones for post-increment iterations 1..N-1 and switches to the real
-        # EMA mask at post-increment iteration N.
         iteration_for_stg = self.iteration
         self.iteration += 1
         current_cross_attention_mask_weight = compute_ca_mask_weight(
@@ -502,13 +506,7 @@ class DC(object):
 
         internal_grad_mask = grad_mask.detach().clone() if grad_mask is not None else None
 
-        # Optional external (e.g. 3D-voxel-cache-derived) mask, fused with
-        # the internal per-view hybrid mask. The fusion mode is chosen by
-        # `self.config.external_mask_fusion` (see DCConfig docstring for the
-        # full taxonomy and motivation). The same `external_mask_blend ∈ [0, 1]`
-        # warmup parameter is reused as the fusion strength `b`.
-        # If a validity map is provided, invalid cache pixels fall back to the
-        # internal mask instead of injecting any cache contribution.
+        # EXTERNAL MASK
         if external_grad_mask is not None:
             blend = min(max(float(external_mask_blend), 0.0), 1.0)
             ext = external_grad_mask
@@ -575,12 +573,8 @@ class DC(object):
                         )
 
                 if mode == "blend":
-                    # Linear blend (legacy): replacement-style.
                     fused = (1.0 - blend) * grad_mask + blend * ext
                 elif mode == "bidirectional":
-                    # Bidirectional interpolation: M_hyb + b*gate*(M3d - M_hyb)
-                    # Can both increase AND decrease grad_mask toward M3d.
-                    # Use asymmetric blend to be conservative on suppression.
                     diff = ext - grad_mask
                     
                     if gate_signal is not None:
@@ -601,11 +595,8 @@ class DC(object):
                         contribution = contribution * gate
                     fused = grad_mask + contribution
                 elif mode == "max":
-                    # Hard upper-envelope.
                     fused = torch.maximum(grad_mask, blend * ext)
                 elif mode == "min":
-                    # Intersection: filter false positives, kill cross-view
-                    # support. Diagnostic / ablation only.
                     fused = torch.minimum(grad_mask, ext)
                 else:
                     raise ValueError(
@@ -622,11 +613,23 @@ class DC(object):
         )
 
         # Phase 2: apply guidance novelties from cached eps_raw after the clean current mask exists.
+        compose_mode = str(self.config.stg_tag_compose_mode).lower()
+        if compose_mode not in ("sequential", "parallel"):
+            raise ValueError(
+                f"Unknown stg_tag_compose_mode={compose_mode!r}; expected "
+                f"'sequential' or 'parallel'."
+            )
         for name in ["tgt", "src"]:
-            noise_pred = eps_raw[name]
+            eps_full = eps_raw[name]
             latents_noisy = noisy_latents[name]
+            eta_current = eta_tag_current if (name == "tgt" or not self.config.asymmetric_tag) else 1.0
+            stg_active = (
+                name == "tgt"
+                and self.config.stg_enabled
+                and current_stg_scale > 0
+            )
 
-            if name == "tgt" and self.config.stg_enabled and current_stg_scale > 0:
+            if stg_active:
                 weak_pred = run_unet_with_skipped_attn(
                     self.unet,
                     self.device,
@@ -638,10 +641,19 @@ class DC(object):
                 weak_text, weak_image, weak_uncond = weak_pred.chunk(3)
                 noise_pred_weak = weak_uncond + self.config.guidance_scale * (weak_text - weak_image) + \
                     self.config.image_guidance_scale * (weak_image - weak_uncond)
-                noise_pred = apply_stg(noise_pred, noise_pred_weak, current_stg_scale)
-
-            eta_current = eta_tag_current if (name == "tgt" or not self.config.asymmetric_tag) else 1.0
-            noise_pred = apply_tag(noise_pred, latents_noisy, eta_current)
+                if compose_mode == "sequential":
+                    # eps_out = TAG(eps_full + s·(eps_full − eps_weak))
+                    noise_pred = apply_stg(eps_full, noise_pred_weak, current_stg_scale)
+                    noise_pred = apply_tag(noise_pred, latents_noisy, eta_current)
+                else:  # "parallel"
+                    # eps_out = TAG(eps_full) + s·(eps_full − eps_weak)
+                    # TAG and STG act independently on the raw CFG prediction.
+                    tag_out = apply_tag(eps_full, latents_noisy, eta_current)
+                    stg_perturbation = current_stg_scale * (eps_full - noise_pred_weak)
+                    noise_pred = tag_out + stg_perturbation
+            else:
+                # STG inactive on this branch — TAG only.
+                noise_pred = apply_tag(eps_full, latents_noisy, eta_current)
 
             _, pred_x0 = self.compute_posterior_mean(latents_noisy, noise_pred, t, t_prev)
             eps[name] = noise_pred

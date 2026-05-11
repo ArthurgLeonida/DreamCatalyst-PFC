@@ -84,6 +84,14 @@ DC_CUSTOM_PARAMS = dict(
     stg_schedule_mode="bump",
     stg_bump_peak_ratio=0.5,
     stg_edit_strength_adaptive=True,
+    # How STG and TAG compose. See DCConfig docstring for the algebra.
+    #   "sequential" : TAG runs on the STG-amplified signal. Compounds an
+    #                  extra s·(η−1)·(eps_full−eps_weak)_⊥ tangential boost
+    #                  onto the STG direction.
+    #   "parallel"   : TAG and STG act independently on the raw CFG signal,
+    #                  then are summed. Each operator has a bounded effect.
+    #                  Cleaner separation for the writeup.
+    stg_tag_compose_mode="sequential",
 
     # ---------------------------------------------------------------------
     # 4. Perp-Neg branch (optional)
