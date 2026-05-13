@@ -316,12 +316,14 @@ class DCPipeline(ModifiedVanillaPipeline):
         print(f"[voxel cache] bbox_min = {bbox_min.tolist()}")
         print(f"[voxel cache] bbox_max = {bbox_max.tolist()}")
         print(f"[voxel cache] extent   = {(bbox_max - bbox_min).tolist()}")
+        n_views = len(self.datamanager.train_dataparser_outputs.image_filenames)
 
         self.mask_voxel_cache = MaskVoxelCache(
             bbox_min=bbox_min,
             bbox_max=bbox_max,
             resolution=self.config.mask_voxel_cache_resolution,
             ema_beta=ema_beta,
+            num_views=n_views if self.config.mask_voxel_cache_confidence_enabled else None,
             device=self.device,
         )
 
@@ -426,6 +428,8 @@ class DCPipeline(ModifiedVanillaPipeline):
         rendered_image, current_spot, depth_world, accumulation_world, ray_origins, ray_directions = (
             self.get_current_rendering(step)
         )
+        current_image_idx = self.datamanager.image_batch["image_idx"][current_spot]
+        current_view_id = int(current_image_idx.item() if hasattr(current_image_idx, "item") else current_image_idx)
         # get original image from dataloader
         original_image = self.datamanager.original_image_batch["image"][current_spot].to(self.device)
         original_image = original_image.unsqueeze(dim=0).permute(0, 3, 1, 2)
@@ -645,6 +649,7 @@ class DCPipeline(ModifiedVanillaPipeline):
                 new_mask,
                 in_bounds=mask_world_points_valid,
                 value_threshold=self.config.mask_voxel_cache_update_threshold,
+                view_id=current_view_id,
             )
             if self.use_wandb and step % self.config.log_step == 0:
                 import wandb

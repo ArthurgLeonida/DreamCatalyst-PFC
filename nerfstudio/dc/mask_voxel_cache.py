@@ -50,6 +50,7 @@ class MaskVoxelCache:
         resolution: int = 128,
         ema_beta: float = 0.9,
         fallback_value: float = 0.5,
+        num_views: Optional[int] = None,
         device: Optional[torch.device] = None,
     ) -> None:
         """
@@ -74,8 +75,10 @@ class MaskVoxelCache:
         self.resolution = int(resolution)
         self.ema_beta = float(ema_beta)
         self.fallback_value = float(fallback_value)
+        self.num_views = int(num_views) if num_views is not None and int(num_views) > 0 else None
 
         V = self.resolution
+        n_voxels = V * V * V
         # Grid of mask values, initialized to the fallback. Shape [V, V, V].
         self.grid = torch.full(
             (V, V, V),
@@ -97,6 +100,20 @@ class MaskVoxelCache:
             (V, V, V),
             dtype=torch.int32,
             device=self.device,
+        )
+        self.unique_view_count = torch.zeros(
+            (V, V, V),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.view_observed = (
+            torch.zeros(
+                (n_voxels, self.num_views),
+                dtype=torch.bool,
+                device=self.device,
+            )
+            if self.num_views is not None
+            else None
         )
         self.running_mean = torch.zeros(
             (V, V, V),
@@ -173,6 +190,7 @@ class MaskVoxelCache:
         mask_values: torch.Tensor,
         in_bounds: Optional[torch.Tensor] = None,
         value_threshold: float = 0.0,
+        view_id: Optional[int] = None,
     ) -> None:
         """EMA-update voxels at backprojected 3D positions.
 
@@ -245,26 +263,45 @@ class MaskVoxelCache:
         flat_grid = self.grid.view(-1)
         flat_observed = self.observed.view(-1)
         flat_update_count = self.update_count.view(-1)
+        flat_unique_view_count = self.unique_view_count.view(-1)
         flat_running_mean = self.running_mean.view(-1)
         flat_running_m2 = self.running_m2.view(-1)
 
         touched_idx = touched.nonzero(as_tuple=True)[0]
         touched_values = per_voxel_mean[touched_idx]
+        flat_update_count[touched_idx] += 1
+
+        stats_idx = touched_idx
+        stats_values = touched_values
+        if self.view_observed is not None and view_id is not None:
+            vid = int(view_id)
+            if 0 <= vid < self.num_views:
+                is_new_view = ~self.view_observed[touched_idx, vid]
+                if is_new_view.any():
+                    stats_idx = touched_idx[is_new_view]
+                    stats_values = touched_values[is_new_view]
+                    self.view_observed[stats_idx, vid] = True
+                    flat_unique_view_count[stats_idx] += 1
+                else:
+                    stats_idx = touched_idx[:0]
+                    stats_values = touched_values[:0]
+        else:
+            flat_unique_view_count[touched_idx] += 1
 
         # Cross-view correspondence statistics: every time a view maps to a
         # voxel, compare its per-view mean against previous observations of
         # that same voxel. Low variance means the same 3D location receives
         # consistent mask evidence across views; high variance means this voxel
         # is unreliable for suppressing or amplifying the 2D mask.
-        old_count = flat_update_count[touched_idx].float()
-        new_count = old_count + 1.0
-        old_mean = flat_running_mean[touched_idx]
-        delta = touched_values - old_mean
-        new_mean = old_mean + delta / new_count
-        delta2 = touched_values - new_mean
-        flat_running_mean[touched_idx] = new_mean
-        flat_running_m2[touched_idx] = flat_running_m2[touched_idx] + delta * delta2
-        flat_update_count[touched_idx] += 1
+        if stats_idx.numel() > 0:
+            old_count = (flat_unique_view_count[stats_idx].float() - 1.0).clamp_min(0.0)
+            new_count = old_count + 1.0
+            old_mean = flat_running_mean[stats_idx]
+            delta = stats_values - old_mean
+            new_mean = old_mean + delta / new_count
+            delta2 = stats_values - new_mean
+            flat_running_mean[stats_idx] = new_mean
+            flat_running_m2[stats_idx] = flat_running_m2[stats_idx] + delta * delta2
 
         existing_and_touched = touched & flat_observed
         first_time = touched & (~flat_observed)
@@ -314,7 +351,7 @@ class MaskVoxelCache:
         ix, iy, iz = idx[:, 0], idx[:, 1], idx[:, 2]
         values = self.grid[ix, iy, iz]
         observed = self.observed[ix, iy, iz]
-        counts = self.update_count[ix, iy, iz].float()
+        counts = self.unique_view_count[ix, iy, iz].float()
         m2 = self.running_m2[ix, iy, iz]
         variance = torch.where(
             counts > 1.0,
@@ -359,16 +396,16 @@ class MaskVoxelCache:
 
     @property
     def mean_observation_count(self) -> float:
-        """Mean number of updates over observed voxels."""
+        """Mean number of unique camera observations over observed voxels."""
         observed = self.observed
         if not observed.any():
             return 0.0
-        return float(self.update_count[observed].float().mean().item())
+        return float(self.unique_view_count[observed].float().mean().item())
 
     @property
     def mean_observed_variance(self) -> float:
-        """Mean cross-view variance over voxels with at least two updates."""
-        counts = self.update_count.float()
+        """Mean cross-view variance over voxels with at least two unique views."""
+        counts = self.unique_view_count.float()
         valid = counts > 1.0
         if not valid.any():
             return 0.0
