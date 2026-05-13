@@ -140,9 +140,9 @@ class DCConfig:
     #       Restrictive (intersection): both must agree to edit. Filters
     #       per-view false positives but kills cross-view support.
     external_mask_fusion: str = "screen"
-    # For "screen" fusion only: how strongly the cache's contribution is gated
-    # by the selected gate signal. The gate is a convex blend between full
-    # gating and no gating:
+    # For "screen" and the upward branch of "bidirectional" fusion: how
+    # strongly the cache's positive contribution is gated by the selected gate
+    # signal. The gate is a convex blend between full gating and no gating:
     #     gate = (1 - strength) + strength * gate_signal
     # so:
     #   strength = 1.0: full gating by gate_signal.
@@ -179,8 +179,11 @@ class DCConfig:
     # the gate above CA when M_self > M_attn. λ=0 collapses to pure CA;
     # λ=1.0 fully uses self where self exceeds CA; λ>1 over-boosts (risky).
     external_mask_screen_self_boost_lambda: float = 1.0
-    # For 'bidirectional' fusion only: how strongly the cache suppresses the 
-    # internal mask where they disagree.
+    # For "bidirectional" fusion only: how strongly a trusted low cache value
+    # suppresses the internal mask where they disagree. This suppression is
+    # intentionally not semantic-gated: confidence already means repeated 3D
+    # observations agree, so low cache values are allowed to clean background
+    # self-mask speckles even when CA/self gate is weak.
     external_mask_interp_suppression_ratio: float = 0.4
 
 
@@ -595,19 +598,29 @@ class DC(object):
                 elif mode == "bidirectional":
                     diff = ext - grad_mask
                     gate = 1.0
-                    
+
                     if gate_signal is not None:
                         strength = min(max(float(self.config.external_mask_screen_attn_gate_strength), 0.0), 1.0)
                         gate = (1.0 - strength) + strength * gate_signal
-                    
+
                     if torch.is_tensor(blend_tensor):
                         blend_map = blend_tensor
                     else:
                         blend_map = torch.full_like(diff, float(blend_tensor))
-                    b_up = blend_map
-                    b_down = blend_map * float(getattr(self.config, "external_mask_interp_suppression_ratio", 0.4))
-                    b_eff = torch.where(diff >= 0, b_up, b_down)
-                    fused = grad_mask + b_eff * gate * diff
+
+                    # Positive cache corrections add 3D-consistent support to
+                    # weak internal-mask regions, so they remain semantic-gated
+                    # to avoid opening the background. Negative corrections are
+                    # cleanup: if the cache confidently says this 3D point is
+                    # low-mask, suppress the internal self-mask noise even when
+                    # the semantic gate is low.
+                    up = blend_map * gate * diff.clamp_min(0.0)
+                    down = (
+                        blend_map
+                        * float(getattr(self.config, "external_mask_interp_suppression_ratio", 0.4))
+                        * diff.clamp_max(0.0)
+                    )
+                    fused = grad_mask + up + down
                 elif mode == "screen":
                     contribution = blend_tensor * ext * (1.0 - grad_mask)
                     

@@ -817,6 +817,32 @@ class DCPipeline(ModifiedVanillaPipeline):
                     payload["dc_debug/voxel_cache_trusted_mask_coverage_0.5"] = float(
                         (trusted > 0.5).float().mean().item()
                     )
+                    internal_mask = dic.get("internal_grad_mask", None)
+                    if internal_mask is not None:
+                        internal_mask = internal_mask.detach().float().clamp(0.0, 1.0)
+                        cache_mask = external_grad_mask.detach().float().clamp(0.0, 1.0)
+                        cache_conf = external_grad_mask_confidence.detach().float().clamp(0.0, 1.0)
+                        if cache_mask.shape[-2:] != internal_mask.shape[-2:]:
+                            cache_mask = F.interpolate(
+                                cache_mask,
+                                size=internal_mask.shape[-2:],
+                                mode="bilinear",
+                                align_corners=False,
+                            )
+                        if cache_conf.shape[-2:] != internal_mask.shape[-2:]:
+                            cache_conf = F.interpolate(
+                                cache_conf,
+                                size=internal_mask.shape[-2:],
+                                mode="bilinear",
+                                align_corners=False,
+                            )
+                        negative_correction = (internal_mask - cache_mask).clamp_min(0.0) * cache_conf
+                        payload["dc_debug/voxel_cache_negative_correction_mean"] = float(
+                            negative_correction.mean().item()
+                        )
+                        payload["dc_debug/voxel_cache_negative_correction_coverage_0.05"] = float(
+                            (negative_correction > 0.05).float().mean().item()
+                        )
                 wandb.log(payload, step=step, commit=False)
 
         if external_grad_mask_valid is not None and step % self.config.log_step == 0:

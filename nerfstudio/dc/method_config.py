@@ -38,10 +38,10 @@ DC_CUSTOM_PARAMS = dict(
     latent_mean_anchor_weight=0.005,
 
     external_mask_fusion="bidirectional", # bidirectional or screen
-    external_mask_screen_attn_gate_strength=1.0, # For screen fusion only
-    external_mask_interp_suppression_ratio=0.5,  # For bidirectional fusion only
+    external_mask_screen_attn_gate_strength=1.0, # Gates positive cache support in screen/bidirectional
+    external_mask_interp_suppression_ratio=1.0,  # For bidirectional fusion only
     
-    # Which signal opens the screen-mode cache gate. Options:
+    # Which signal opens positive voxel-cache support in screen/bidirectional modes. Options:
     #   "ca"            : M_attn (semantic; late-confirmation signal)
     #   "self"          : M_self (responsive to raw DDS delta; circular risk)
     #   "hybrid_max"    : max(M_self, M_attn) — most aggressive, recovers
@@ -113,7 +113,7 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_warmup_end=2500,
     mask_voxel_cache_max_blend=0.4,
     mask_voxel_cache_accumulation_threshold=0.3,
-    mask_voxel_cache_update_threshold=0,
+    mask_voxel_cache_update_threshold=0.25,
     # Confidence-aware 3D mask trust. The cache still learns every confident
     # observation, but fusion only trusts voxels after enough repeated
     # world-space observations agree. This is the NeRF-friendly version of a
