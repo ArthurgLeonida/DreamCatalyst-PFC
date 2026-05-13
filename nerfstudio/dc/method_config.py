@@ -19,7 +19,7 @@ DC_CUSTOM_PARAMS = dict(
     psi=0.075,
     source_blend_localization_enabled=True,
     gradient_mask_enabled=False,
-    outside_mask_anchor_weight=0.15,
+    outside_mask_anchor_weight=0.18,
     outside_mask_anchor_edit_strength_adaptive=True,
 
     gradient_mask_blur=0.5,
@@ -29,7 +29,7 @@ DC_CUSTOM_PARAMS = dict(
 
     cross_attention_mask_enabled=True,
     cross_attention_mask_layers=[1, 2],
-    cross_attention_mask_weight=0.7,
+    cross_attention_mask_weight=1,
     cross_attention_mask_blur=0.5,
     cross_attention_mask_gamma=1.2,
     cross_attention_mask_weight_schedule_enabled=True,
@@ -37,9 +37,9 @@ DC_CUSTOM_PARAMS = dict(
 
     latent_mean_anchor_weight=0.005,
 
-    external_mask_fusion="screen",
+    external_mask_fusion="bidirectional", # bidirectional or screen
     external_mask_screen_attn_gate_strength=1.0, # For screen fusion only
-    external_mask_interp_suppression_ratio=0.4,  # For bidirectional fusion only
+    external_mask_interp_suppression_ratio=0.5,  # For bidirectional fusion only
     
     # Which signal opens the screen-mode cache gate. Options:
     #   "ca"            : M_attn (semantic; late-confirmation signal)
@@ -53,10 +53,6 @@ DC_CUSTOM_PARAMS = dict(
     #                     CA (gate ≥ M_attn always); self contributes only
     #                     where it discovers signal CA missed. Best universal
     #                     candidate for late-forming features (helmet).
-    #   "bidirectional" : Scales the downward blend strength relative to 
-    #                     `external_mask_blend`. 1.0 = fully symmetric, 0.0 = 
-    #                     amplification-only (equivalent to screen). Default 0.4 
-    #                     is conservative: suppression is 40% as strong as amplification.
 
     external_mask_screen_gate_source="self_boost",
     external_mask_screen_self_boost_lambda=1.0, # For self_boost gate source only
@@ -91,7 +87,7 @@ DC_CUSTOM_PARAMS = dict(
     #   "parallel"   : TAG and STG act independently on the raw CFG signal,
     #                  then are summed. Each operator has a bounded effect.
     #                  Cleaner separation for the writeup.
-    stg_tag_compose_mode="sequential",
+    stg_tag_compose_mode="parallel",
 
     # ---------------------------------------------------------------------
     # 4. Perp-Neg branch (optional)
@@ -105,12 +101,19 @@ DC_CUSTOM_PARAMS = dict(
 VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_enabled=True,
     mask_voxel_cache_resolution=64,
-    mask_voxel_cache_ema_beta=0.9,
-    mask_voxel_cache_warmup_start=1500,
-    mask_voxel_cache_warmup_end=2700,
+    # Manual fallback if `mask_voxel_cache_ema_beta_auto=False`.
+    mask_voxel_cache_ema_beta=0.99,
+    # Camera-count-aware EMA. With 65 cameras and factor=2:
+    # beta = 1 - 1 / (2 * 65) = 0.9923.
+    # This keeps the cache stable across views without freezing it as hard as
+    # fixed beta=0.999 on medium-sized captures.
+    mask_voxel_cache_ema_beta_auto=True,
+    mask_voxel_cache_ema_beta_camera_factor=2.0,
+    mask_voxel_cache_warmup_start=1300,
+    mask_voxel_cache_warmup_end=2500,
     mask_voxel_cache_max_blend=0.4,
     mask_voxel_cache_accumulation_threshold=0.3,
-    mask_voxel_cache_update_threshold=0.2,
+    mask_voxel_cache_update_threshold=0,
     mask_voxel_cache_bbox_source="observed",
     mask_voxel_cache_bbox_observe_steps=50,
     mask_voxel_cache_bbox_observe_quantile=0.05,

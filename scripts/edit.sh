@@ -104,6 +104,11 @@ if enabled:
     last = "\u2514\u2500"
     arrow = "\u2192"
     print(f"   {branch} res:        {voxel['mask_voxel_cache_resolution']}")
+    if voxel.get("mask_voxel_cache_ema_beta_auto", False):
+        factor = voxel.get("mask_voxel_cache_ema_beta_camera_factor", 2.0)
+        print(f"   {branch} ema:        auto 1-1/({factor}*Ncam)")
+    else:
+        print(f"   {branch} ema:        {voxel['mask_voxel_cache_ema_beta']}")
     print(
         f"   {branch} bbox src:   "
         f"{voxel['mask_voxel_cache_bbox_source']} "

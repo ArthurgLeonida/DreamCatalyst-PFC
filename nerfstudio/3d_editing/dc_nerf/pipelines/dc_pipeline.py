@@ -47,6 +47,16 @@ class DCPipelineConfig(VanillaPipelineConfig):
     mask_voxel_cache_enabled: bool = VOXEL_CACHE_PARAMS["mask_voxel_cache_enabled"]
     mask_voxel_cache_resolution: int = VOXEL_CACHE_PARAMS["mask_voxel_cache_resolution"]
     mask_voxel_cache_ema_beta: float = VOXEL_CACHE_PARAMS["mask_voxel_cache_ema_beta"]
+    # Optional camera-count-aware EMA:
+    #     beta = 1 - 1 / (factor * N_cameras)
+    # This keeps the cache memory proportional to scene coverage. Larger
+    # datasets get slower updates; smaller datasets stay responsive.
+    mask_voxel_cache_ema_beta_auto: bool = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_ema_beta_auto", False
+    )
+    mask_voxel_cache_ema_beta_camera_factor: float = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_ema_beta_camera_factor", 2.0
+    )
     # Warmup ramp for the external-mask blend factor inside DC.__call__.
     # `blend(step) = clamp((step - start) / (end - start), 0, 1) * max_blend`.
     # During [0, start] iterations the cache is built but not yet used in the
@@ -146,6 +156,7 @@ class DCPipeline(ModifiedVanillaPipeline):
         # iterations of backprojected world points, depending on bbox source).
         self.mask_voxel_cache: Optional[MaskVoxelCache] = None
         self.mask_voxel_cache_start_step: Optional[int] = None
+        self.mask_voxel_cache_effective_ema_beta: Optional[float] = None
         # For "observed" bbox source: rolling per-axis min/max accumulated
         # across the first `bbox_observe_steps` iterations.
         self._observed_pts_min: Optional[torch.Tensor] = None
@@ -263,9 +274,13 @@ class DCPipeline(ModifiedVanillaPipeline):
         bbox_min = center - half_extent
         bbox_max = center + half_extent
 
+        ema_beta = self._effective_voxel_cache_ema_beta()
+        self.mask_voxel_cache_effective_ema_beta = ema_beta
+
         print(
             f"[voxel cache] source={source}, inflation={inflation:.2f}, "
-            f"resolution={self.config.mask_voxel_cache_resolution}"
+            f"resolution={self.config.mask_voxel_cache_resolution}, "
+            f"ema_beta={ema_beta:.6f}"
         )
         print(f"[voxel cache] bbox_min = {bbox_min.tolist()}")
         print(f"[voxel cache] bbox_max = {bbox_max.tolist()}")
@@ -275,9 +290,22 @@ class DCPipeline(ModifiedVanillaPipeline):
             bbox_min=bbox_min,
             bbox_max=bbox_max,
             resolution=self.config.mask_voxel_cache_resolution,
-            ema_beta=self.config.mask_voxel_cache_ema_beta,
+            ema_beta=ema_beta,
             device=self.device,
         )
+
+    def _effective_voxel_cache_ema_beta(self) -> float:
+        """Return the manual or camera-count-aware voxel-cache EMA beta."""
+        if not self.config.mask_voxel_cache_ema_beta_auto:
+            return min(max(float(self.config.mask_voxel_cache_ema_beta), 0.0), 0.9999)
+
+        n_cameras = max(
+            1,
+            len(self.datamanager.train_dataparser_outputs.image_filenames),
+        )
+        factor = max(float(self.config.mask_voxel_cache_ema_beta_camera_factor), 1e-6)
+        beta = 1.0 - 1.0 / (factor * float(n_cameras))
+        return min(max(beta, 0.0), 0.9999)
 
     def _observe_points(self, points_world: torch.Tensor, valid: torch.Tensor) -> None:
         """Accumulate robust per-axis bounds of valid backprojected world points.
@@ -557,6 +585,11 @@ class DCPipeline(ModifiedVanillaPipeline):
                         "dc_debug/voxel_cache_blend": float(external_mask_blend),
                         "dc_debug/voxel_cache_valid_ratio": valid_ratio,
                         "dc_debug/voxel_cache_edit_step": float(voxel_cache_edit_step or 0),
+                        "dc_debug/voxel_cache_ema_beta": float(
+                            self.mask_voxel_cache_effective_ema_beta
+                            if self.mask_voxel_cache_effective_ema_beta is not None
+                            else self.mask_voxel_cache.ema_beta
+                        ),
                     },
                     step=step,
                     commit=False,
@@ -608,6 +641,24 @@ class DCPipeline(ModifiedVanillaPipeline):
             voxel_mask_vis = F.interpolate(external_grad_mask.detach().cpu(), size=(h, w), mode="bilinear", align_corners=False)
             voxel_mask_img = Image.fromarray((voxel_mask_vis[0, 0].clamp(0, 1).numpy() * 255).astype(np.uint8))
             voxel_mask_img.save(self.base_dir / f"logging/{step}_voxel_cache_mask.png")
+            if self.use_wandb:
+                import wandb
+                voxel_mask_stats = external_grad_mask.detach().float().clamp(0.0, 1.0)
+                wandb.log(
+                    {
+                        "dc_debug/voxel_cache_mask": wandb.Image(
+                            TF.resize(voxel_mask_img, min_size),
+                            caption=f"step={step} | queried voxel-cache mask",
+                        ),
+                        "dc_debug/voxel_cache_mask_mean": float(voxel_mask_stats.mean().item()),
+                        "dc_debug/voxel_cache_mask_max": float(voxel_mask_stats.max().item()),
+                        "dc_debug/voxel_cache_mask_coverage_0.5": float(
+                            (voxel_mask_stats > 0.5).float().mean().item()
+                        ),
+                    },
+                    step=step,
+                    commit=False,
+                )
 
         if external_grad_mask_valid is not None and step % self.config.log_step == 0:
             voxel_valid_vis = F.interpolate(
@@ -617,6 +668,18 @@ class DCPipeline(ModifiedVanillaPipeline):
             )
             voxel_valid_img = Image.fromarray((voxel_valid_vis[0, 0].clamp(0, 1).numpy() * 255).astype(np.uint8))
             voxel_valid_img.save(self.base_dir / f"logging/{step}_voxel_cache_valid.png")
+            if self.use_wandb:
+                import wandb
+                wandb.log(
+                    {
+                        "dc_debug/voxel_cache_valid_mask": wandb.Image(
+                            TF.resize(voxel_valid_img, min_size),
+                            caption=f"step={step} | voxel-cache observed/in-bounds mask",
+                        ),
+                    },
+                    step=step,
+                    commit=False,
+                )
 
         # logging
         if step % self.config.log_step == 0:

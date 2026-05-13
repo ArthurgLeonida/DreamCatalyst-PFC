@@ -576,6 +576,7 @@ class DC(object):
                     fused = (1.0 - blend) * grad_mask + blend * ext
                 elif mode == "bidirectional":
                     diff = ext - grad_mask
+                    gate = 1.0
                     
                     if gate_signal is not None:
                         strength = min(max(float(self.config.external_mask_screen_attn_gate_strength), 0.0), 1.0)
