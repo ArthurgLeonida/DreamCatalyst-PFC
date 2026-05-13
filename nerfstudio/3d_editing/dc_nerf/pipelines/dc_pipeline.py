@@ -837,6 +837,22 @@ class DCPipeline(ModifiedVanillaPipeline):
                                 align_corners=False,
                             )
                         negative_correction = (internal_mask - cache_mask).clamp_min(0.0) * cache_conf
+                        negative_correction_vis = F.interpolate(
+                            negative_correction.cpu(),
+                            size=(h, w),
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                        negative_correction_img = Image.fromarray(
+                            (negative_correction_vis[0, 0].clamp(0, 1).numpy() * 255).astype(np.uint8)
+                        )
+                        negative_correction_img.save(
+                            self.base_dir / f"logging/{step}_voxel_cache_negative_correction.png"
+                        )
+                        payload["dc_debug/voxel_cache_negative_correction"] = wandb.Image(
+                            TF.resize(negative_correction_img, min_size),
+                            caption=f"step={step} | max(0, internal - cache) times confidence",
+                        )
                         payload["dc_debug/voxel_cache_negative_correction_mean"] = float(
                             negative_correction.mean().item()
                         )

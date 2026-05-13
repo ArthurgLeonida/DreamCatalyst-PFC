@@ -33,7 +33,7 @@ DC_CUSTOM_PARAMS = dict(
     cross_attention_mask_blur=0.5,
     cross_attention_mask_gamma=1.2,
     cross_attention_mask_weight_schedule_enabled=True,
-    cross_attention_mask_weight_schedule_power=0.75,
+    cross_attention_mask_weight_schedule_power=0.5,
 
     latent_mean_anchor_weight=0.005,
 
@@ -126,9 +126,9 @@ VOXEL_CACHE_PARAMS = dict(
     # min_obs = clamp(ceil(N_cameras * fraction), floor, cap).
     # With 65 cameras and fraction=0.05 this gives 4 observations.
     mask_voxel_cache_min_observations_auto=True,
-    mask_voxel_cache_observation_fraction=0.05,
-    mask_voxel_cache_min_observations_floor=2,
-    mask_voxel_cache_min_observations_cap=8,
+    mask_voxel_cache_observation_fraction=0.10,
+    mask_voxel_cache_min_observations_floor=5,
+    mask_voxel_cache_min_observations_cap=12,
     # Variance is measured on soft mask values in [0, 1]. 0.04 means a
     # standard deviation of 0.2; voxels above this are treated as unreliable.
     mask_voxel_cache_max_variance=0.04,
