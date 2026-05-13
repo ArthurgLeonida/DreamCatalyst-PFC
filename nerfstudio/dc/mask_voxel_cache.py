@@ -89,6 +89,25 @@ class MaskVoxelCache:
             dtype=torch.bool,
             device=self.device,
         )
+        # Per-voxel cross-view consistency statistics. Each update contributes
+        # one per-view mean mask value per touched voxel. Welford statistics
+        # let us estimate disagreement between different views that hit the
+        # same 3D location without storing a history.
+        self.update_count = torch.zeros(
+            (V, V, V),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.running_mean = torch.zeros(
+            (V, V, V),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self.running_m2 = torch.zeros(
+            (V, V, V),
+            device=self.device,
+            dtype=torch.float32,
+        )
 
     # -----------------------------------------------------------------
     # Spatial coordinate conversion
@@ -225,6 +244,27 @@ class MaskVoxelCache:
         # direct copy for first-time-observed voxels.
         flat_grid = self.grid.view(-1)
         flat_observed = self.observed.view(-1)
+        flat_update_count = self.update_count.view(-1)
+        flat_running_mean = self.running_mean.view(-1)
+        flat_running_m2 = self.running_m2.view(-1)
+
+        touched_idx = touched.nonzero(as_tuple=True)[0]
+        touched_values = per_voxel_mean[touched_idx]
+
+        # Cross-view correspondence statistics: every time a view maps to a
+        # voxel, compare its per-view mean against previous observations of
+        # that same voxel. Low variance means the same 3D location receives
+        # consistent mask evidence across views; high variance means this voxel
+        # is unreliable for suppressing or amplifying the 2D mask.
+        old_count = flat_update_count[touched_idx].float()
+        new_count = old_count + 1.0
+        old_mean = flat_running_mean[touched_idx]
+        delta = touched_values - old_mean
+        new_mean = old_mean + delta / new_count
+        delta2 = touched_values - new_mean
+        flat_running_mean[touched_idx] = new_mean
+        flat_running_m2[touched_idx] = flat_running_m2[touched_idx] + delta * delta2
+        flat_update_count[touched_idx] += 1
 
         existing_and_touched = touched & flat_observed
         first_time = touched & (~flat_observed)
@@ -248,13 +288,20 @@ class MaskVoxelCache:
         points_world: torch.Tensor,
         in_bounds: Optional[torch.Tensor] = None,
         return_valid: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        return_stats: bool = False,
+        min_observations: int = 1,
+        max_variance: Optional[float] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """Look up mask values at world-space positions.
 
         Returns `fallback_value` for voxels never observed. Out-of-bounds
         points (if `in_bounds` is provided) are also returned as fallback.
         If `return_valid=True`, also returns a bool tensor indicating which
         lookups came from observed, in-bounds voxels.
+        If `return_stats=True`, also returns a confidence map, observation
+        counts, and cross-view variance estimates. Confidence is zero until a
+        voxel has at least `min_observations`; if `max_variance` is provided,
+        it then decays linearly to zero as variance approaches that threshold.
         """
         original_shape = points_world.shape[:-1]
         flat_points = points_world.reshape(-1, 3).to(self.device)
@@ -267,15 +314,38 @@ class MaskVoxelCache:
         ix, iy, iz = idx[:, 0], idx[:, 1], idx[:, 2]
         values = self.grid[ix, iy, iz]
         observed = self.observed[ix, iy, iz]
+        counts = self.update_count[ix, iy, iz].float()
+        m2 = self.running_m2[ix, iy, iz]
+        variance = torch.where(
+            counts > 1.0,
+            m2 / (counts - 1.0).clamp_min(1.0),
+            torch.zeros_like(m2),
+        )
 
         # Replace unobserved or out-of-bounds with fallback.
         valid = observed & in_bounds
+        min_observations = max(int(min_observations), 1)
+        enough_views = counts >= float(min_observations)
+        if max_variance is not None and float(max_variance) > 0.0:
+            var_confidence = (1.0 - variance / float(max_variance)).clamp(0.0, 1.0)
+        else:
+            var_confidence = torch.ones_like(values)
+        confidence = valid.float() * enough_views.float() * var_confidence
+
         values = torch.where(
             valid, values, torch.full_like(values, self.fallback_value)
         )
         values = values.view(*original_shape)
+        confidence = confidence.view(*original_shape)
+        counts = counts.view(*original_shape)
+        variance = variance.view(*original_shape)
         if return_valid:
-            return values, valid.view(*original_shape)
+            valid = valid.view(*original_shape)
+            if return_stats:
+                return values, valid, confidence, counts, variance
+            return values, valid
+        if return_stats:
+            return values, confidence, counts, variance
         return values
 
     # -----------------------------------------------------------------
@@ -286,3 +356,21 @@ class MaskVoxelCache:
     def occupancy(self) -> float:
         """Fraction of voxels that have been observed at least once."""
         return float(self.observed.float().mean().item())
+
+    @property
+    def mean_observation_count(self) -> float:
+        """Mean number of updates over observed voxels."""
+        observed = self.observed
+        if not observed.any():
+            return 0.0
+        return float(self.update_count[observed].float().mean().item())
+
+    @property
+    def mean_observed_variance(self) -> float:
+        """Mean cross-view variance over voxels with at least two updates."""
+        counts = self.update_count.float()
+        valid = counts > 1.0
+        if not valid.any():
+            return 0.0
+        variance = self.running_m2[valid] / (counts[valid] - 1.0).clamp_min(1.0)
+        return float(variance.mean().item())

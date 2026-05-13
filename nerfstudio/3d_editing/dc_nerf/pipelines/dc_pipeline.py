@@ -78,6 +78,20 @@ class DCPipelineConfig(VanillaPipelineConfig):
     mask_voxel_cache_update_threshold: float = VOXEL_CACHE_PARAMS[
         "mask_voxel_cache_update_threshold"
     ]
+    # TransSplat-style trust signal for the non-parametric NeRF cache: a voxel
+    # is useful only after several views have observed it and those view-level
+    # mask values agree. This is a cheap correspondence-consistency proxy: all
+    # pixels that backproject to the same voxel are treated as observations of
+    # the same 3D point.
+    mask_voxel_cache_confidence_enabled: bool = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_confidence_enabled", False
+    )
+    mask_voxel_cache_min_observations: int = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_min_observations", 1
+    )
+    mask_voxel_cache_max_variance: float = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_max_variance", 0.0
+    )
     # Source for the cache's world-space bbox.
     #   "observed" (default) — observe `bbox_observe_steps` iterations of
     #                          backprojected world points first, take their
@@ -424,9 +438,12 @@ class DCPipeline(ModifiedVanillaPipeline):
         # ----------------------------------------------------------------
         external_grad_mask = None
         external_grad_mask_valid = None
+        external_grad_mask_confidence = None
         external_mask_blend = 0.0
         mask_world_points = None
         mask_world_points_valid = None
+        voxel_cache_query_count = None
+        voxel_cache_query_variance = None
         voxel_cache_edit_step = None
         if (
             self.config.mask_voxel_cache_enabled
@@ -497,10 +514,27 @@ class DCPipeline(ModifiedVanillaPipeline):
                     )
 
             if self.mask_voxel_cache is not None:
-                queried, cache_valid = self.mask_voxel_cache.query(
+                (
+                    queried,
+                    cache_valid,
+                    cache_confidence,
+                    cache_count,
+                    cache_variance,
+                ) = self.mask_voxel_cache.query(
                     mask_world_points,
                     in_bounds=mask_world_points_valid,
                     return_valid=True,
+                    return_stats=True,
+                    min_observations=(
+                        self.config.mask_voxel_cache_min_observations
+                        if self.config.mask_voxel_cache_confidence_enabled
+                        else 1
+                    ),
+                    max_variance=(
+                        self.config.mask_voxel_cache_max_variance
+                        if self.config.mask_voxel_cache_confidence_enabled
+                        else None
+                    ),
                 )
                 external_grad_mask = queried.view(1, 1, mask_h, mask_w).to(
                     device=x0.device, dtype=x0.dtype
@@ -508,6 +542,11 @@ class DCPipeline(ModifiedVanillaPipeline):
                 external_grad_mask_valid = cache_valid.view(1, 1, mask_h, mask_w).to(
                     device=x0.device
                 )
+                external_grad_mask_confidence = cache_confidence.view(1, 1, mask_h, mask_w).to(
+                    device=x0.device, dtype=x0.dtype
+                )
+                voxel_cache_query_count = cache_count.view(1, 1, mask_h, mask_w)
+                voxel_cache_query_variance = cache_variance.view(1, 1, mask_h, mask_w)
                 external_mask_blend = self._voxel_cache_warmup_blend(voxel_cache_edit_step)
 
             if self.use_wandb and step % self.config.log_step == 0:
@@ -545,6 +584,7 @@ class DCPipeline(ModifiedVanillaPipeline):
             current_spot=current_spot,
             external_grad_mask=external_grad_mask,
             external_grad_mask_valid=external_grad_mask_valid,
+            external_grad_mask_confidence=external_grad_mask_confidence,
             external_mask_blend=external_mask_blend,
         )
 
@@ -589,6 +629,12 @@ class DCPipeline(ModifiedVanillaPipeline):
                             self.mask_voxel_cache_effective_ema_beta
                             if self.mask_voxel_cache_effective_ema_beta is not None
                             else self.mask_voxel_cache.ema_beta
+                        ),
+                        "dc_debug/voxel_cache_mean_observation_count": float(
+                            self.mask_voxel_cache.mean_observation_count
+                        ),
+                        "dc_debug/voxel_cache_mean_observed_variance": float(
+                            self.mask_voxel_cache.mean_observed_variance
                         ),
                     },
                     step=step,
@@ -659,6 +705,38 @@ class DCPipeline(ModifiedVanillaPipeline):
                     step=step,
                     commit=False,
                 )
+
+        if external_grad_mask_confidence is not None and step % self.config.log_step == 0:
+            voxel_conf_vis = F.interpolate(
+                external_grad_mask_confidence.detach().float().cpu(),
+                size=(h, w),
+                mode="bilinear",
+                align_corners=False,
+            )
+            voxel_conf_img = Image.fromarray((voxel_conf_vis[0, 0].clamp(0, 1).numpy() * 255).astype(np.uint8))
+            voxel_conf_img.save(self.base_dir / f"logging/{step}_voxel_cache_confidence.png")
+            if self.use_wandb:
+                import wandb
+                conf = external_grad_mask_confidence.detach().float().clamp(0.0, 1.0)
+                payload = {
+                    "dc_debug/voxel_cache_confidence": wandb.Image(
+                        TF.resize(voxel_conf_img, min_size),
+                        caption=f"step={step} | confidence from count + variance",
+                    ),
+                    "dc_debug/voxel_cache_confidence_mean": float(conf.mean().item()),
+                    "dc_debug/voxel_cache_confidence_coverage_0.5": float(
+                        (conf > 0.5).float().mean().item()
+                    ),
+                }
+                if voxel_cache_query_count is not None:
+                    payload["dc_debug/voxel_cache_query_count_mean"] = float(
+                        voxel_cache_query_count.detach().float().mean().item()
+                    )
+                if voxel_cache_query_variance is not None:
+                    payload["dc_debug/voxel_cache_query_variance_mean"] = float(
+                        voxel_cache_query_variance.detach().float().mean().item()
+                    )
+                wandb.log(payload, step=step, commit=False)
 
         if external_grad_mask_valid is not None and step % self.config.log_step == 0:
             voxel_valid_vis = F.interpolate(

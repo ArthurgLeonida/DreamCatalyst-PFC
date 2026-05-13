@@ -68,7 +68,7 @@ DC_CUSTOM_PARAMS = dict(
     # 3. STG branch
     # ---------------------------------------------------------------------
     stg_enabled=True,
-    stg_scale=2.35,
+    stg_scale=2.5,
     stg_skip_layers=[2],
     stg_schedule_enabled=True,
     stg_schedule_start_ratio=0.4,
@@ -114,6 +114,16 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_max_blend=0.4,
     mask_voxel_cache_accumulation_threshold=0.3,
     mask_voxel_cache_update_threshold=0,
+    # Confidence-aware 3D mask trust. The cache still learns every confident
+    # observation, but fusion only trusts voxels after enough repeated
+    # world-space observations agree. This is the NeRF-friendly version of a
+    # TransSplat-style residual / agreement prior and a cheap correspondence
+    # consistency proxy.
+    mask_voxel_cache_confidence_enabled=True,
+    mask_voxel_cache_min_observations=3,
+    # Variance is measured on soft mask values in [0, 1]. 0.04 means a
+    # standard deviation of 0.2; voxels above this are treated as unreliable.
+    mask_voxel_cache_max_variance=0.04,
     mask_voxel_cache_bbox_source="observed",
     mask_voxel_cache_bbox_observe_steps=50,
     mask_voxel_cache_bbox_observe_quantile=0.05,

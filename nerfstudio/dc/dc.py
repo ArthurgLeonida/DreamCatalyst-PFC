@@ -372,6 +372,7 @@ class DC(object):
         current_spot=0,
         external_grad_mask=None,
         external_grad_mask_valid=None,
+        external_grad_mask_confidence=None,
         external_mask_blend=0.0,
     ):
         device = self.device
@@ -530,6 +531,23 @@ class DC(object):
                 if valid.shape[-2:] != target_shape:
                     valid = F.interpolate(valid, size=target_shape, mode="nearest")
                 valid = valid > 0.5
+            confidence = None
+            if external_grad_mask_confidence is not None:
+                confidence = external_grad_mask_confidence
+                if confidence.dim() == 2:
+                    confidence = confidence.unsqueeze(0).unsqueeze(0)
+                elif confidence.dim() == 3:
+                    confidence = confidence.unsqueeze(0)
+                confidence = confidence.to(device=eps_raw["tgt"].device, dtype=eps_raw["tgt"].dtype)
+                if confidence.shape[-2:] != target_shape:
+                    confidence = F.interpolate(
+                        confidence,
+                        size=target_shape,
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                confidence = confidence.clamp(0.0, 1.0)
+            blend_tensor = blend if confidence is None else blend * confidence
             if grad_mask is None:
                 grad_mask = ext
             else:
@@ -573,7 +591,7 @@ class DC(object):
                         )
 
                 if mode == "blend":
-                    fused = (1.0 - blend) * grad_mask + blend * ext
+                    fused = (1.0 - blend_tensor) * grad_mask + blend_tensor * ext
                 elif mode == "bidirectional":
                     diff = ext - grad_mask
                     gate = 1.0
@@ -582,12 +600,16 @@ class DC(object):
                         strength = min(max(float(self.config.external_mask_screen_attn_gate_strength), 0.0), 1.0)
                         gate = (1.0 - strength) + strength * gate_signal
                     
-                    b_up = blend
-                    b_down = blend * float(getattr(self.config, "external_mask_interp_suppression_ratio", 0.4))
+                    if torch.is_tensor(blend_tensor):
+                        blend_map = blend_tensor
+                    else:
+                        blend_map = torch.full_like(diff, float(blend_tensor))
+                    b_up = blend_map
+                    b_down = blend_map * float(getattr(self.config, "external_mask_interp_suppression_ratio", 0.4))
                     b_eff = torch.where(diff >= 0, b_up, b_down)
                     fused = grad_mask + b_eff * gate * diff
                 elif mode == "screen":
-                    contribution = blend * ext * (1.0 - grad_mask)
+                    contribution = blend_tensor * ext * (1.0 - grad_mask)
                     
                     if gate_signal is not None:
                         strength = float(self.config.external_mask_screen_attn_gate_strength)
@@ -596,7 +618,7 @@ class DC(object):
                         contribution = contribution * gate
                     fused = grad_mask + contribution
                 elif mode == "max":
-                    fused = torch.maximum(grad_mask, blend * ext)
+                    fused = torch.maximum(grad_mask, blend_tensor * ext)
                 elif mode == "min":
                     fused = torch.minimum(grad_mask, ext)
                 else:
