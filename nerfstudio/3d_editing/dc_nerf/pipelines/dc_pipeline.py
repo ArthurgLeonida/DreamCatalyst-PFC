@@ -428,8 +428,11 @@ class DCPipeline(ModifiedVanillaPipeline):
         rendered_image, current_spot, depth_world, accumulation_world, ray_origins, ray_directions = (
             self.get_current_rendering(step)
         )
-        current_image_idx = self.datamanager.image_batch["image_idx"][current_spot]
-        current_view_id = int(current_image_idx.item() if hasattr(current_image_idx, "item") else current_image_idx)
+        # Use the train-camera slot as the unique-view id. The datamanager's
+        # `image_idx` can refer to original dataset indices after train/eval
+        # splitting, which may be non-contiguous; `current_spot` is guaranteed
+        # to be in [0, num_train_views).
+        current_view_id = int(current_spot)
         # get original image from dataloader
         original_image = self.datamanager.original_image_batch["image"][current_spot].to(self.device)
         original_image = original_image.unsqueeze(dim=0).permute(0, 3, 1, 2)
@@ -776,9 +779,43 @@ class DCPipeline(ModifiedVanillaPipeline):
                     payload["dc_debug/voxel_cache_query_count_mean"] = float(
                         voxel_cache_query_count.detach().float().mean().item()
                     )
+                    n_views = max(
+                        1,
+                        len(self.datamanager.train_dataparser_outputs.image_filenames),
+                    )
+                    query_count = voxel_cache_query_count.detach().float()
+                    payload["dc_debug/voxel_cache_query_view_frac_mean"] = float(
+                        (query_count / float(n_views)).mean().item()
+                    )
+                    payload["dc_debug/voxel_cache_query_count_max"] = float(
+                        query_count.max().item()
+                    )
                 if voxel_cache_query_variance is not None:
                     payload["dc_debug/voxel_cache_query_variance_mean"] = float(
                         voxel_cache_query_variance.detach().float().mean().item()
+                    )
+                if external_grad_mask is not None:
+                    trusted = (
+                        external_grad_mask.detach().float().clamp(0.0, 1.0)
+                        * external_grad_mask_confidence.detach().float().clamp(0.0, 1.0)
+                    )
+                    trusted_vis = F.interpolate(
+                        trusted.cpu(),
+                        size=(h, w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    trusted_img = Image.fromarray(
+                        (trusted_vis[0, 0].clamp(0, 1).numpy() * 255).astype(np.uint8)
+                    )
+                    trusted_img.save(self.base_dir / f"logging/{step}_voxel_cache_trusted_mask.png")
+                    payload["dc_debug/voxel_cache_trusted_mask"] = wandb.Image(
+                        TF.resize(trusted_img, min_size),
+                        caption=f"step={step} | voxel mask times confidence",
+                    )
+                    payload["dc_debug/voxel_cache_trusted_mask_mean"] = float(trusted.mean().item())
+                    payload["dc_debug/voxel_cache_trusted_mask_coverage_0.5"] = float(
+                        (trusted > 0.5).float().mean().item()
                     )
                 wandb.log(payload, step=step, commit=False)
 
