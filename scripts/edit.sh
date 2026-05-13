@@ -118,9 +118,17 @@ if enabled:
     print(f"   {branch} acc thr:    {voxel['mask_voxel_cache_accumulation_threshold']}")
     print(f"   {branch} upd thr:    {voxel['mask_voxel_cache_update_threshold']}")
     if voxel.get("mask_voxel_cache_confidence_enabled", False):
+        if voxel.get("mask_voxel_cache_min_observations_auto", False):
+            obs = (
+                f"ceil(Ncam*{voxel['mask_voxel_cache_observation_fraction']}) "
+                f"[{voxel['mask_voxel_cache_min_observations_floor']},"
+                f"{voxel['mask_voxel_cache_min_observations_cap']}]"
+            )
+        else:
+            obs = str(voxel["mask_voxel_cache_min_observations"])
         print(
             f"   {branch} trust:      "
-            f"obs>={voxel['mask_voxel_cache_min_observations']}, "
+            f"obs>={obs}, "
             f"var<={voxel['mask_voxel_cache_max_variance']}"
         )
     else:

@@ -89,6 +89,22 @@ class DCPipelineConfig(VanillaPipelineConfig):
     mask_voxel_cache_min_observations: int = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_min_observations", 1
     )
+    # Optional camera-count-aware observation threshold:
+    #     min_obs = clamp(ceil(N_cameras * fraction), floor, cap)
+    # This scales the trust threshold with dataset size while respecting that
+    # many valid surface points are visible from only a subset of cameras.
+    mask_voxel_cache_min_observations_auto: bool = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_min_observations_auto", False
+    )
+    mask_voxel_cache_observation_fraction: float = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_observation_fraction", 0.05
+    )
+    mask_voxel_cache_min_observations_floor: int = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_min_observations_floor", 2
+    )
+    mask_voxel_cache_min_observations_cap: int = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_min_observations_cap", 8
+    )
     mask_voxel_cache_max_variance: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_max_variance", 0.0
     )
@@ -171,6 +187,7 @@ class DCPipeline(ModifiedVanillaPipeline):
         self.mask_voxel_cache: Optional[MaskVoxelCache] = None
         self.mask_voxel_cache_start_step: Optional[int] = None
         self.mask_voxel_cache_effective_ema_beta: Optional[float] = None
+        self.mask_voxel_cache_effective_min_observations: Optional[int] = None
         # For "observed" bbox source: rolling per-axis min/max accumulated
         # across the first `bbox_observe_steps` iterations.
         self._observed_pts_min: Optional[torch.Tensor] = None
@@ -320,6 +337,21 @@ class DCPipeline(ModifiedVanillaPipeline):
         factor = max(float(self.config.mask_voxel_cache_ema_beta_camera_factor), 1e-6)
         beta = 1.0 - 1.0 / (factor * float(n_cameras))
         return min(max(beta, 0.0), 0.9999)
+
+    def _effective_voxel_cache_min_observations(self) -> int:
+        """Return the manual or camera-count-aware voxel trust threshold."""
+        if not self.config.mask_voxel_cache_min_observations_auto:
+            return max(int(self.config.mask_voxel_cache_min_observations), 1)
+
+        n_cameras = max(
+            1,
+            len(self.datamanager.train_dataparser_outputs.image_filenames),
+        )
+        fraction = min(max(float(self.config.mask_voxel_cache_observation_fraction), 0.0), 1.0)
+        floor = max(int(self.config.mask_voxel_cache_min_observations_floor), 1)
+        cap = max(int(self.config.mask_voxel_cache_min_observations_cap), floor)
+        threshold = int(np.ceil(float(n_cameras) * fraction))
+        return min(max(threshold, floor), cap)
 
     def _observe_points(self, points_world: torch.Tensor, valid: torch.Tensor) -> None:
         """Accumulate robust per-axis bounds of valid backprojected world points.
@@ -514,6 +546,12 @@ class DCPipeline(ModifiedVanillaPipeline):
                     )
 
             if self.mask_voxel_cache is not None:
+                min_observations = (
+                    self._effective_voxel_cache_min_observations()
+                    if self.config.mask_voxel_cache_confidence_enabled
+                    else 1
+                )
+                self.mask_voxel_cache_effective_min_observations = min_observations
                 (
                     queried,
                     cache_valid,
@@ -525,11 +563,7 @@ class DCPipeline(ModifiedVanillaPipeline):
                     in_bounds=mask_world_points_valid,
                     return_valid=True,
                     return_stats=True,
-                    min_observations=(
-                        self.config.mask_voxel_cache_min_observations
-                        if self.config.mask_voxel_cache_confidence_enabled
-                        else 1
-                    ),
+                    min_observations=min_observations,
                     max_variance=(
                         self.config.mask_voxel_cache_max_variance
                         if self.config.mask_voxel_cache_confidence_enabled
@@ -635,6 +669,11 @@ class DCPipeline(ModifiedVanillaPipeline):
                         ),
                         "dc_debug/voxel_cache_mean_observed_variance": float(
                             self.mask_voxel_cache.mean_observed_variance
+                        ),
+                        "dc_debug/voxel_cache_min_observations": float(
+                            self.mask_voxel_cache_effective_min_observations
+                            if self.mask_voxel_cache_effective_min_observations is not None
+                            else self._effective_voxel_cache_min_observations()
                         ),
                     },
                     step=step,

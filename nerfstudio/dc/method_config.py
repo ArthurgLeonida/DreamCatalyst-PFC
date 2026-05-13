@@ -120,7 +120,15 @@ VOXEL_CACHE_PARAMS = dict(
     # TransSplat-style residual / agreement prior and a cheap correspondence
     # consistency proxy.
     mask_voxel_cache_confidence_enabled=True,
+    # Manual fallback if `mask_voxel_cache_min_observations_auto=False`.
     mask_voxel_cache_min_observations=3,
+    # Camera-count-aware trust threshold:
+    # min_obs = clamp(ceil(N_cameras * fraction), floor, cap).
+    # With 65 cameras and fraction=0.05 this gives 4 observations.
+    mask_voxel_cache_min_observations_auto=True,
+    mask_voxel_cache_observation_fraction=0.05,
+    mask_voxel_cache_min_observations_floor=2,
+    mask_voxel_cache_min_observations_cap=8,
     # Variance is measured on soft mask values in [0, 1]. 0.04 means a
     # standard deviation of 0.2; voxels above this are treated as unreliable.
     mask_voxel_cache_max_variance=0.04,
