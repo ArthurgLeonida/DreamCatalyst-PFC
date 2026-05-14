@@ -647,46 +647,64 @@ class DCPipeline(ModifiedVanillaPipeline):
             and dic.get("internal_grad_mask", None) is not None
         ):
             new_mask = dic["internal_grad_mask"].detach().to(self.device).reshape(-1)
-            self.mask_voxel_cache.update(
+            log_this_step = (
+                self.use_wandb and step % self.config.log_step == 0
+            )
+            per_voxel_mean_snapshot = self.mask_voxel_cache.update(
                 mask_world_points,
                 new_mask,
                 in_bounds=mask_world_points_valid,
                 value_threshold=self.config.mask_voxel_cache_update_threshold,
                 view_id=current_view_id,
+                return_per_voxel_mean=log_this_step,
             )
-            if self.use_wandb and step % self.config.log_step == 0:
+            if log_this_step:
                 import wandb
                 valid_ratio = (
                     float(external_grad_mask_valid.float().mean().item())
                     if external_grad_mask_valid is not None
                     else 0.0
                 )
-                wandb.log(
-                    {
-                        "dc_debug/voxel_cache_occupancy": float(self.mask_voxel_cache.occupancy),
-                        "dc_debug/voxel_cache_blend": float(external_mask_blend),
-                        "dc_debug/voxel_cache_valid_ratio": valid_ratio,
-                        "dc_debug/voxel_cache_edit_step": float(voxel_cache_edit_step or 0),
-                        "dc_debug/voxel_cache_ema_beta": float(
-                            self.mask_voxel_cache_effective_ema_beta
-                            if self.mask_voxel_cache_effective_ema_beta is not None
-                            else self.mask_voxel_cache.ema_beta
-                        ),
-                        "dc_debug/voxel_cache_mean_observation_count": float(
-                            self.mask_voxel_cache.mean_observation_count
-                        ),
-                        "dc_debug/voxel_cache_mean_observed_variance": float(
-                            self.mask_voxel_cache.mean_observed_variance
-                        ),
-                        "dc_debug/voxel_cache_min_observations": float(
-                            self.mask_voxel_cache_effective_min_observations
-                            if self.mask_voxel_cache_effective_min_observations is not None
-                            else self._effective_voxel_cache_min_observations()
-                        ),
-                    },
-                    step=step,
-                    commit=False,
-                )
+                payload = {
+                    "dc_debug/voxel_cache_occupancy": float(self.mask_voxel_cache.occupancy),
+                    "dc_debug/voxel_cache_blend": float(external_mask_blend),
+                    "dc_debug/voxel_cache_valid_ratio": valid_ratio,
+                    "dc_debug/voxel_cache_edit_step": float(voxel_cache_edit_step or 0),
+                    "dc_debug/voxel_cache_ema_beta": float(
+                        self.mask_voxel_cache_effective_ema_beta
+                        if self.mask_voxel_cache_effective_ema_beta is not None
+                        else self.mask_voxel_cache.ema_beta
+                    ),
+                    "dc_debug/voxel_cache_mean_observation_count": float(
+                        self.mask_voxel_cache.mean_observation_count
+                    ),
+                    "dc_debug/voxel_cache_mean_observed_variance": float(
+                        self.mask_voxel_cache.mean_observed_variance
+                    ),
+                    "dc_debug/voxel_cache_min_observations": float(
+                        self.mask_voxel_cache_effective_min_observations
+                        if self.mask_voxel_cache_effective_min_observations is not None
+                        else self._effective_voxel_cache_min_observations()
+                    ),
+                }
+                if (
+                    per_voxel_mean_snapshot is not None
+                    and per_voxel_mean_snapshot.numel() > 0
+                ):
+                    snap = per_voxel_mean_snapshot.detach().float().cpu()
+                    payload["dc_debug/voxel_cache_update_hist"] = wandb.Histogram(
+                        snap.numpy(), num_bins=50
+                    )
+                    threshold = float(
+                        self.config.mask_voxel_cache_update_threshold
+                    )
+                    payload["dc_debug/voxel_cache_update_mean_pre_gate"] = float(
+                        snap.mean().item()
+                    )
+                    payload["dc_debug/voxel_cache_update_above_threshold_frac"] = float(
+                        (snap >= threshold).float().mean().item()
+                    ) if threshold > 0.0 else 1.0
+                wandb.log(payload, step=step, commit=False)
         grad = dic["grad"].cpu()
         grad_mask = dic.get("grad_mask", None)
         self_grad_mask = dic.get("self_grad_mask", None)

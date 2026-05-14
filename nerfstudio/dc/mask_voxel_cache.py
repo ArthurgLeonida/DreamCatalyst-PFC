@@ -191,7 +191,8 @@ class MaskVoxelCache:
         in_bounds: Optional[torch.Tensor] = None,
         value_threshold: float = 0.0,
         view_id: Optional[int] = None,
-    ) -> None:
+        return_per_voxel_mean: bool = False,
+    ) -> Optional[torch.Tensor]:
         """EMA-update voxels at backprojected 3D positions.
 
         Within-batch duplicates (multiple pixels falling in the same voxel
@@ -229,11 +230,21 @@ class MaskVoxelCache:
                 this view observes each voxel — preventing repeat
                 visits to the same training view from inflating the
                 effective sample size and deflating variance.
+            return_per_voxel_mean: if True, returns the per-voxel mean
+                values (one scalar per touched voxel) BEFORE the
+                value_threshold gate filters them out. Intended for
+                histogram diagnostics — lets the caller see the full
+                distribution of evidence this view contributed,
+                including the values the threshold rejected. Returns
+                None otherwise.
         """
         points_world = points_world.reshape(-1, 3).to(self.device)
         mask_values = mask_values.reshape(-1).to(self.device).float().clamp(0.0, 1.0)
+        empty_return: Optional[torch.Tensor] = (
+            mask_values.new_empty(0) if return_per_voxel_mean else None
+        )
         if points_world.numel() == 0:
-            return
+            return empty_return
 
         idx, default_in_bounds = self._world_to_voxel(points_world)  # [N, 3], [N]
         if in_bounds is None:
@@ -243,7 +254,7 @@ class MaskVoxelCache:
         idx = idx[valid]
         mask_values = mask_values[valid]
         if idx.numel() == 0:
-            return
+            return empty_return
 
         V = self.resolution
         flat = idx[:, 0] * V * V + idx[:, 1] * V + idx[:, 2]  # [N]
@@ -259,9 +270,16 @@ class MaskVoxelCache:
 
         touched = counts > 0  # [n_voxels]
         if not touched.any():
-            return
+            return empty_return
         per_voxel_mean = torch.zeros_like(sums)
         per_voxel_mean[touched] = sums[touched] / counts[touched]
+        # Pre-gate snapshot for diagnostics: per-voxel mean values from this
+        # view BEFORE the value_threshold gate filters them out.
+        pre_gate_snapshot = (
+            per_voxel_mean[touched].detach().clone()
+            if return_per_voxel_mean
+            else None
+        )
 
         # Confidence gate: only learn from per-voxel evidence above the
         # threshold. The gate is on the per-voxel mean (the actual sample
@@ -276,7 +294,7 @@ class MaskVoxelCache:
             confident_voxels = per_voxel_mean >= float(value_threshold)
             touched = touched & confident_voxels
             if not touched.any():
-                return
+                return pre_gate_snapshot if return_per_voxel_mean else None
 
         # EMA blend into existing grid for already-observed voxels;
         # direct copy for first-time-observed voxels.
@@ -335,6 +353,8 @@ class MaskVoxelCache:
         if first_time.any():
             flat_grid[first_time] = per_voxel_mean[first_time]
             flat_observed[first_time] = True
+
+        return pre_gate_snapshot if return_per_voxel_mean else None
 
     # -----------------------------------------------------------------
     # Query — read voxels back at backprojected 3D positions
