@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from diffusers import DDIMScheduler, DiffusionPipeline
 from jaxtyping import Float
 from PIL import Image
-from typing import List, Dict
+from typing import List, Dict, Optional
 from dc.attention_utils import (
     run_unet_with_cross_attention_capture,
     run_unet_with_skipped_attn,
@@ -240,8 +240,26 @@ class DC(object):
         3. temporally smoothed via EMA per view,
         4. optionally sharpened and blurred,
         5. detached before use so it does not backprop through the mask.
+
+        Also returns a raw, max-normalized variant of the relevance map (no
+        percentile pass, no EMA, no post-processing). The percentile pass
+        is the right choice for the DDS gradient mask — it keeps the spatial
+        rank ordering and is invariant to noise-level scale — but it
+        compresses absolute confidence toward the median, which makes
+        downstream consumers that need foreground/background discrimination
+        (e.g. the voxel cache) lose signal. The raw variant preserves
+        absolute structure for those consumers.
         """
         relevance = (eps_tgt - eps_src).norm(dim=1, keepdim=True) # B, 1, H, W
+        # Per-sample max-normalization: preserves absolute structure within a
+        # frame while keeping values in [0, 1]. Each frame is rescaled by its
+        # own max so values are comparable across the cache's spatial extent.
+        B = relevance.shape[0]
+        max_per_sample = (
+            relevance.view(B, -1).amax(dim=1).clamp_min(1e-8).view(B, 1, 1, 1)
+        )
+        raw_mask = (relevance / max_per_sample).clamp(0.0, 1.0).detach()
+
         normalized = normalize_relevance_map(relevance)
 
         prev_mask = self.gradient_mask_ema.get(current_spot)
@@ -263,7 +281,7 @@ class DC(object):
             sigma=self.config.gradient_mask_blur,
         )
 
-        return mask.detach()
+        return mask.detach(), raw_mask
 
         
     def compute_posterior_mean(self, xt, noise_pred, t, t_prev):
@@ -485,8 +503,9 @@ class DC(object):
             or self.config.cross_attention_mask_enabled
         )
 
+        self_grad_mask_raw: Optional[torch.Tensor] = None
         if needs_self_mask:
-            self_grad_mask = self._build_gradient_relevance_mask(
+            self_grad_mask, self_grad_mask_raw = self._build_gradient_relevance_mask(
                 eps_raw["tgt"], eps_raw["src"], current_spot
             )
             grad_mask = self_grad_mask
@@ -765,6 +784,7 @@ class DC(object):
                 "grad_mask": grad_mask,
                 "internal_grad_mask": internal_grad_mask,
                 "self_grad_mask": self_grad_mask,
+                "self_grad_mask_raw": self_grad_mask_raw,
                 "cross_attention_mask": target_cross_attention_mask,
                 "cross_attention_mask_weight": current_cross_attention_mask_weight,
                 "edit_strength": current_edit_strength,

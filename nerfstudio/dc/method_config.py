@@ -136,4 +136,11 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_bbox_observe_steps=50,
     mask_voxel_cache_bbox_observe_quantile=0.05,
     mask_voxel_cache_bbox_inflation=0.2,
+    # Source for the cache's 2D mask input.
+    #   "internal" : post-percentile / EMA / blur mask (current behavior).
+    #                Value-compressed; update histogram is unimodal near 0.
+    #   "raw_self" : raw per-sample max-normalized ||eps_tgt - eps_src||.
+    #                Preserves absolute foreground/background confidence;
+    #                noisier per-view but denoised by cross-view aggregation.
+    mask_voxel_cache_update_source="internal",
 )

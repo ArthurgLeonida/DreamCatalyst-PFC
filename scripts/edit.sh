@@ -142,6 +142,7 @@ if enabled:
     print(f"   {branch} fusion:     {dc['external_mask_fusion']}")
     print(f"   {branch} gate src:   {dc['external_mask_screen_gate_source']}")
     print(f"   {branch} gate str:   {dc['external_mask_screen_attn_gate_strength']}")
+    print(f"   {branch} update src: {voxel.get('mask_voxel_cache_update_source', 'internal')}")
     print(f"   {last} stg+tag:    {dc.get('stg_tag_compose_mode', 'sequential')}")
 PY
 }

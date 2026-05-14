@@ -78,6 +78,24 @@ class DCPipelineConfig(VanillaPipelineConfig):
     mask_voxel_cache_update_threshold: float = VOXEL_CACHE_PARAMS[
         "mask_voxel_cache_update_threshold"
     ]
+    # Which 2D mask source feeds the voxel cache update().
+    #   "internal" : the fused, post-percentile, post-EMA, post-blur mask used
+    #                by the DDS gradient (current behavior). Spatially clean
+    #                but value-compressed by percentile normalization, so per-
+    #                voxel evidence sits in a narrow band near the median.
+    #   "raw_self" : the raw per-sample max-normalized ||eps_tgt - eps_src||
+    #                without percentile / EMA / blur. Preserves absolute
+    #                confidence — foreground voxels keep high values and
+    #                background voxels keep low ones — at the cost of being
+    #                noisier per-view. The cache's EMA-then-cross-view
+    #                aggregation is the right denoiser for this source.
+    # Diagnosed empirically: with "internal" the update histogram is unimodal
+    # near zero with a thin tail, no separable trough — no threshold value
+    # can cleanly partition foreground from background. The raw source is
+    # the experimental fix.
+    mask_voxel_cache_update_source: str = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_update_source", "internal"
+    )
     # TransSplat-style trust signal for the non-parametric NeRF cache: a voxel
     # is useful only after several views have observed it and those view-level
     # mask values agree. This is a cheap correspondence-consistency proxy: all
@@ -646,7 +664,12 @@ class DCPipeline(ModifiedVanillaPipeline):
             and mask_world_points is not None
             and dic.get("internal_grad_mask", None) is not None
         ):
-            new_mask = dic["internal_grad_mask"].detach().to(self.device).reshape(-1)
+            update_source = str(self.config.mask_voxel_cache_update_source).lower()
+            if update_source == "raw_self" and dic.get("self_grad_mask_raw") is not None:
+                cache_mask_input = dic["self_grad_mask_raw"]
+            else:
+                cache_mask_input = dic["internal_grad_mask"]
+            new_mask = cache_mask_input.detach().to(self.device).reshape(-1)
             log_this_step = (
                 self.use_wandb and step % self.config.log_step == 0
             )
@@ -704,6 +727,22 @@ class DCPipeline(ModifiedVanillaPipeline):
                     payload["dc_debug/voxel_cache_update_above_threshold_frac"] = float(
                         (snap >= threshold).float().mean().item()
                     ) if threshold > 0.0 else 1.0
+                # Bonus diagnostic: histogram of the 2D mask values fed into the
+                # cache, BEFORE any voxel aggregation. Lets us tell whether a
+                # mushy update histogram (Shape B) is caused by per-voxel
+                # averaging mixing fg/bg pixels along rays, or by the 2D
+                # source mask already lacking absolute confidence.
+                src_2d = new_mask.detach().float().cpu()
+                if src_2d.numel() > 0:
+                    payload["dc_debug/voxel_cache_input_mask_hist"] = wandb.Histogram(
+                        src_2d.numpy(), num_bins=50
+                    )
+                    payload["dc_debug/voxel_cache_input_mask_mean"] = float(
+                        src_2d.mean().item()
+                    )
+                    payload["dc_debug/voxel_cache_input_mask_source"] = (
+                        1.0 if update_source == "raw_self" else 0.0
+                    )
                 wandb.log(payload, step=step, commit=False)
         grad = dic["grad"].cpu()
         grad_mask = dic.get("grad_mask", None)
