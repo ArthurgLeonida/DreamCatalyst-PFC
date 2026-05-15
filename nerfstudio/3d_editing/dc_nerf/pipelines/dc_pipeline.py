@@ -758,6 +758,11 @@ class DCPipeline(ModifiedVanillaPipeline):
                     "dc_debug/voxel_cache_mean_angular_factor": float(
                         self.mask_voxel_cache.mean_angular_factor
                     ),
+                    "dc_debug/voxel_cache_mean_angular_factor_trusted": float(
+                        self.mask_voxel_cache.mean_angular_factor_at(
+                            min_views=min_observations
+                        )
+                    ),
                     "dc_debug/voxel_cache_min_observations": float(
                         self.mask_voxel_cache_effective_min_observations
                         if self.mask_voxel_cache_effective_min_observations is not None

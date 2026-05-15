@@ -499,15 +499,25 @@ class MaskVoxelCache:
             # Scene-relative normalization. Cameras for a given dataset live
             # on a roughly-fixed-shape rig (e.g. a horizontal orbit), so the
             # absolute angular factor saturates near a scene-specific
-            # ceiling. Dividing by that ceiling (here, the scene mean over
-            # multi-view voxels) gives a factor that is comparable across
-            # scenes: ratio > 1 means "better triangulated than average for
-            # this scene"; ratio < 1 means "worse." Without this, a clown
-            # voxel with factor 0.06 looks identically untrustworthy to an
-            # elf voxel with factor 0.01, even though clown's voxel is at
-            # the high end of its scene's distribution.
+            # ceiling. Dividing by that ceiling (the scene mean over
+            # trusted-population voxels) gives a factor that is comparable
+            # across scenes: ratio > 1 means "better triangulated than
+            # average for this scene"; ratio < 1 means "worse." Without this,
+            # a clown voxel with factor 0.06 looks identically untrustworthy
+            # to an elf voxel with factor 0.01, even though clown's voxel is
+            # at the high end of its scene's distribution.
+            #
+            # The mean is restricted to voxels at or above `min_observations`
+            # — the same population the confidence gate trusts. If the mean
+            # included all 2-view voxels, edge voxels with only 2 nearly-
+            # parallel observations would dominate it and collapse the
+            # denominator to ~0, defeating the normalization. Restricting to
+            # the trusted population gives a stable denominator that reflects
+            # actual triangulation quality in well-observed regions.
             if angular_relative:
-                scene_mean = float(self.mean_angular_factor)
+                scene_mean = float(
+                    self.mean_angular_factor_at(min_views=min_observations)
+                )
                 if scene_mean > 1e-6:
                     angular_factor = (angular_factor / scene_mean).clamp(0.0, 1.0)
 
@@ -568,22 +578,39 @@ class MaskVoxelCache:
         variance = self.running_m2[valid] / (counts[valid] - 1.0).clamp_min(1.0)
         return float(variance.mean().item())
 
-    @property
-    def mean_angular_factor(self) -> float:
+    def mean_angular_factor_at(self, min_views: int = 2) -> float:
         """Mean angular-diversity factor (1 − ‖mean_view_dir‖) over voxels
-        observed by at least two unique views.
+        observed by at least `min_views` unique views.
 
         Close to 0 means observing rays are clustered in direction (cache
         has narrow-cone evidence); close to 1 means rays span a wide
-        angular range (cache has true triangulation evidence). On dense
-        captures this rises smoothly toward ~0.5; on captures with
-        clustered cameras it stays below ~0.2 and is the principal signal
-        that the cache should be down-trusted on that scene.
+        angular range (cache has true triangulation evidence).
+
+        The choice of `min_views` matters and is load-bearing for the
+        scene-relative normalization in `query`. Including 2-observation
+        voxels (any voxel seen by just two cameras) drives the mean toward
+        zero as training progresses, because edge voxels with only 2
+        nearly-parallel observations dominate the population. Using
+        `min_views = min_observations` (the same threshold the confidence
+        gate uses) restricts the mean to the population the gate actually
+        cares about — voxels in the "trusted" regime — which keeps the
+        scene-relative denominator meaningful and stable.
         """
+        min_views = max(int(min_views), 2)
         counts = self.unique_view_count.float()
-        mask = counts > 1.0
+        mask = counts >= float(min_views)
         if not mask.any():
             return 0.0
         dir_sum = self.view_dir_sum[mask]  # [M, 3]
         resultant = (dir_sum.norm(dim=-1) / counts[mask]).clamp(0.0, 1.0)
         return float((1.0 - resultant).mean().item())
+
+    @property
+    def mean_angular_factor(self) -> float:
+        """Mean angular-diversity factor over multi-view voxels (≥2 views).
+
+        Diagnostic-grade quantity. For the scene-relative normalization in
+        `query`, prefer `mean_angular_factor_at(min_observations)` so the
+        denominator is restricted to the population the gate cares about.
+        """
+        return self.mean_angular_factor_at(min_views=2)
