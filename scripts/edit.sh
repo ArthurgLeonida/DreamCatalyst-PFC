@@ -143,6 +143,12 @@ if enabled:
     print(f"   {branch} gate src:   {dc['external_mask_screen_gate_source']}")
     print(f"   {branch} gate str:   {dc['external_mask_screen_attn_gate_strength']}")
     print(f"   {branch} update src: {voxel.get('mask_voxel_cache_update_source', 'internal')}")
+    ang_p = voxel.get('mask_voxel_cache_angular_power', 0.0)
+    if ang_p > 0.0:
+        ang_floor = voxel.get('mask_voxel_cache_min_angular_factor', 0.0)
+        print(f"   {branch} ang gate:   power={ang_p} floor={ang_floor}")
+    else:
+        print(f"   {branch} ang gate:   off")
     print(f"   {last} stg+tag:    {dc.get('stg_tag_compose_mode', 'sequential')}")
 PY
 }

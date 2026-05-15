@@ -84,11 +84,12 @@ class DCPipelineConfig(VanillaPipelineConfig):
     #                but value-compressed by percentile normalization, so per-
     #                voxel evidence sits in a narrow band near the median.
     #   "raw_self" : the raw per-sample max-normalized ||eps_tgt - eps_src||
-    #                without percentile / EMA / blur. Preserves absolute
-    #                confidence — foreground voxels keep high values and
-    #                background voxels keep low ones — at the cost of being
-    #                noisier per-view. The cache's EMA-then-cross-view
-    #                aggregation is the right denoiser for this source.
+    #                without percentile / EMA / blur. Preserves within-view
+    #                foreground/background contrast better than percentile
+    #                normalization — foreground voxels tend to keep high values
+    #                and background voxels tend to keep low ones — at the cost
+    #                of being noisier per-view. The cache's EMA-then-cross-view
+    #                aggregation is the intended denoiser for this source.
     # Diagnosed empirically: with "internal" the update histogram is unimodal
     # near zero with a thin tail, no separable trough — no threshold value
     # can cleanly partition foreground from background. The raw source is
@@ -125,6 +126,28 @@ class DCPipelineConfig(VanillaPipelineConfig):
     )
     mask_voxel_cache_max_variance: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_max_variance", 0.0
+    )
+    # Angular-diversity factor for cache confidence. The factor for each voxel
+    # is (1 − ‖Σ unit_view_dir / unique_view_count‖) ∈ [0, 1]: 1 if observing
+    # rays span the full sphere, 0 if they are all parallel. This is raised to
+    # `angular_power` and multiplied into confidence. 0.0 disables it (current
+    # default; preserves prior behavior for stormtrooper/clown). Empirical
+    # motivation: on the elf scene with 65 cameras and clustered viewpoints,
+    # cross-view variance read ~0.005 (near-saturated confidence) while voxels
+    # were observed only from a narrow cone — the variance gate alone could
+    # not detect this failure mode because parallel views agree by
+    # construction. The angular factor distinguishes "consistent because well
+    # triangulated" from "consistent because seen from one direction".
+    mask_voxel_cache_angular_power: float = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_angular_power", 0.0
+    )
+    # Floor on the angular factor before exponentiation. Prevents the factor
+    # from collapsing to 0 on voxels observed by very few unique views (where
+    # the resultant length is necessarily 1 and the diversity necessarily 0).
+    # With min_observations active above, this guards against the boundary
+    # case rather than carrying real semantic weight.
+    mask_voxel_cache_min_angular_factor: float = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_min_angular_factor", 0.0
     )
     # Source for the cache's world-space bbox.
     #   "observed" (default) — observe `bbox_observe_steps` iterations of
@@ -499,6 +522,7 @@ class DCPipeline(ModifiedVanillaPipeline):
         external_mask_blend = 0.0
         mask_world_points = None
         mask_world_points_valid = None
+        mask_ray_directions = None
         voxel_cache_query_count = None
         voxel_cache_query_variance = None
         voxel_cache_edit_step = None
@@ -539,6 +563,7 @@ class DCPipeline(ModifiedVanillaPipeline):
             # Backproject: world points where each ray reaches `depth_world`.
             world_points = o + d * dr  # [1, 3, mask_h, mask_w]
             mask_world_points = world_points.permute(0, 2, 3, 1).reshape(-1, 3)  # [N, 3]
+            mask_ray_directions = dr.permute(0, 2, 3, 1).reshape(-1, 3)  # [N, 3]
             mask_world_points_valid = (
                 (acc > float(self.config.mask_voxel_cache_accumulation_threshold))
                 & torch.isfinite(d)
@@ -593,6 +618,10 @@ class DCPipeline(ModifiedVanillaPipeline):
                         self.config.mask_voxel_cache_max_variance
                         if self.config.mask_voxel_cache_confidence_enabled
                         else None
+                    ),
+                    angular_power=float(self.config.mask_voxel_cache_angular_power),
+                    min_angular_factor=float(
+                        self.config.mask_voxel_cache_min_angular_factor
                     ),
                 )
                 external_grad_mask = queried.view(1, 1, mask_h, mask_w).to(
@@ -665,6 +694,11 @@ class DCPipeline(ModifiedVanillaPipeline):
             and dic.get("internal_grad_mask", None) is not None
         ):
             update_source = str(self.config.mask_voxel_cache_update_source).lower()
+            if update_source not in {"internal", "raw_self"}:
+                raise ValueError(
+                    f"Unknown mask_voxel_cache_update_source={update_source!r}; "
+                    "expected 'internal' or 'raw_self'."
+                )
             if update_source == "raw_self" and dic.get("self_grad_mask_raw") is not None:
                 cache_mask_input = dic["self_grad_mask_raw"]
             else:
@@ -680,6 +714,7 @@ class DCPipeline(ModifiedVanillaPipeline):
                 value_threshold=self.config.mask_voxel_cache_update_threshold,
                 view_id=current_view_id,
                 return_per_voxel_mean=log_this_step,
+                ray_directions=mask_ray_directions,
             )
             if log_this_step:
                 import wandb
@@ -703,6 +738,9 @@ class DCPipeline(ModifiedVanillaPipeline):
                     ),
                     "dc_debug/voxel_cache_mean_observed_variance": float(
                         self.mask_voxel_cache.mean_observed_variance
+                    ),
+                    "dc_debug/voxel_cache_mean_angular_factor": float(
+                        self.mask_voxel_cache.mean_angular_factor
                     ),
                     "dc_debug/voxel_cache_min_observations": float(
                         self.mask_voxel_cache_effective_min_observations

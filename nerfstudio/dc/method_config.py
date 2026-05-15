@@ -39,7 +39,7 @@ DC_CUSTOM_PARAMS = dict(
 
     external_mask_fusion="bidirectional", # bidirectional or screen
     external_mask_screen_attn_gate_strength=1.0, # Gates positive cache support in screen/bidirectional
-    external_mask_interp_suppression_ratio=1.0,  # For bidirectional fusion only
+    external_mask_interp_suppression_ratio=0.3,  # For bidirectional fusion only
     
     # Which signal opens positive voxel-cache support in screen/bidirectional modes. Options:
     #   "ca"            : M_attn (semantic; late-confirmation signal)
@@ -113,7 +113,7 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_warmup_end=2500,
     mask_voxel_cache_max_blend=0.4,
     mask_voxel_cache_accumulation_threshold=0.3,
-    mask_voxel_cache_update_threshold=0.25,
+    mask_voxel_cache_update_threshold=0.2,
     # Confidence-aware 3D mask trust. The cache still learns every confident
     # observation, but fusion only trusts voxels after enough repeated
     # world-space observations agree. This is the NeRF-friendly version of a
@@ -140,7 +140,24 @@ VOXEL_CACHE_PARAMS = dict(
     #   "internal" : post-percentile / EMA / blur mask (current behavior).
     #                Value-compressed; update histogram is unimodal near 0.
     #   "raw_self" : raw per-sample max-normalized ||eps_tgt - eps_src||.
-    #                Preserves absolute foreground/background confidence;
-    #                noisier per-view but denoised by cross-view aggregation.
-    mask_voxel_cache_update_source="internal",
+    #                Preserves within-view foreground/background contrast
+    #                better than percentile normalization; noisier per-view
+    #                but denoised by cross-view aggregation.
+    mask_voxel_cache_update_source="raw_self",
+    # Angular-diversity factor for cache confidence. Per-voxel factor is
+    # (1 - ||sum unit_view_dir / unique_view_count||) ^ angular_power.
+    # The resultant length is the circular-statistics measure of clustering:
+    # 1 when all observing rays are parallel (no triangulation info),
+    # 0 when they span the full sphere (maximal info). Raised to
+    # `angular_power` and multiplied into confidence.
+    #   0.0    : disabled (preserves prior behavior).
+    #   0.5-1  : mild gate, recommended starting range for sparse scenes.
+    #   1.5-3  : steep gate; only widely-triangulated voxels stay confident.
+    # Empirical motivation: elf (65 cameras with clustered viewpoints) had
+    # near-saturated confidence (coverage_0.5 = 0.99) and very low variance
+    # (~0.005) but produced soft erosion across the whole subject — the
+    # variance gate could not detect that the cache was over-trusting
+    # narrow-cone observations.
+    mask_voxel_cache_angular_power=0.0,
+    mask_voxel_cache_min_angular_factor=0.0,
 )

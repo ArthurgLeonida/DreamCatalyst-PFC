@@ -125,6 +125,23 @@ class MaskVoxelCache:
             device=self.device,
             dtype=torch.float32,
         )
+        # Sum of unit ray directions over all observations for each voxel.
+        # `‖view_dir_sum / unique_view_count‖` is the resultant length of a
+        # set of unit vectors; it tends to 1 when all observations come from
+        # parallel rays (no angular diversity) and to 0 when observations are
+        # spherically distributed (maximal diversity). This is the standard
+        # circular-statistics resultant-length measure (Fisher, 1953, "Dispersion
+        # on a sphere"). We use 1 − resultant_length as the per-voxel angular
+        # coverage factor in `query`, which down-weights confidence on voxels
+        # observed only from a narrow cone of viewpoints — the failure mode
+        # diagnosed empirically on elf (65 cameras, but voxels overwhelmingly
+        # observed from clustered directions; cross-view variance ≈ 0.005 with
+        # near-saturated confidence but minimal real correspondence info).
+        self.view_dir_sum = torch.zeros(
+            (V, V, V, 3),
+            device=self.device,
+            dtype=torch.float32,
+        )
 
     # -----------------------------------------------------------------
     # Spatial coordinate conversion
@@ -192,6 +209,7 @@ class MaskVoxelCache:
         value_threshold: float = 0.0,
         view_id: Optional[int] = None,
         return_per_voxel_mean: bool = False,
+        ray_directions: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         """EMA-update voxels at backprojected 3D positions.
 
@@ -251,6 +269,13 @@ class MaskVoxelCache:
             valid = default_in_bounds
         else:
             valid = in_bounds.reshape(-1).to(self.device).bool() & default_in_bounds
+        if ray_directions is not None:
+            rd_full = ray_directions.reshape(-1, 3).to(self.device).float()
+            rd_full = rd_full / rd_full.norm(dim=1, keepdim=True).clamp_min(1e-8)
+            rd_filtered = rd_full[valid]
+        else:
+            rd_filtered = None
+
         idx = idx[valid]
         mask_values = mask_values[valid]
         if idx.numel() == 0:
@@ -267,6 +292,18 @@ class MaskVoxelCache:
         counts = torch.zeros(n_voxels, device=self.device, dtype=torch.float32)
         sums.index_add_(0, flat, mask_values)
         counts.index_add_(0, flat, torch.ones_like(mask_values))
+
+        # Per-voxel mean ray direction from this view. Aggregate the unit
+        # ray directions of all pixels mapping to each voxel and renormalize.
+        # The result represents "the direction this view observed this voxel
+        # from"; the running sum across views drives the angular-diversity
+        # factor in `query`.
+        per_voxel_view_dir: Optional[torch.Tensor] = None
+        if rd_filtered is not None:
+            dir_sums = torch.zeros(n_voxels, 3, device=self.device, dtype=torch.float32)
+            dir_sums.index_add_(0, flat, rd_filtered)
+            dir_norms = dir_sums.norm(dim=1, keepdim=True).clamp_min(1e-8)
+            per_voxel_view_dir = dir_sums / dir_norms  # [n_voxels, 3] unit vectors
 
         touched = counts > 0  # [n_voxels]
         if not touched.any():
@@ -341,6 +378,20 @@ class MaskVoxelCache:
             flat_running_mean[stats_idx] = new_mean
             flat_running_m2[stats_idx] = flat_running_m2[stats_idx] + delta * delta2
 
+        # Angular-diversity statistics: accumulate the per-voxel mean unit
+        # ray direction from this view into a per-voxel running sum, but
+        # only when this view is genuinely new for that voxel (same gating
+        # as the Welford stats above). The resultant length
+        # ‖sum / unique_view_count‖ ∈ [0, 1] measures clustering of the
+        # observing directions: 1 = parallel rays (no angular diversity),
+        # 0 = spherically uniform (maximal diversity). 1 − resultant_length
+        # becomes the per-voxel angular coverage factor in `query`.
+        if per_voxel_view_dir is not None and stats_idx.numel() > 0:
+            flat_view_dir_sum = self.view_dir_sum.view(-1, 3)
+            flat_view_dir_sum[stats_idx] = (
+                flat_view_dir_sum[stats_idx] + per_voxel_view_dir[stats_idx]
+            )
+
         existing_and_touched = touched & flat_observed
         first_time = touched & (~flat_observed)
 
@@ -368,6 +419,8 @@ class MaskVoxelCache:
         return_stats: bool = False,
         min_observations: int = 1,
         max_variance: Optional[float] = None,
+        angular_power: float = 0.0,
+        min_angular_factor: float = 0.0,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """Look up mask values at world-space positions.
 
@@ -379,6 +432,15 @@ class MaskVoxelCache:
         counts, and cross-view variance estimates. Confidence is zero until a
         voxel has at least `min_observations`; if `max_variance` is provided,
         it then decays linearly to zero as variance approaches that threshold.
+
+        `angular_power` (≥ 0) raises the per-voxel angular-diversity factor
+        `(1 − ‖mean_view_dir‖)` to that power before multiplying into the
+        confidence. 0.0 disables the angular gate. 1.0 multiplies linearly.
+        Larger values make the gate steeper (only voxels observed from very
+        widely-separated viewpoints stay confident). `min_angular_factor`
+        sets a floor so the gate never collapses confidence to zero on
+        single-observation voxels (where the resultant length is 1 by
+        construction and the factor would otherwise be 0).
         """
         original_shape = points_world.shape[:-1]
         flat_points = points_world.reshape(-1, 3).to(self.device)
@@ -407,7 +469,31 @@ class MaskVoxelCache:
             var_confidence = (1.0 - variance / float(max_variance)).clamp(0.0, 1.0)
         else:
             var_confidence = torch.ones_like(values)
-        confidence = valid.float() * enough_views.float() * var_confidence
+
+        # Angular-diversity factor. The resultant length of the per-voxel
+        # sum of unit view-directions, divided by the count, lies in [0, 1].
+        # 1 means "all observations came from parallel rays" — the cache has
+        # no real correspondence evidence and should be down-trusted.
+        # 0 means "observations spread uniformly on the sphere" — maximal
+        # information from triangulation. (1 − resultant) is the diversity.
+        if float(angular_power) > 0.0:
+            dir_sum = self.view_dir_sum[ix, iy, iz]  # [N, 3]
+            safe_counts = counts.clamp_min(1.0)
+            resultant_len = (dir_sum.norm(dim=-1) / safe_counts).clamp(0.0, 1.0)
+            angular_factor = (1.0 - resultant_len).clamp(0.0, 1.0)
+            if float(min_angular_factor) > 0.0:
+                floor = float(min_angular_factor)
+                angular_factor = angular_factor.clamp_min(floor)
+            angular_confidence = angular_factor.pow(float(angular_power))
+        else:
+            angular_confidence = torch.ones_like(values)
+
+        confidence = (
+            valid.float()
+            * enough_views.float()
+            * var_confidence
+            * angular_confidence
+        )
 
         values = torch.where(
             valid, values, torch.full_like(values, self.fallback_value)
@@ -451,3 +537,23 @@ class MaskVoxelCache:
             return 0.0
         variance = self.running_m2[valid] / (counts[valid] - 1.0).clamp_min(1.0)
         return float(variance.mean().item())
+
+    @property
+    def mean_angular_factor(self) -> float:
+        """Mean angular-diversity factor (1 − ‖mean_view_dir‖) over voxels
+        observed by at least two unique views.
+
+        Close to 0 means observing rays are clustered in direction (cache
+        has narrow-cone evidence); close to 1 means rays span a wide
+        angular range (cache has true triangulation evidence). On dense
+        captures this rises smoothly toward ~0.5; on captures with
+        clustered cameras it stays below ~0.2 and is the principal signal
+        that the cache should be down-trusted on that scene.
+        """
+        counts = self.unique_view_count.float()
+        mask = counts > 1.0
+        if not mask.any():
+            return 0.0
+        dir_sum = self.view_dir_sum[mask]  # [M, 3]
+        resultant = (dir_sum.norm(dim=-1) / counts[mask]).clamp(0.0, 1.0)
+        return float((1.0 - resultant).mean().item())
