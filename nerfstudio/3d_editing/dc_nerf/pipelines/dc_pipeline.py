@@ -749,10 +749,15 @@ class DCPipeline(ModifiedVanillaPipeline):
             # edge voxels reach min_observations, eventually saturating the
             # normalized factor at 1.0 everywhere (gate becomes no-op).
             freeze_step = int(self.config.mask_voxel_cache_angular_freeze_step)
+            edit_step_for_freeze = (
+                voxel_cache_edit_step
+                if voxel_cache_edit_step is not None
+                else self._voxel_cache_edit_step(step)
+            )
             if (
                 freeze_step > 0
                 and self.config.mask_voxel_cache_angular_relative
-                and step >= freeze_step
+                and edit_step_for_freeze >= freeze_step
                 and not self.mask_voxel_cache.angular_denominator_is_frozen
             ):
                 freeze_min_views = (
@@ -760,13 +765,28 @@ class DCPipeline(ModifiedVanillaPipeline):
                     if self.mask_voxel_cache_effective_min_observations is not None
                     else self._effective_voxel_cache_min_observations()
                 )
-                frozen_value = self.mask_voxel_cache.freeze_angular_denominator(
+                # Probe the trusted-population mean before committing to the
+                # freeze. If no voxels yet qualify, the mean is 0 and freezing
+                # it would permanently store a useless denominator; defer
+                # until the population is real.
+                candidate = self.mask_voxel_cache.mean_angular_factor_at(
                     min_views=freeze_min_views
                 )
-                print(
-                    f"[voxel-cache] froze angular denominator at step={step}: "
-                    f"value={frozen_value:.5f} (min_views={freeze_min_views})"
-                )
+                if candidate > 1e-6:
+                    frozen_value = self.mask_voxel_cache.freeze_angular_denominator(
+                        min_views=freeze_min_views
+                    )
+                    print(
+                        f"[voxel-cache] froze angular denominator at edit_step="
+                        f"{edit_step_for_freeze} (global={step}): "
+                        f"value={frozen_value:.5f} (min_views={freeze_min_views})"
+                    )
+                else:
+                    print(
+                        f"[voxel-cache] freeze deferred at edit_step="
+                        f"{edit_step_for_freeze}: trusted-population mean is 0 "
+                        f"(no voxels with >= {freeze_min_views} unique views yet)"
+                    )
             if log_this_step:
                 import wandb
                 valid_ratio = (
