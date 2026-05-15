@@ -160,4 +160,14 @@ VOXEL_CACHE_PARAMS = dict(
     # narrow-cone observations.
     mask_voxel_cache_angular_power=0.0,
     mask_voxel_cache_min_angular_factor=0.0,
+    # Scene-relative normalization for the angular factor. When True, each
+    # voxel's diversity factor is divided by the scene-wide mean before
+    # exponentiation, so the gate is judged against scene-typical
+    # triangulation rather than against an absolute 0-1 scale. Required for
+    # the gate to behave consistently across capture geometries — e.g. the
+    # clown horizontal-orbit rig has mean angular factor ~0.05 while elf's
+    # forward-facing rig has ~0.01; without normalization both saturate the
+    # gate and erase the cache contribution. With normalization, each
+    # voxel's standing within its own scene's distribution is what matters.
+    mask_voxel_cache_angular_relative=False,
 )

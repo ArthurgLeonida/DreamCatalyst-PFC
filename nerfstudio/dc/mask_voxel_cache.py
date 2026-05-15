@@ -421,6 +421,7 @@ class MaskVoxelCache:
         max_variance: Optional[float] = None,
         angular_power: float = 0.0,
         min_angular_factor: float = 0.0,
+        angular_relative: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """Look up mask values at world-space positions.
 
@@ -441,6 +442,19 @@ class MaskVoxelCache:
         sets a floor so the gate never collapses confidence to zero on
         single-observation voxels (where the resultant length is 1 by
         construction and the factor would otherwise be 0).
+
+        `angular_relative` (default False) switches the factor from absolute
+        to scene-relative. With it enabled, each voxel's factor is divided
+        by the scene-wide mean angular factor (over all observed voxels with
+        ≥ 2 unique views), then clamped to [0, 1]. This is what makes the
+        gate work consistently across capture geometries: a captured-on-a-
+        horizontal-arc scene (clown) has an absolute mean factor of ~0.05
+        and a forward-facing capture (elf) has ~0.01; without normalization
+        both look "almost zero" and the gate collapses the cache on both.
+        With normalization, each voxel is judged against its own scene's
+        typical diversity — voxels above the scene mean keep most of their
+        confidence, voxels below get damped, regardless of the absolute
+        scale set by the capture rig.
         """
         original_shape = points_world.shape[:-1]
         flat_points = points_world.reshape(-1, 3).to(self.device)
@@ -481,6 +495,22 @@ class MaskVoxelCache:
             safe_counts = counts.clamp_min(1.0)
             resultant_len = (dir_sum.norm(dim=-1) / safe_counts).clamp(0.0, 1.0)
             angular_factor = (1.0 - resultant_len).clamp(0.0, 1.0)
+
+            # Scene-relative normalization. Cameras for a given dataset live
+            # on a roughly-fixed-shape rig (e.g. a horizontal orbit), so the
+            # absolute angular factor saturates near a scene-specific
+            # ceiling. Dividing by that ceiling (here, the scene mean over
+            # multi-view voxels) gives a factor that is comparable across
+            # scenes: ratio > 1 means "better triangulated than average for
+            # this scene"; ratio < 1 means "worse." Without this, a clown
+            # voxel with factor 0.06 looks identically untrustworthy to an
+            # elf voxel with factor 0.01, even though clown's voxel is at
+            # the high end of its scene's distribution.
+            if angular_relative:
+                scene_mean = float(self.mean_angular_factor)
+                if scene_mean > 1e-6:
+                    angular_factor = (angular_factor / scene_mean).clamp(0.0, 1.0)
+
             if float(min_angular_factor) > 0.0:
                 floor = float(min_angular_factor)
                 angular_factor = angular_factor.clamp_min(floor)

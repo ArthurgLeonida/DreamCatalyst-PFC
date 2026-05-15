@@ -141,6 +141,19 @@ class DCPipelineConfig(VanillaPipelineConfig):
     mask_voxel_cache_angular_power: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_angular_power", 0.0
     )
+    # Scene-relative normalization for the angular factor. With it enabled,
+    # the per-voxel factor is divided by the scene-wide mean angular factor
+    # before exponentiation. This makes the gate behave consistently across
+    # capture geometries — a clown voxel with absolute factor 0.06 (its
+    # scene mean) reads as "average for its scene" rather than "almost
+    # zero." Empirically necessary: without normalization, the clown scene
+    # (horizontal-arc capture, mean angular factor ~0.05) suffered the same
+    # confidence collapse as elf (forward-facing, mean ~0.01), erasing the
+    # cache's contribution on both. With normalization, each scene is
+    # judged against its own typical diversity.
+    mask_voxel_cache_angular_relative: bool = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_angular_relative", False
+    )
     # Floor on the angular factor before exponentiation. Prevents the factor
     # from collapsing to 0 on voxels observed by very few unique views (where
     # the resultant length is necessarily 1 and the diversity necessarily 0).
@@ -622,6 +635,9 @@ class DCPipeline(ModifiedVanillaPipeline):
                     angular_power=float(self.config.mask_voxel_cache_angular_power),
                     min_angular_factor=float(
                         self.config.mask_voxel_cache_min_angular_factor
+                    ),
+                    angular_relative=bool(
+                        self.config.mask_voxel_cache_angular_relative
                     ),
                 )
                 external_grad_mask = queried.view(1, 1, mask_h, mask_w).to(

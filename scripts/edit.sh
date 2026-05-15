@@ -146,7 +146,9 @@ if enabled:
     ang_p = voxel.get('mask_voxel_cache_angular_power', 0.0)
     if ang_p > 0.0:
         ang_floor = voxel.get('mask_voxel_cache_min_angular_factor', 0.0)
-        print(f"   {branch} ang gate:   power={ang_p} floor={ang_floor}")
+        ang_rel = voxel.get('mask_voxel_cache_angular_relative', False)
+        rel_str = "relative" if ang_rel else "absolute"
+        print(f"   {branch} ang gate:   power={ang_p} floor={ang_floor} ({rel_str})")
     else:
         print(f"   {branch} ang gate:   off")
     print(f"   {last} stg+tag:    {dc.get('stg_tag_compose_mode', 'sequential')}")
