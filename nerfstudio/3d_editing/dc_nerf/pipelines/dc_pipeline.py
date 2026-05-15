@@ -154,6 +154,17 @@ class DCPipelineConfig(VanillaPipelineConfig):
     mask_voxel_cache_angular_relative: bool = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_angular_relative", False
     )
+    # Step at which to freeze the scene-relative denominator. If > 0, the
+    # cache snapshots mean_angular_factor_at(min_observations) at this step
+    # and reuses it for all subsequent queries. Without freezing, the mean
+    # keeps drifting downward as late-arriving edge voxels reach min_obs,
+    # eventually saturating every voxel's normalized factor to 1.0 (gate
+    # becomes a no-op). Recommended value: mask_voxel_cache_warmup_end —
+    # the trusted-population voxels are sufficiently populated by then.
+    # Set to 0 to disable freezing (legacy behavior; per-call recompute).
+    mask_voxel_cache_angular_freeze_step: int = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_angular_freeze_step", 0
+    )
     # Floor on the angular factor before exponentiation. Prevents the factor
     # from collapsing to 0 on voxels observed by very few unique views (where
     # the resultant length is necessarily 1 and the diversity necessarily 0).
@@ -732,6 +743,30 @@ class DCPipeline(ModifiedVanillaPipeline):
                 return_per_voxel_mean=log_this_step,
                 ray_directions=mask_ray_directions,
             )
+            # Freeze the scene-relative angular denominator once the trusted
+            # population has had time to populate (typically at warmup_end).
+            # Without this, the per-call mean drifts downward as late-arriving
+            # edge voxels reach min_observations, eventually saturating the
+            # normalized factor at 1.0 everywhere (gate becomes no-op).
+            freeze_step = int(self.config.mask_voxel_cache_angular_freeze_step)
+            if (
+                freeze_step > 0
+                and self.config.mask_voxel_cache_angular_relative
+                and step >= freeze_step
+                and not self.mask_voxel_cache.angular_denominator_is_frozen
+            ):
+                freeze_min_views = (
+                    self.mask_voxel_cache_effective_min_observations
+                    if self.mask_voxel_cache_effective_min_observations is not None
+                    else self._effective_voxel_cache_min_observations()
+                )
+                frozen_value = self.mask_voxel_cache.freeze_angular_denominator(
+                    min_views=freeze_min_views
+                )
+                print(
+                    f"[voxel-cache] froze angular denominator at step={step}: "
+                    f"value={frozen_value:.5f} (min_views={freeze_min_views})"
+                )
             if log_this_step:
                 import wandb
                 valid_ratio = (
@@ -762,6 +797,11 @@ class DCPipeline(ModifiedVanillaPipeline):
                         self.mask_voxel_cache.mean_angular_factor_at(
                             min_views=min_observations
                         )
+                    ),
+                    "dc_debug/voxel_cache_angular_denominator_frozen": float(
+                        self.mask_voxel_cache.frozen_angular_denominator
+                        if self.mask_voxel_cache.frozen_angular_denominator is not None
+                        else 0.0
                     ),
                     "dc_debug/voxel_cache_min_observations": float(
                         self.mask_voxel_cache_effective_min_observations

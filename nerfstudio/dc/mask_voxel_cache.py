@@ -142,6 +142,16 @@ class MaskVoxelCache:
             device=self.device,
             dtype=torch.float32,
         )
+        # Frozen denominator for scene-relative angular normalization.
+        # Set externally by `freeze_angular_denominator(min_views)` once the
+        # trusted population has stabilized (typically at the cache's
+        # `warmup_end`). After freezing, `query` uses this value instead of
+        # recomputing the mean each call. Diagnosed empirically: without
+        # freezing, the per-iteration mean keeps drifting downward as late-
+        # arriving edge voxels with low diversity reach `min_observations`,
+        # eventually clamping ~every voxel's normalized factor to 1.0 and
+        # making the gate a no-op.
+        self._frozen_angular_denominator: Optional[float] = None
 
     # -----------------------------------------------------------------
     # Spatial coordinate conversion
@@ -515,9 +525,12 @@ class MaskVoxelCache:
             # the trusted population gives a stable denominator that reflects
             # actual triangulation quality in well-observed regions.
             if angular_relative:
-                scene_mean = float(
-                    self.mean_angular_factor_at(min_views=min_observations)
-                )
+                if self._frozen_angular_denominator is not None:
+                    scene_mean = float(self._frozen_angular_denominator)
+                else:
+                    scene_mean = float(
+                        self.mean_angular_factor_at(min_views=min_observations)
+                    )
                 if scene_mean > 1e-6:
                     angular_factor = (angular_factor / scene_mean).clamp(0.0, 1.0)
 
@@ -577,6 +590,32 @@ class MaskVoxelCache:
             return 0.0
         variance = self.running_m2[valid] / (counts[valid] - 1.0).clamp_min(1.0)
         return float(variance.mean().item())
+
+    def freeze_angular_denominator(self, min_views: int) -> float:
+        """Snapshot the current scene mean angular factor and cache it for
+        all subsequent `query` calls.
+
+        Should be called once after the trusted-population voxels have
+        accumulated enough observations to be representative — typically
+        at the cache's `warmup_end` iteration. The frozen value becomes
+        the denominator $\\bar{A}$ for scene-relative normalization,
+        replacing the per-call recomputation that otherwise drifts
+        downward as late-arriving low-diversity voxels reach the
+        `min_observations` threshold.
+
+        Returns the frozen value (also stored internally).
+        """
+        snapshot = self.mean_angular_factor_at(min_views=min_views)
+        self._frozen_angular_denominator = float(snapshot)
+        return snapshot
+
+    @property
+    def angular_denominator_is_frozen(self) -> bool:
+        return self._frozen_angular_denominator is not None
+
+    @property
+    def frozen_angular_denominator(self) -> Optional[float]:
+        return self._frozen_angular_denominator
 
     def mean_angular_factor_at(self, min_views: int = 2) -> float:
         """Mean angular-diversity factor (1 − ‖mean_view_dir‖) over voxels

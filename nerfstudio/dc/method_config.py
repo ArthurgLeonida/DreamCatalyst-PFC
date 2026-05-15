@@ -101,36 +101,25 @@ DC_CUSTOM_PARAMS = dict(
 VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_enabled=True,
     mask_voxel_cache_resolution=64,
-    # Manual fallback if `mask_voxel_cache_ema_beta_auto=False`.
+
     mask_voxel_cache_ema_beta=0.99,
-    # Camera-count-aware EMA. With 65 cameras and factor=2:
-    # beta = 1 - 1 / (2 * 65) = 0.9923.
-    # This keeps the cache stable across views without freezing it as hard as
-    # fixed beta=0.999 on medium-sized captures.
     mask_voxel_cache_ema_beta_auto=True,
+    
     mask_voxel_cache_ema_beta_camera_factor=2.0,
     mask_voxel_cache_warmup_start=1300,
     mask_voxel_cache_warmup_end=2500,
     mask_voxel_cache_max_blend=0.4,
     mask_voxel_cache_accumulation_threshold=0.3,
     mask_voxel_cache_update_threshold=0.2,
-    # Confidence-aware 3D mask trust. The cache still learns every confident
-    # observation, but fusion only trusts voxels after enough repeated
-    # world-space observations agree. This is the NeRF-friendly version of a
-    # TransSplat-style residual / agreement prior and a cheap correspondence
-    # consistency proxy.
+
     mask_voxel_cache_confidence_enabled=True,
-    # Manual fallback if `mask_voxel_cache_min_observations_auto=False`.
     mask_voxel_cache_min_observations=3,
-    # Camera-count-aware trust threshold:
-    # min_obs = clamp(ceil(N_cameras * fraction), floor, cap).
-    # With 65 cameras and fraction=0.05 this gives 4 observations.
+
     mask_voxel_cache_min_observations_auto=True,
     mask_voxel_cache_observation_fraction=0.10,
     mask_voxel_cache_min_observations_floor=5,
     mask_voxel_cache_min_observations_cap=12,
-    # Variance is measured on soft mask values in [0, 1]. 0.04 means a
-    # standard deviation of 0.2; voxels above this are treated as unreliable.
+
     mask_voxel_cache_max_variance=0.04,
     mask_voxel_cache_bbox_source="observed",
     mask_voxel_cache_bbox_observe_steps=50,
@@ -144,30 +133,8 @@ VOXEL_CACHE_PARAMS = dict(
     #                better than percentile normalization; noisier per-view
     #                but denoised by cross-view aggregation.
     mask_voxel_cache_update_source="raw_self",
-    # Angular-diversity factor for cache confidence. Per-voxel factor is
-    # (1 - ||sum unit_view_dir / unique_view_count||) ^ angular_power.
-    # The resultant length is the circular-statistics measure of clustering:
-    # 1 when all observing rays are parallel (no triangulation info),
-    # 0 when they span the full sphere (maximal info). Raised to
-    # `angular_power` and multiplied into confidence.
-    #   0.0    : disabled (preserves prior behavior).
-    #   0.5-1  : mild gate, recommended starting range for sparse scenes.
-    #   1.5-3  : steep gate; only widely-triangulated voxels stay confident.
-    # Empirical motivation: elf (65 cameras with clustered viewpoints) had
-    # near-saturated confidence (coverage_0.5 = 0.99) and very low variance
-    # (~0.005) but produced soft erosion across the whole subject — the
-    # variance gate could not detect that the cache was over-trusting
-    # narrow-cone observations.
     mask_voxel_cache_angular_power=0.0,
     mask_voxel_cache_min_angular_factor=0.0,
-    # Scene-relative normalization for the angular factor. When True, each
-    # voxel's diversity factor is divided by the scene-wide mean before
-    # exponentiation, so the gate is judged against scene-typical
-    # triangulation rather than against an absolute 0-1 scale. Required for
-    # the gate to behave consistently across capture geometries — e.g. the
-    # clown horizontal-orbit rig has mean angular factor ~0.05 while elf's
-    # forward-facing rig has ~0.01; without normalization both saturate the
-    # gate and erase the cache contribution. With normalization, each
-    # voxel's standing within its own scene's distribution is what matters.
     mask_voxel_cache_angular_relative=False,
+    mask_voxel_cache_angular_freeze_step=2500,
 )
