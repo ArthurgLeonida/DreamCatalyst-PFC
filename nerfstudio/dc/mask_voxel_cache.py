@@ -144,14 +144,24 @@ class MaskVoxelCache:
         )
         # Frozen denominator for scene-relative angular normalization.
         # Set externally by `freeze_angular_denominator(min_views)` once the
-        # trusted population has stabilized (typically at the cache's
-        # `warmup_end`). After freezing, `query` uses this value instead of
+        # trusted population has stabilized (typically near the peak of the
+        # trusted angular factor, before edge voxels reaching min_views
+        # dilute it). After freezing, `query` uses this value instead of
         # recomputing the mean each call. Diagnosed empirically: without
         # freezing, the per-iteration mean keeps drifting downward as late-
         # arriving edge voxels with low diversity reach `min_observations`,
         # eventually clamping ~every voxel's normalized factor to 1.0 and
         # making the gate a no-op.
         self._frozen_angular_denominator: Optional[float] = None
+        # Peak-tracking state for the auto-freeze heuristic.
+        #   `_angular_peak_value`: highest mean_angular_factor_trusted seen.
+        #   `_angular_peak_step`: edit-step at which that peak was reached.
+        # Used by `try_auto_freeze_angular_denominator` to detect when the
+        # trusted curve has stopped improving and snapshot the peak value
+        # before drift sets in. Scene-adaptive: each scene's peak is
+        # determined by its own observation geometry, not a hardcoded step.
+        self._angular_peak_value: float = 0.0
+        self._angular_peak_step: int = -1
 
     # -----------------------------------------------------------------
     # Spatial coordinate conversion
@@ -590,6 +600,75 @@ class MaskVoxelCache:
             return 0.0
         variance = self.running_m2[valid] / (counts[valid] - 1.0).clamp_min(1.0)
         return float(variance.mean().item())
+
+    def try_auto_freeze_angular_denominator(
+        self,
+        edit_step: int,
+        min_views: int,
+        patience: int = 500,
+        min_value: float = 1e-3,
+        warmup_steps: int = 50,
+    ) -> Optional[float]:
+        """Scene-adaptive auto-freeze of the angular denominator.
+
+        Tracks the running maximum of `mean_angular_factor_at(min_views)`
+        across calls. When the peak has not improved for `patience`
+        consecutive edit-steps, freezes the denominator at that peak.
+        Returns the frozen value if a freeze fired on this call, else None.
+
+        The patience-on-no-improvement heuristic catches the scene-specific
+        peak of the trusted curve regardless of when it occurs:
+            - On scenes where the peak is early (clown: ~edit-step 100),
+              the freeze fires around edit-step 100 + patience.
+            - On scenes with a later peak (elf, if any), it shifts
+              accordingly.
+        This sidesteps the hardcoded freeze-step problem where a single
+        step value over- or under-shoots the peak across different rigs.
+
+        Args:
+            edit_step: current edit-relative iteration (not global step).
+            min_views: trusted-population threshold for computing the mean.
+            patience: edit-steps of no-improvement before freezing.
+            min_value: do not freeze on values below this — protects
+                against pathological scenes where the trusted population
+                is genuinely empty for a while.
+            warmup_steps: do not start tracking until this many edit-steps
+                have elapsed. Avoids treating the cache's startup transient
+                as a "peak."
+        """
+        if self._frozen_angular_denominator is not None:
+            return None
+        if edit_step < int(warmup_steps):
+            return None
+        current = self.mean_angular_factor_at(min_views=min_views)
+        if current > self._angular_peak_value:
+            self._angular_peak_value = float(current)
+            self._angular_peak_step = int(edit_step)
+            return None
+        steps_since_peak = edit_step - self._angular_peak_step
+        if (
+            steps_since_peak >= int(patience)
+            and self._angular_peak_value > float(min_value)
+        ):
+            self._frozen_angular_denominator = float(self._angular_peak_value)
+            return self._frozen_angular_denominator
+        return None
+
+    @property
+    def angular_peak_value(self) -> float:
+        """Highest `mean_angular_factor_trusted` seen so far (diagnostic).
+
+        Useful for verifying that the auto-freeze captured the right value:
+        compare against the post-freeze constant in
+        `frozen_angular_denominator`. After freezing, this property
+        continues to read the same peak — the peak is monotone.
+        """
+        return float(self._angular_peak_value)
+
+    @property
+    def angular_peak_step(self) -> int:
+        """Edit-step at which `angular_peak_value` was reached."""
+        return int(self._angular_peak_step)
 
     def freeze_angular_denominator(self, min_views: int) -> float:
         """Snapshot the current scene mean angular factor and cache it for

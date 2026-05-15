@@ -165,6 +165,24 @@ class DCPipelineConfig(VanillaPipelineConfig):
     mask_voxel_cache_angular_freeze_step: int = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_angular_freeze_step", 0
     )
+    # Patience (in edit-steps) for the scene-adaptive auto-freeze of the
+    # angular denominator. The cache tracks the running maximum of the
+    # trusted angular factor each iteration; when no improvement is seen
+    # for this many consecutive edit-steps, the denominator snapshots
+    # the peak value. Lower → freezes sooner but more sensitive to noise
+    # in the trusted curve; higher → more robust but may freeze after
+    # drift has begun. 500 strikes a balance: long enough to confirm the
+    # peak isn't transient, short enough to fire before significant decay.
+    mask_voxel_cache_angular_freeze_patience: int = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_angular_freeze_patience", 500
+    )
+    # Warmup window (edit-steps) during which the auto-freeze does not
+    # track peaks. Avoids treating the cache's startup transient — when
+    # only one or two views have been observed and the trusted population
+    # is tiny and noisy — as a "peak."
+    mask_voxel_cache_angular_freeze_warmup: int = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_angular_freeze_warmup", 50
+    )
     # Floor on the angular factor before exponentiation. Prevents the factor
     # from collapsing to 0 on voxels observed by very few unique views (where
     # the resultant length is necessarily 1 and the diversity necessarily 0).
@@ -748,44 +766,48 @@ class DCPipeline(ModifiedVanillaPipeline):
             # Without this, the per-call mean drifts downward as late-arriving
             # edge voxels reach min_observations, eventually saturating the
             # normalized factor at 1.0 everywhere (gate becomes no-op).
-            freeze_step = int(self.config.mask_voxel_cache_angular_freeze_step)
-            edit_step_for_freeze = (
-                voxel_cache_edit_step
-                if voxel_cache_edit_step is not None
-                else self._voxel_cache_edit_step(step)
-            )
+            # Auto-freeze the scene-relative angular denominator at the
+            # peak of the trusted curve. The cache tracks its own running
+            # max of mean_angular_factor_at(min_views); when the peak has
+            # not improved for `patience` edit-steps, the denominator
+            # snapshots that peak. Scene-adaptive — each scene's peak
+            # location is determined by its own observation geometry,
+            # rather than a hardcoded step that over- or under-shoots
+            # depending on the rig. Empirically: clown peaks ~edit-step 100,
+            # elf peaks later; one fixed freeze step couldn't catch both.
             if (
-                freeze_step > 0
-                and self.config.mask_voxel_cache_angular_relative
-                and edit_step_for_freeze >= freeze_step
+                self.config.mask_voxel_cache_angular_relative
                 and not self.mask_voxel_cache.angular_denominator_is_frozen
             ):
+                edit_step_for_freeze = (
+                    voxel_cache_edit_step
+                    if voxel_cache_edit_step is not None
+                    else self._voxel_cache_edit_step(step)
+                )
                 freeze_min_views = (
                     self.mask_voxel_cache_effective_min_observations
                     if self.mask_voxel_cache_effective_min_observations is not None
                     else self._effective_voxel_cache_min_observations()
                 )
-                # Probe the trusted-population mean before committing to the
-                # freeze. If no voxels yet qualify, the mean is 0 and freezing
-                # it would permanently store a useless denominator; defer
-                # until the population is real.
-                candidate = self.mask_voxel_cache.mean_angular_factor_at(
-                    min_views=freeze_min_views
+                frozen_value = (
+                    self.mask_voxel_cache.try_auto_freeze_angular_denominator(
+                        edit_step=edit_step_for_freeze,
+                        min_views=freeze_min_views,
+                        patience=int(
+                            self.config.mask_voxel_cache_angular_freeze_patience
+                        ),
+                        warmup_steps=int(
+                            self.config.mask_voxel_cache_angular_freeze_warmup
+                        ),
+                    )
                 )
-                if candidate > 1e-6:
-                    frozen_value = self.mask_voxel_cache.freeze_angular_denominator(
-                        min_views=freeze_min_views
-                    )
+                if frozen_value is not None:
+                    peak_step = self.mask_voxel_cache.angular_peak_step
                     print(
-                        f"[voxel-cache] froze angular denominator at edit_step="
-                        f"{edit_step_for_freeze} (global={step}): "
-                        f"value={frozen_value:.5f} (min_views={freeze_min_views})"
-                    )
-                else:
-                    print(
-                        f"[voxel-cache] freeze deferred at edit_step="
-                        f"{edit_step_for_freeze}: trusted-population mean is 0 "
-                        f"(no voxels with >= {freeze_min_views} unique views yet)"
+                        f"[voxel-cache] auto-froze angular denominator at "
+                        f"edit_step={edit_step_for_freeze} (global={step}): "
+                        f"value={frozen_value:.5f} captured at peak "
+                        f"edit_step={peak_step} (min_views={freeze_min_views})"
                     )
             if log_this_step:
                 import wandb
@@ -822,6 +844,12 @@ class DCPipeline(ModifiedVanillaPipeline):
                         self.mask_voxel_cache.frozen_angular_denominator
                         if self.mask_voxel_cache.frozen_angular_denominator is not None
                         else 0.0
+                    ),
+                    "dc_debug/voxel_cache_angular_peak_value": float(
+                        self.mask_voxel_cache.angular_peak_value
+                    ),
+                    "dc_debug/voxel_cache_angular_peak_step": float(
+                        self.mask_voxel_cache.angular_peak_step
                     ),
                     "dc_debug/voxel_cache_min_observations": float(
                         self.mask_voxel_cache_effective_min_observations

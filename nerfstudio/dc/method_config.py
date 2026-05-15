@@ -136,5 +136,24 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_angular_power=0.0,
     mask_voxel_cache_min_angular_factor=0.0,
     mask_voxel_cache_angular_relative=False,
+    # Legacy hardcoded freeze step. Unused now — kept for backward
+    # compatibility with older runs in the experiment log. The auto-freeze
+    # below supersedes it: it tracks the trusted curve's running max and
+    # snapshots the denominator when no improvement is seen for `patience`
+    # edit-steps, which catches the scene-specific peak instead of guessing
+    # a fixed step that may over- or under-shoot across rigs.
     mask_voxel_cache_angular_freeze_step=2500,
+    # Scene-adaptive auto-freeze knobs.
+    #   patience: edit-steps of no-improvement before the peak is locked in.
+    #             Lower = freezes sooner, more sensitive to noise on the
+    #             trusted curve. Higher = more robust, but may miss the
+    #             peak if drift starts gradually.
+    #   warmup:   edit-steps at the start of the edit during which the
+    #             auto-freeze does not track. Avoids treating the cache's
+    #             transient first observations as a "peak."
+    # 500/50 catches clown's edit-step ~100 peak (freezes around step ~600)
+    # and is short enough to act on elf before its slower drift erodes the
+    # denominator significantly.
+    mask_voxel_cache_angular_freeze_patience=500,
+    mask_voxel_cache_angular_freeze_warmup=50,
 )
