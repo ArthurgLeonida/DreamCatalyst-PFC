@@ -156,4 +156,17 @@ VOXEL_CACHE_PARAMS = dict(
     # denominator significantly.
     mask_voxel_cache_angular_freeze_patience=100,
     mask_voxel_cache_angular_freeze_warmup=50,
+    # Mass gate (C_mass): explicit replacement for the implicit content
+    # coupling that the value-gated angular factor had pre-Fix-B. Damps
+    # the cache's confidence on voxels whose cached mean value is below
+    # `mass_threshold`. Without this gate, the cache contributes to
+    # regions the model isn't actively editing (stormtrooper hand /
+    # crotch, elf eyes), producing geometric artifacts and blurring
+    # fine detail. With it, the cache's influence is restricted to
+    # regions where the diffusion model has committed real edit signal.
+    #   threshold = 0.3 → start damping below cache-mean 0.3
+    #   power     = 1.0 → linear ramp inside the damped region
+    #   power     = 0.0 → gate disabled (legacy)
+    mask_voxel_cache_mass_threshold=0.0,
+    mask_voxel_cache_mass_power=0.0,
 )

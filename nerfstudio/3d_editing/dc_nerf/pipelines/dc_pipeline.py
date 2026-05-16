@@ -154,6 +154,26 @@ class DCPipelineConfig(VanillaPipelineConfig):
     mask_voxel_cache_angular_relative: bool = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_angular_relative", False
     )
+    # Mass gate (C_mass). Damps the cache's confidence on voxels whose
+    # cached mean value is below `mass_threshold`, effectively turning
+    # off the cache's contribution where the model isn't actively
+    # editing. Made the previously-implicit coupling (via the
+    # value-gated angular factor) explicit. Empirical motivation: pre-
+    # Fix-B runs accidentally had this coupling and produced correct
+    # behavior on stormtrooper hand/crotch; Fix B decoupled angular
+    # from evidence and broke those regions; this gate re-establishes
+    # the coupling in a controllable way.
+    #
+    #   mass_threshold: cache-mean value below which the gate starts
+    #                   damping. 0.0 disables (legacy / debug).
+    #   mass_power:     exponent on (m/threshold). 1.0 = linear ramp.
+    #                   Higher = steeper cliff. 0.0 disables.
+    mask_voxel_cache_mass_threshold: float = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_mass_threshold", 0.0
+    )
+    mask_voxel_cache_mass_power: float = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_mass_power", 0.0
+    )
     # Step at which to freeze the scene-relative denominator. If > 0, the
     # cache snapshots mean_angular_factor_at(min_observations) at this step
     # and reuses it for all subsequent queries. Without freezing, the mean
@@ -667,6 +687,12 @@ class DCPipeline(ModifiedVanillaPipeline):
                     ),
                     angular_relative=bool(
                         self.config.mask_voxel_cache_angular_relative
+                    ),
+                    mass_threshold=float(
+                        self.config.mask_voxel_cache_mass_threshold
+                    ),
+                    mass_power=float(
+                        self.config.mask_voxel_cache_mass_power
                     ),
                 )
                 external_grad_mask = queried.view(1, 1, mask_h, mask_w).to(

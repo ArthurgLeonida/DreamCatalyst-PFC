@@ -156,6 +156,12 @@ if enabled:
         print(f"   {branch} ang gate:   power={ang_p} floor={ang_floor} ({rel_str}{extra})")
     else:
         print(f"   {branch} ang gate:   off")
+    mass_p = voxel.get('mask_voxel_cache_mass_power', 0.0)
+    mass_t = voxel.get('mask_voxel_cache_mass_threshold', 0.0)
+    if mass_p > 0.0 and mass_t > 0.0:
+        print(f"   {branch} mass gate:  power={mass_p} threshold={mass_t}")
+    else:
+        print(f"   {branch} mass gate:  off")
     print(f"   {last} stg+tag:    {dc.get('stg_tag_compose_mode', 'sequential')}")
 PY
 }

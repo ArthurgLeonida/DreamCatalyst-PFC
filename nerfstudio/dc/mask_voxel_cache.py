@@ -368,15 +368,14 @@ class MaskVoxelCache:
             else None
         )
 
-        # Geometry-only angular update. Fires for every in-bounds touched
-        # voxel BEFORE the value-threshold gate, so the angular factor
-        # measures pure triangulation coverage (which cameras saw this
-        # voxel) rather than evidential coverage (which cameras saw this
-        # voxel AND produced confident mask values). Decoupling these
-        # fixes the stormtrooper-helmet bug where low early-iteration
-        # helmet mask values caused the cameras observing the helmet to
-        # be excluded from the angular factor's view set, making helmet
-        # voxels look geometrically under-triangulated.
+        # Diagnostic-only geometry counters. These count every in-bounds
+        # observation regardless of value_threshold and are NOT used by
+        # the gate math (kept on the instance for analysis: comparing
+        # geom_view_count vs unique_view_count exposes how much the
+        # value gate is restricting the trusted population per scene).
+        # The `view_dir_sum` accumulation happens later, in the
+        # evidence-gated block — see the empirical note in `query()`
+        # about why content-coupling the angular factor is load-bearing.
         if (
             per_voxel_view_dir is not None
             and self.view_observed_geom is not None
@@ -387,27 +386,10 @@ class MaskVoxelCache:
                 touched_geom_idx = touched.nonzero(as_tuple=True)[0]
                 is_new_geom_view = ~self.view_observed_geom[touched_geom_idx, vid_geom]
                 if is_new_geom_view.any():
-                    geom_idx = touched_geom_idx[is_new_geom_view]
-                    self.view_observed_geom[geom_idx, vid_geom] = True
-                    flat_geom_count = self.geom_view_count.view(-1)
-                    flat_geom_count[geom_idx] += 1
-                    flat_view_dir_sum = self.view_dir_sum.view(-1, 3)
-                    flat_view_dir_sum[geom_idx] = (
-                        flat_view_dir_sum[geom_idx] + per_voxel_view_dir[geom_idx]
-                    )
-        elif per_voxel_view_dir is not None:
-            # No view_id provided OR cache wasn't built with num_views.
-            # Fall back to counting every touched observation as a new
-            # geometric sample; this loses the duplicate-view protection
-            # but keeps the angular factor functioning.
-            touched_geom_idx = touched.nonzero(as_tuple=True)[0]
-            flat_geom_count = self.geom_view_count.view(-1)
-            flat_geom_count[touched_geom_idx] += 1
-            flat_view_dir_sum = self.view_dir_sum.view(-1, 3)
-            flat_view_dir_sum[touched_geom_idx] = (
-                flat_view_dir_sum[touched_geom_idx]
-                + per_voxel_view_dir[touched_geom_idx]
-            )
+                    geom_idx_diag = touched_geom_idx[is_new_geom_view]
+                    self.view_observed_geom[geom_idx_diag, vid_geom] = True
+                    flat_geom_count_diag = self.geom_view_count.view(-1)
+                    flat_geom_count_diag[geom_idx_diag] += 1
 
         # Confidence gate: only learn from per-voxel evidence above the
         # threshold. The gate is on the per-voxel mean (the actual sample
@@ -469,10 +451,20 @@ class MaskVoxelCache:
             flat_running_mean[stats_idx] = new_mean
             flat_running_m2[stats_idx] = flat_running_m2[stats_idx] + delta * delta2
 
-        # Angular-diversity update happens in the geometry-only phase
-        # above, before the value-threshold gate. This block intentionally
-        # left blank (the angular factor is no longer driven by the
-        # evidence-gated `stats_idx` population).
+        # Angular-diversity update: accumulate this view's per-voxel mean
+        # direction into the running view-direction sum. Same gating as
+        # the Welford stats above (new evidence-gated view only). The
+        # angular factor in `query` divides ‖view_dir_sum‖ by the
+        # evidence-gated `unique_view_count`, so they must be updated
+        # on the same population. Reverting to evidence-gating after the
+        # geometry-only variant proved load-bearing in the wrong direction
+        # (cf. stormtrooper hand artifacts when the gate stopped
+        # implicitly damping low-edit-activity voxels).
+        if per_voxel_view_dir is not None and stats_idx.numel() > 0:
+            flat_view_dir_sum = self.view_dir_sum.view(-1, 3)
+            flat_view_dir_sum[stats_idx] = (
+                flat_view_dir_sum[stats_idx] + per_voxel_view_dir[stats_idx]
+            )
 
         existing_and_touched = touched & flat_observed
         first_time = touched & (~flat_observed)
@@ -504,6 +496,8 @@ class MaskVoxelCache:
         angular_power: float = 0.0,
         min_angular_factor: float = 0.0,
         angular_relative: bool = False,
+        mass_threshold: float = 0.0,
+        mass_power: float = 0.0,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """Look up mask values at world-space positions.
 
@@ -524,6 +518,14 @@ class MaskVoxelCache:
         sets a floor so the gate never collapses confidence to zero on
         single-observation voxels (where the resultant length is 1 by
         construction and the factor would otherwise be 0).
+
+        `mass_threshold` and `mass_power` control the mass gate
+        `C_mass = min(1, m(q) / mass_threshold)^mass_power`. Voxels whose
+        cached mean value is below `mass_threshold` get damped — they
+        represent regions the diffusion model isn't actively editing,
+        and letting the cache contribute there produces visible
+        artifacts on extremity regions and blurs high-frequency detail.
+        With `mass_power = 0` or `mass_threshold = 0` the gate is off.
 
         `angular_relative` (default False) switches the factor from absolute
         to scene-relative. With it enabled, each voxel's factor is divided
@@ -574,14 +576,20 @@ class MaskVoxelCache:
         # information from triangulation. (1 − resultant) is the diversity.
         if float(angular_power) > 0.0:
             dir_sum = self.view_dir_sum[ix, iy, iz]  # [N, 3]
-            # Use the geometry-only view count as the denominator. This
-            # counts every in-bounds observation regardless of whether
-            # that view's mask cleared `value_threshold`, so the
-            # resultant length reflects pure triangulation geometry
-            # rather than content-dependent evidential coverage.
-            geom_counts = self.geom_view_count[ix, iy, iz].float()
-            safe_geom_counts = geom_counts.clamp_min(1.0)
-            resultant_len = (dir_sum.norm(dim=-1) / safe_geom_counts).clamp(0.0, 1.0)
+            # Use the evidence-gated unique view count as the denominator.
+            # Conceptually the angular factor should be a pure geometric
+            # quantity ("how spread out are the cameras that observed
+            # this voxel?"), but empirically using the geometry-only
+            # count produces worse results — it damps confidence on
+            # voxels with no edit activity (e.g. stormtrooper hand,
+            # crotch) so they receive the full cache contribution, which
+            # produces visible artifacts. The evidence-gated count
+            # accidentally couples "is this voxel actually being edited"
+            # into the gate, which turns out to be load-bearing. See the
+            # explicit `mass_threshold`/`mass_power` mass gate below for
+            # the clean version of this coupling.
+            safe_counts = counts.clamp_min(1.0)
+            resultant_len = (dir_sum.norm(dim=-1) / safe_counts).clamp(0.0, 1.0)
             angular_factor = (1.0 - resultant_len).clamp(0.0, 1.0)
 
             # Scene-relative normalization. Cameras for a given dataset live
@@ -619,11 +627,30 @@ class MaskVoxelCache:
         else:
             angular_confidence = torch.ones_like(values)
 
+        # Mass gate (C_mass): damp confidence on voxels with low cached
+        # mean value. Conceptually distinct from variance (which measures
+        # cross-view agreement) and angular factor (which measures
+        # triangulation quality): mass measures "is the model committing
+        # edit signal to this voxel at all." Voxels with low cached
+        # mass are regions the diffusion model isn't actively editing,
+        # so the cache's contribution there should be muted to avoid
+        # geometric artifacts on extremity regions (e.g. stormtrooper
+        # hand, crotch) and high-frequency detail (e.g. elf eyes) that
+        # get blurred when the cache averages contributions across views.
+        # Formula: C_mass = min(1, m(q) / threshold)^power. With
+        # threshold=0 or power=0 the gate is disabled.
+        if float(mass_power) > 0.0 and float(mass_threshold) > 1e-6:
+            mass_ratio = (values / float(mass_threshold)).clamp(0.0, 1.0)
+            mass_confidence = mass_ratio.pow(float(mass_power))
+        else:
+            mass_confidence = torch.ones_like(values)
+
         confidence = (
             valid.float()
             * enough_views.float()
             * var_confidence
             * angular_confidence
+            * mass_confidence
         )
 
         values = torch.where(
@@ -800,12 +827,12 @@ class MaskVoxelCache:
         scene-relative denominator meaningful and stable.
         """
         min_views = max(int(min_views), 2)
-        # Use the geometry-only view count: both the population gate and
-        # the resultant-length divisor should reflect pure triangulation
-        # coverage, not evidence-gated coverage. Matches the denominator
-        # used in `query` so the scene-relative normalization compares
-        # like-with-like.
-        counts = self.geom_view_count.float()
+        # Use the evidence-gated unique view count to match `query`'s
+        # angular factor denominator. The geom_view_count is kept on the
+        # instance for diagnostics but is not load-bearing in the gate
+        # math; the evidence-gated count's implicit coupling to "voxel
+        # is being edited" turned out to be necessary.
+        counts = self.unique_view_count.float()
         mask = counts >= float(min_views)
         if not mask.any():
             return 0.0
