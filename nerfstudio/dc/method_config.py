@@ -104,7 +104,7 @@ VOXEL_CACHE_PARAMS = dict(
 
     mask_voxel_cache_ema_beta=0.99,
     mask_voxel_cache_ema_beta_auto=True,
-    
+
     mask_voxel_cache_ema_beta_camera_factor=2.0,
     mask_voxel_cache_warmup_start=1300,
     mask_voxel_cache_warmup_end=2500,
@@ -133,9 +133,9 @@ VOXEL_CACHE_PARAMS = dict(
     #                better than percentile normalization; noisier per-view
     #                but denoised by cross-view aggregation.
     mask_voxel_cache_update_source="raw_self",
-    mask_voxel_cache_angular_power=0.0,
+    mask_voxel_cache_angular_power=1.0,
     mask_voxel_cache_min_angular_factor=0.0,
-    mask_voxel_cache_angular_relative=False,
+    mask_voxel_cache_angular_relative=True,
     # Legacy hardcoded freeze step. Unused now — kept for backward
     # compatibility with older runs in the experiment log. The auto-freeze
     # below supersedes it: it tracks the trusted curve's running max and
@@ -154,6 +154,6 @@ VOXEL_CACHE_PARAMS = dict(
     # 500/50 catches clown's edit-step ~100 peak (freezes around step ~600)
     # and is short enough to act on elf before its slower drift erodes the
     # denominator significantly.
-    mask_voxel_cache_angular_freeze_patience=500,
+    mask_voxel_cache_angular_freeze_patience=100,
     mask_voxel_cache_angular_freeze_warmup=50,
 )

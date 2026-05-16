@@ -829,6 +829,9 @@ class DCPipeline(ModifiedVanillaPipeline):
                     "dc_debug/voxel_cache_mean_observation_count": float(
                         self.mask_voxel_cache.mean_observation_count
                     ),
+                    "dc_debug/voxel_cache_mean_geom_observation_count": float(
+                        self.mask_voxel_cache.mean_geom_observation_count
+                    ),
                     "dc_debug/voxel_cache_mean_observed_variance": float(
                         self.mask_voxel_cache.mean_observed_variance
                     ),

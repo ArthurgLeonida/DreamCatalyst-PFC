@@ -115,6 +115,36 @@ class MaskVoxelCache:
             if self.num_views is not None
             else None
         )
+        # Geometry-only twin of `view_observed`. The original `view_observed`
+        # only flips when a view's per-voxel mean clears `value_threshold`,
+        # which conflates "this camera geometrically saw the voxel" with
+        # "this camera produced confident mask evidence for the voxel."
+        # The angular-diversity factor wants the former (pure triangulation
+        # coverage), so it consults this tensor instead. Bug diagnosed on
+        # stormtrooper: the helmet's diffusion mask is low early in
+        # training (helmet is a generated feature, not present in source);
+        # cameras observing the helmet failed the value gate and were
+        # excluded from view_dir_sum, making helmet voxels look
+        # geometrically under-triangulated even though the orbit observes
+        # them well.
+        self.view_observed_geom = (
+            torch.zeros(
+                (n_voxels, self.num_views),
+                dtype=torch.bool,
+                device=self.device,
+            )
+            if self.num_views is not None
+            else None
+        )
+        # Geometric-only unique-view count (counts every in-bounds
+        # observation, regardless of value threshold). Used as the
+        # denominator for the angular resultant length so that
+        # ‖view_dir_sum‖ / geom_view_count reflects pure triangulation.
+        self.geom_view_count = torch.zeros(
+            (V, V, V),
+            dtype=torch.int32,
+            device=self.device,
+        )
         self.running_mean = torch.zeros(
             (V, V, V),
             device=self.device,
@@ -338,6 +368,47 @@ class MaskVoxelCache:
             else None
         )
 
+        # Geometry-only angular update. Fires for every in-bounds touched
+        # voxel BEFORE the value-threshold gate, so the angular factor
+        # measures pure triangulation coverage (which cameras saw this
+        # voxel) rather than evidential coverage (which cameras saw this
+        # voxel AND produced confident mask values). Decoupling these
+        # fixes the stormtrooper-helmet bug where low early-iteration
+        # helmet mask values caused the cameras observing the helmet to
+        # be excluded from the angular factor's view set, making helmet
+        # voxels look geometrically under-triangulated.
+        if (
+            per_voxel_view_dir is not None
+            and self.view_observed_geom is not None
+            and view_id is not None
+        ):
+            vid_geom = int(view_id)
+            if 0 <= vid_geom < self.num_views:
+                touched_geom_idx = touched.nonzero(as_tuple=True)[0]
+                is_new_geom_view = ~self.view_observed_geom[touched_geom_idx, vid_geom]
+                if is_new_geom_view.any():
+                    geom_idx = touched_geom_idx[is_new_geom_view]
+                    self.view_observed_geom[geom_idx, vid_geom] = True
+                    flat_geom_count = self.geom_view_count.view(-1)
+                    flat_geom_count[geom_idx] += 1
+                    flat_view_dir_sum = self.view_dir_sum.view(-1, 3)
+                    flat_view_dir_sum[geom_idx] = (
+                        flat_view_dir_sum[geom_idx] + per_voxel_view_dir[geom_idx]
+                    )
+        elif per_voxel_view_dir is not None:
+            # No view_id provided OR cache wasn't built with num_views.
+            # Fall back to counting every touched observation as a new
+            # geometric sample; this loses the duplicate-view protection
+            # but keeps the angular factor functioning.
+            touched_geom_idx = touched.nonzero(as_tuple=True)[0]
+            flat_geom_count = self.geom_view_count.view(-1)
+            flat_geom_count[touched_geom_idx] += 1
+            flat_view_dir_sum = self.view_dir_sum.view(-1, 3)
+            flat_view_dir_sum[touched_geom_idx] = (
+                flat_view_dir_sum[touched_geom_idx]
+                + per_voxel_view_dir[touched_geom_idx]
+            )
+
         # Confidence gate: only learn from per-voxel evidence above the
         # threshold. The gate is on the per-voxel mean (the actual sample
         # this view contributes to the cache and to the cross-view
@@ -398,19 +469,10 @@ class MaskVoxelCache:
             flat_running_mean[stats_idx] = new_mean
             flat_running_m2[stats_idx] = flat_running_m2[stats_idx] + delta * delta2
 
-        # Angular-diversity statistics: accumulate the per-voxel mean unit
-        # ray direction from this view into a per-voxel running sum, but
-        # only when this view is genuinely new for that voxel (same gating
-        # as the Welford stats above). The resultant length
-        # ‖sum / unique_view_count‖ ∈ [0, 1] measures clustering of the
-        # observing directions: 1 = parallel rays (no angular diversity),
-        # 0 = spherically uniform (maximal diversity). 1 − resultant_length
-        # becomes the per-voxel angular coverage factor in `query`.
-        if per_voxel_view_dir is not None and stats_idx.numel() > 0:
-            flat_view_dir_sum = self.view_dir_sum.view(-1, 3)
-            flat_view_dir_sum[stats_idx] = (
-                flat_view_dir_sum[stats_idx] + per_voxel_view_dir[stats_idx]
-            )
+        # Angular-diversity update happens in the geometry-only phase
+        # above, before the value-threshold gate. This block intentionally
+        # left blank (the angular factor is no longer driven by the
+        # evidence-gated `stats_idx` population).
 
         existing_and_touched = touched & flat_observed
         first_time = touched & (~flat_observed)
@@ -512,8 +574,14 @@ class MaskVoxelCache:
         # information from triangulation. (1 − resultant) is the diversity.
         if float(angular_power) > 0.0:
             dir_sum = self.view_dir_sum[ix, iy, iz]  # [N, 3]
-            safe_counts = counts.clamp_min(1.0)
-            resultant_len = (dir_sum.norm(dim=-1) / safe_counts).clamp(0.0, 1.0)
+            # Use the geometry-only view count as the denominator. This
+            # counts every in-bounds observation regardless of whether
+            # that view's mask cleared `value_threshold`, so the
+            # resultant length reflects pure triangulation geometry
+            # rather than content-dependent evidential coverage.
+            geom_counts = self.geom_view_count[ix, iy, iz].float()
+            safe_geom_counts = geom_counts.clamp_min(1.0)
+            resultant_len = (dir_sum.norm(dim=-1) / safe_geom_counts).clamp(0.0, 1.0)
             angular_factor = (1.0 - resultant_len).clamp(0.0, 1.0)
 
             # Scene-relative normalization. Cameras for a given dataset live
@@ -585,11 +653,28 @@ class MaskVoxelCache:
 
     @property
     def mean_observation_count(self) -> float:
-        """Mean number of unique camera observations over observed voxels."""
+        """Mean number of evidence-gated unique view observations over
+        observed voxels. Counts only views whose per-voxel mean cleared
+        `value_threshold`. Use this for diagnostics on the variance gate.
+        """
         observed = self.observed
         if not observed.any():
             return 0.0
         return float(self.unique_view_count[observed].float().mean().item())
+
+    @property
+    def mean_geom_observation_count(self) -> float:
+        """Mean number of geometric (in-bounds) view observations over
+        observed voxels. Counts every view whose ray intersected the
+        voxel, regardless of mask value. Use this for diagnostics on
+        the angular-diversity gate, and to compare against
+        `mean_observation_count` to see how much the value-threshold
+        filter is restricting the angular factor's view set.
+        """
+        observed = self.observed
+        if not observed.any():
+            return 0.0
+        return float(self.geom_view_count[observed].float().mean().item())
 
     @property
     def mean_observed_variance(self) -> float:
@@ -715,7 +800,12 @@ class MaskVoxelCache:
         scene-relative denominator meaningful and stable.
         """
         min_views = max(int(min_views), 2)
-        counts = self.unique_view_count.float()
+        # Use the geometry-only view count: both the population gate and
+        # the resultant-length divisor should reflect pure triangulation
+        # coverage, not evidence-gated coverage. Matches the denominator
+        # used in `query` so the scene-relative normalization compares
+        # like-with-like.
+        counts = self.geom_view_count.float()
         mask = counts >= float(min_views)
         if not mask.any():
             return 0.0
