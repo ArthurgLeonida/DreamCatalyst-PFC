@@ -185,6 +185,21 @@ class DCConfig:
     # observations agree, so low cache values are allowed to clean background
     # self-mask speckles even when CA/self gate is weak.
     external_mask_interp_suppression_ratio: float = 0.4
+    # Extra confidence exponent applied to the bidirectional negative
+    # branch only. The negative branch already inherits cache confidence
+    # (count + variance + angular + mass) through `blend_tensor`, but
+    # symmetric gating treats subtraction and addition as equally
+    # destructive. Empirically subtraction is more dangerous: removing
+    # edit signal on legitimate high-frequency detail (stormtrooper
+    # armor segments) is visually worse than adding spurious edit signal
+    # on noisy regions. This knob asks the negative branch for stricter
+    # variance/confidence agreement than the positive branch.
+    #   power = 0.0 → no extra gating (legacy)
+    #   power = 1.0 → confidence enters the negative branch squared
+    #                 (since blend_tensor already includes one factor)
+    #   power = 2.0 → confidence enters cubed; only very-high-confidence
+    #                 voxels (clean background) survive
+    external_mask_negative_variance_power: float = 0.0
 
 
 class DC(object):
@@ -634,8 +649,31 @@ class DC(object):
                     # low-mask, suppress the internal self-mask noise even when
                     # the semantic gate is low.
                     up = blend_map * gate * diff.clamp_min(0.0)
+                    neg_var_power = float(
+                        getattr(
+                            self.config,
+                            "external_mask_negative_variance_power",
+                            0.0,
+                        )
+                    )
+                    if neg_var_power > 0.0 and confidence is not None:
+                        # Negative-branch-only extra variance/confidence gate.
+                        # The positive branch keeps its single-power
+                        # `blend_map ∝ confidence`. The negative branch
+                        # multiplies in `confidence^neg_var_power` so that
+                        # subtraction requires stricter cross-view agreement
+                        # than addition. High-variance voxels (where views
+                        # disagree about edit content — typical of fine
+                        # detail like stormtrooper armor segments) are
+                        # protected from negative cleanup. Low-variance
+                        # low-cache-value voxels (consistent background
+                        # noise) still get cleaned.
+                        neg_extra = confidence.clamp(0.0, 1.0).pow(neg_var_power)
+                    else:
+                        neg_extra = 1.0
                     down = (
                         blend_map
+                        * neg_extra
                         * float(getattr(self.config, "external_mask_interp_suppression_ratio", 0.4))
                         * diff.clamp_max(0.0)
                     )

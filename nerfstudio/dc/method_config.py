@@ -40,6 +40,16 @@ DC_CUSTOM_PARAMS = dict(
     external_mask_fusion="bidirectional", # bidirectional or screen
     external_mask_screen_attn_gate_strength=1.0, # Gates positive cache support in screen/bidirectional
     external_mask_interp_suppression_ratio=0.3,  # For bidirectional fusion only
+    # Extra variance/confidence exponent on the bidirectional negative
+    # branch. Both branches inherit cache confidence through `blend_map`,
+    # but symmetric gating treats subtraction and addition as equally
+    # destructive — empirically the negative branch erodes high-frequency
+    # edit detail (stormtrooper armor) while the positive branch is
+    # harmless on the same regions. This knob asks the negative branch
+    # for stricter agreement. 0.0 disables. 1.0 squares confidence on
+    # the negative branch (since blend_map already has one factor).
+    # 2.0 cubes it — only very-high-confidence voxels survive.
+    external_mask_negative_variance_power=0.0,
     
     # Which signal opens positive voxel-cache support in screen/bidirectional modes. Options:
     #   "ca"            : M_attn (semantic; late-confirmation signal)
