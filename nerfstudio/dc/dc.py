@@ -103,6 +103,14 @@ class DCConfig:
     gradient_mask_enabled: bool = False
     gradient_mask_blur: float = 3.0
     gradient_mask_ema_beta: float = 0.9
+    # When True, the per-view self-mask EMA reuses the voxel-cache's
+    # camera-count-aware β:
+    #   β = 1 − 1 / (camera_factor · N_cameras)
+    # The same `camera_factor` from VOXEL_CACHE_PARAMS is consumed (no
+    # duplicate knob). With N_cam=65 and factor=2: β ≈ 0.9923.
+    # `gradient_mask_ema_beta` above remains the manual fallback if auto
+    # cannot resolve N_cameras at construction time.
+    gradient_mask_ema_beta_auto: bool = False
     gradient_mask_gamma: float = 1.0
     gradient_mask_warmup: int = 50
     source_blend_localization_enabled: bool = False

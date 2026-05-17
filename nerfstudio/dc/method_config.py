@@ -19,20 +19,36 @@ DC_CUSTOM_PARAMS = dict(
     psi=0.075,
     source_blend_localization_enabled=True,
     gradient_mask_enabled=False,
-    outside_mask_anchor_weight=0.18,
+    # Reverted to the table-era value (0.2) for the universal-baseline
+    # comparison. The drift to 0.18 came after the table was generated.
+    outside_mask_anchor_weight=0.2,
     outside_mask_anchor_edit_strength_adaptive=True,
 
     gradient_mask_blur=0.5,
     gradient_mask_gamma=1.2,
-    gradient_mask_ema_beta=0,
+    # Self-mask EMA: stabilizes per-view ||eps_tgt - eps_src|| across
+    # iterations. The table-era runs used hand-picked values (0.9 or
+    # 0.85) that were probably too low — the same logic that justifies
+    # the voxel cache's camera-count-aware β (each revisit contributes
+    # 1/(c·N_cam)) applies here. With auto=True, the pipeline resolves
+    # β = 1 − 1/(camera_factor · N_cameras) at construction.
+    #   N_cam=65, factor=2 → β ≈ 0.9923
+    #   N_cam=365, factor=2 → β ≈ 0.9986
+    gradient_mask_ema_beta=0.99,
+    gradient_mask_ema_beta_auto=True,
     gradient_mask_warmup=0,
 
     cross_attention_mask_enabled=True,
     cross_attention_mask_layers=[1, 2],
-    cross_attention_mask_weight=1,
+    # Reverted to table-era value (0.7). Drifted to 1 after the table
+    # was generated; the CA weight schedule mechanism was added later
+    # and is disabled below to match the table's setup.
+    cross_attention_mask_weight=0.7,
     cross_attention_mask_blur=0.5,
     cross_attention_mask_gamma=1.2,
-    cross_attention_mask_weight_schedule_enabled=True,
+    # CA weight schedule did not exist when the table was produced.
+    # Disabled here so the cache+universal comparison is apples-to-apples.
+    cross_attention_mask_weight_schedule_enabled=False,
     cross_attention_mask_weight_schedule_power=0.5,
 
     latent_mean_anchor_weight=0.005,
@@ -78,7 +94,11 @@ DC_CUSTOM_PARAMS = dict(
     # 3. STG branch
     # ---------------------------------------------------------------------
     stg_enabled=True,
-    stg_scale=2.5,
+    # Reverted to the table-era value (2.0). Drifted to 2.5 after the
+    # stg_tag_compose_mode mechanism was introduced; with sequential
+    # composition (the table-era behavior) the effective edit strength
+    # is higher, so a lower scale is the right calibration.
+    stg_scale=2.0,
     stg_skip_layers=[2],
     stg_schedule_enabled=True,
     stg_schedule_start_ratio=0.4,
@@ -97,7 +117,11 @@ DC_CUSTOM_PARAMS = dict(
     #   "parallel"   : TAG and STG act independently on the raw CFG signal,
     #                  then are summed. Each operator has a bounded effect.
     #                  Cleaner separation for the writeup.
-    stg_tag_compose_mode="parallel",
+    # Reverted to "sequential" to match the table-era behavior (the
+    # compose_mode knob didn't exist then; sequential was the implicit
+    # implementation). Use "parallel" only after ablation-confirming it
+    # against this baseline.
+    stg_tag_compose_mode="sequential",
 
     # ---------------------------------------------------------------------
     # 4. Perp-Neg branch (optional)
