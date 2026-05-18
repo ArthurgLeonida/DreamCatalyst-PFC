@@ -279,14 +279,6 @@ class DCPipeline(ModifiedVanillaPipeline):
         self.use_wandb = kwargs.get("wandb_enabled", False)
         
         self.dc = DC(self.config.dc, use_wandb=self.use_wandb)
-        # If the per-view self-mask EMA is set to auto, resolve it here using
-        # the same camera-count-aware formula as the voxel cache. Reuses the
-        # voxel cache's `camera_factor` knob — no duplicate config required.
-        # Each view is revisited every ~N_cameras iterations on average
-        # (random view sampling with change_view_step=1), so the per-revisit
-        # contribution 1/(c·N_cameras) makes the EMA behave as a sample-mean
-        # estimator across visits — same logic that produced visible
-        # improvements on the voxel cache's EMA.
         if getattr(self.config.dc, "gradient_mask_ema_beta_auto", False):
             n_cameras = max(
                 1,

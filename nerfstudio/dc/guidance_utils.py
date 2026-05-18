@@ -50,13 +50,6 @@ def apply_stg(noise_pred: torch.Tensor, noise_pred_weak: torch.Tensor, scale: fl
     return noise_pred + scale * (noise_pred - noise_pred_weak)
 
 
-def apply_perp_neg(eps_tgt: torch.Tensor, eps_src: torch.Tensor, alpha: float) -> torch.Tensor:
-    """Orthogonalize target prediction with respect to the source prediction."""
-    src_norm_sq = (eps_src * eps_src).sum(dim=(1, 2, 3), keepdim=True).clamp(min=1e-8)
-    projection = (eps_tgt * eps_src).sum(dim=(1, 2, 3), keepdim=True) / src_norm_sq
-    return eps_tgt - alpha * projection * eps_src
-
-
 def apply_source_blend(eps_tgt: torch.Tensor, eps_src: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Localize DDS by falling back to the source branch outside the mask."""
     return eps_src + mask * (eps_tgt - eps_src)
@@ -203,36 +196,12 @@ def apply_latent_mean_anchor(
 
 
 def compute_gate_signal(
-    gate_source: str,
     target_ca: Optional[torch.Tensor],
     sm: Optional[torch.Tensor],
     self_boost_lambda: float,
 ) -> Optional[torch.Tensor]:
-    """Compute the gate signal for the external mask fusion."""
-    if gate_source == "ca":
-        gate_signal = target_ca if target_ca is not None else sm
-    elif gate_source == "self":
-        gate_signal = sm if sm is not None else target_ca
-    elif gate_source == "hybrid_max":
-        if sm is not None and target_ca is not None:
-            gate_signal = torch.maximum(sm, target_ca)
-        else:
-            gate_signal = sm if sm is not None else target_ca
-    elif gate_source == "hybrid_mean":
-        if sm is not None and target_ca is not None:
-            gate_signal = 0.5 * (sm + target_ca)
-        else:
-            gate_signal = sm if sm is not None else target_ca
-    elif gate_source == "self_boost":
-        if sm is not None and target_ca is not None:
-            lam = max(float(self_boost_lambda), 0.0)
-            gate_signal = target_ca + lam * (sm - target_ca).clamp_min(0.0)
-            gate_signal = gate_signal.clamp(0.0, 1.0)
-        else:
-            gate_signal = target_ca if target_ca is not None else sm
-    else:
-        raise ValueError(
-            f"Unknown external_mask_screen_gate_source={gate_source!r}; "
-            "expected 'ca', 'self', 'hybrid_max', 'hybrid_mean', or 'self_boost'."
-        )
-    return gate_signal
+    if sm is not None and target_ca is not None:
+        lam = max(float(self_boost_lambda), 0.0)
+        gate_signal = target_ca + lam * (sm - target_ca).clamp_min(0.0)
+        return gate_signal.clamp(0.0, 1.0)
+    return target_ca if target_ca is not None else sm

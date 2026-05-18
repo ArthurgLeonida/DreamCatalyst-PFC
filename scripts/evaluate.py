@@ -12,6 +12,8 @@ Metrics:
   - SSIM:            structural similarity (identity preservation)
   - LPIPS:           perceptual distance (lower = more similar to original)
   - Multi-view consistency: std of per-view CLIP embeddings (lower = more consistent)
+  - EditMaskVariance_3D: variance of a rendered edit-magnitude mask after
+    backprojection into world-space voxels (lower = more 3D-consistent masks)
 
 Usage:
   python scripts/evaluate.py eval \
@@ -263,6 +265,185 @@ def log_results_to_wandb(results, config_path, config, metrics_path, run_id=None
     wandb.finish()
 
 
+def _resize_image_like(tensor, size, mode="bilinear"):
+    """Resize [1,C,H,W] tensor to size while preserving value range."""
+    kwargs = {"mode": mode}
+    if mode in {"bilinear", "bicubic"}:
+        kwargs["align_corners"] = False
+    return F.interpolate(tensor, size=size, **kwargs)
+
+
+def _hwc_to_bchw(tensor):
+    """Convert [H,W,C] or [H,W] to [1,C,H,W]."""
+    if tensor.dim() == 4 and tensor.shape[0] == 1:
+        tensor = tensor.squeeze(0)
+    if tensor.dim() == 2:
+        tensor = tensor.unsqueeze(-1)
+    return tensor.permute(2, 0, 1).unsqueeze(0)
+
+
+def _choose_mask_metric_size(height, width, max_side):
+    """Return a smaller H,W preserving aspect ratio for geometry metrics."""
+    if max_side <= 0:
+        return int(height), int(width)
+    scale = min(1.0, float(max_side) / float(max(height, width)))
+    return max(1, int(round(height * scale))), max(1, int(round(width * scale)))
+
+
+def _sample_edit_mask_points(
+    rendered,
+    gt,
+    outputs,
+    camera,
+    max_side=128,
+    accumulation_threshold=0.3,
+):
+    """Build one view's world-space samples for the 3D edit-mask variance metric.
+
+    The metric cannot recover the training-time final gradient mask from a
+    checkpoint, so it uses a rendered edit-magnitude proxy:
+        M_edit = robust_norm(||I_edit - I_src||_2).
+    Those mask values are backprojected with rendered depth and camera rays.
+    """
+    depth = outputs.get("depth", None)
+    if depth is None:
+        return None
+
+    device = rendered.device
+    height, width = rendered.shape[:2]
+    metric_h, metric_w = _choose_mask_metric_size(height, width, max_side)
+
+    rendered_bchw = _hwc_to_bchw(rendered.float())
+    gt_bchw = _hwc_to_bchw(gt.float()).to(device)
+    if gt_bchw.shape[-2:] != rendered_bchw.shape[-2:]:
+        gt_bchw = _resize_image_like(gt_bchw, rendered_bchw.shape[-2:])
+
+    edit_delta = torch.linalg.norm(rendered_bchw - gt_bchw, dim=1, keepdim=True)
+    edit_delta = _resize_image_like(edit_delta, (metric_h, metric_w))
+    q95 = torch.quantile(edit_delta.flatten(), 0.95).clamp_min(1e-6)
+    edit_mask = (edit_delta / q95).clamp(0.0, 1.0)
+
+    depth_bchw = _hwc_to_bchw(depth.float().to(device))
+    depth_bchw = _resize_image_like(depth_bchw, (metric_h, metric_w))
+
+    accumulation = outputs.get("accumulation", None)
+    if accumulation is None:
+        accumulation_bchw = torch.ones_like(depth_bchw)
+    else:
+        accumulation_bchw = _hwc_to_bchw(accumulation.float().to(device))
+        accumulation_bchw = _resize_image_like(accumulation_bchw, (metric_h, metric_w))
+
+    rays = camera.generate_rays(camera_indices=0, keep_shape=True)
+    origins = rays.origins.to(device).float()
+    directions = rays.directions.to(device).float()
+    origins_bchw = _resize_image_like(_hwc_to_bchw(origins), (metric_h, metric_w))
+    directions_bchw = _resize_image_like(_hwc_to_bchw(directions), (metric_h, metric_w))
+    directions_bchw = F.normalize(directions_bchw, dim=1)
+
+    points = origins_bchw + depth_bchw * directions_bchw
+    valid = (
+        torch.isfinite(points).all(dim=1, keepdim=True)
+        & torch.isfinite(depth_bchw)
+        & torch.isfinite(edit_mask)
+        & (depth_bchw > 0)
+        & (accumulation_bchw > float(accumulation_threshold))
+    )
+
+    return {
+        "points": points.permute(0, 2, 3, 1).reshape(-1, 3).detach().cpu(),
+        "values": edit_mask.reshape(-1).detach().cpu(),
+        "valid": valid.reshape(-1).detach().cpu(),
+    }
+
+
+def compute_3d_edit_mask_variance(
+    mask_samples,
+    voxel_resolution=64,
+    min_observations=3,
+    bbox_quantile=0.05,
+    bbox_inflation=0.2,
+):
+    """Measure per-voxel disagreement of rendered edit masks across views.
+
+    Each view first contributes one mean edit-mask value per occupied voxel.
+    The final metric is the variance of those per-view values over voxels
+    observed by at least `min_observations` views.
+    """
+    mask_samples = [sample for sample in mask_samples if sample is not None]
+    valid_points = [
+        sample["points"][sample["valid"]]
+        for sample in mask_samples
+        if bool(sample["valid"].any())
+    ]
+    if not valid_points:
+        return None
+
+    all_points = torch.cat(valid_points, dim=0)
+    if all_points.numel() == 0:
+        return None
+
+    q = min(max(float(bbox_quantile), 0.0), 0.49)
+    bbox_min = torch.quantile(all_points, q, dim=0)
+    bbox_max = torch.quantile(all_points, 1.0 - q, dim=0)
+    span = (bbox_max - bbox_min).clamp_min(1e-6)
+    bbox_min = bbox_min - float(bbox_inflation) * span
+    bbox_max = bbox_max + float(bbox_inflation) * span
+    span = (bbox_max - bbox_min).clamp_min(1e-6)
+
+    resolution = int(voxel_resolution)
+    n_voxels = resolution ** 3
+    obs_count = torch.zeros(n_voxels, dtype=torch.float32)
+    mean = torch.zeros(n_voxels, dtype=torch.float32)
+    m2 = torch.zeros(n_voxels, dtype=torch.float32)
+
+    for sample in mask_samples:
+        valid = sample["valid"]
+        if not bool(valid.any()):
+            continue
+
+        points = sample["points"][valid]
+        values = sample["values"][valid].float()
+        coords = torch.floor((points - bbox_min) / span * resolution).long()
+        in_bounds = ((coords >= 0) & (coords < resolution)).all(dim=-1)
+        if not bool(in_bounds.any()):
+            continue
+
+        coords = coords[in_bounds]
+        values = values[in_bounds]
+        flat = coords[:, 0] * (resolution * resolution) + coords[:, 1] * resolution + coords[:, 2]
+
+        per_voxel_sum = torch.bincount(flat, weights=values, minlength=n_voxels)
+        per_voxel_count = torch.bincount(flat, minlength=n_voxels).float()
+        touched = per_voxel_count > 0
+        if not bool(touched.any()):
+            continue
+
+        idx = touched.nonzero(as_tuple=False).squeeze(-1)
+        view_values = per_voxel_sum[idx] / per_voxel_count[idx].clamp_min(1.0)
+
+        old_count = obs_count[idx]
+        new_count = old_count + 1.0
+        delta = view_values - mean[idx]
+        mean[idx] = mean[idx] + delta / new_count
+        delta2 = view_values - mean[idx]
+        m2[idx] = m2[idx] + delta * delta2
+        obs_count[idx] = new_count
+
+    eligible = obs_count >= float(min_observations)
+    if not bool(eligible.any()):
+        return None
+
+    variance = m2[eligible] / (obs_count[eligible] - 1.0).clamp_min(1.0)
+    return {
+        "EditMaskVariance_3D": {
+            "mean": float(variance.mean().item()),
+            "std": float(variance.std(unbiased=False).item()),
+        },
+        "EditMaskVariance_3D_num_voxels": int(eligible.sum().item()),
+        "EditMaskVariance_3D_mean_observations": float(obs_count[eligible].mean().item()),
+    }
+
+
 def load_pipeline_from_experiment(config_path, device, disable_wandb_during_load=True):
     """Load the edited checkpoint directly from the experiment folder.
 
@@ -306,7 +487,16 @@ def load_pipeline_from_experiment(config_path, device, disable_wandb_during_load
     return pipeline, load_path, load_step, config
 
 
-def render_all_views(config_path, device, disable_wandb_during_load=True):
+def render_all_views(
+    config_path,
+    device,
+    disable_wandb_during_load=True,
+    compute_mask_variance=True,
+    mask_variance_image_max_side=128,
+    mask_variance_voxel_resolution=64,
+    mask_variance_min_observations=3,
+    mask_variance_accumulation_threshold=0.3,
+):
     """Load an edited nerfstudio checkpoint and render all training views.
     Returns list of (rendered_image_tensor, gt_image_tensor) pairs.
     rendered images are [1,C,H,W] in [0,1].
@@ -321,6 +511,7 @@ def render_all_views(config_path, device, disable_wandb_during_load=True):
     rendered_images = []
     gt_images = []
     image_names = []
+    mask_variance_samples = []
 
     dataset = pipeline.datamanager.train_dataset
 
@@ -339,13 +530,35 @@ def render_all_views(config_path, device, disable_wandb_during_load=True):
         rendered_tensor = rendered.permute(2, 0, 1).unsqueeze(0).clamp(0, 1)
         gt_tensor = gt.permute(2, 0, 1).unsqueeze(0).clamp(0, 1)
 
+        if compute_mask_variance:
+            sample = _sample_edit_mask_points(
+                outputs["rgb"].detach(),
+                dataset[i]["image"].to(device),
+                outputs,
+                camera,
+                max_side=mask_variance_image_max_side,
+                accumulation_threshold=mask_variance_accumulation_threshold,
+            )
+            mask_variance_samples.append(sample)
+
         rendered_images.append(rendered_tensor)
         gt_images.append(gt_tensor)
 
         fname = Path(dataset.image_filenames[i]).stem if hasattr(dataset, "image_filenames") else f"view_{i:04d}"
         image_names.append(fname)
 
-    return rendered_images, gt_images, image_names, config
+    mask_variance_metrics = None
+    if compute_mask_variance:
+        print("Computing 3D edit-mask variance...")
+        mask_variance_metrics = compute_3d_edit_mask_variance(
+            mask_variance_samples,
+            voxel_resolution=mask_variance_voxel_resolution,
+            min_observations=mask_variance_min_observations,
+        )
+        if mask_variance_metrics is None:
+            print("WARNING: 3D edit-mask variance unavailable; depth/ray samples were insufficient.")
+
+    return rendered_images, gt_images, image_names, config, mask_variance_metrics
 
 
 def evaluate_experiment(
@@ -358,6 +571,11 @@ def evaluate_experiment(
     wandb_run_id=None,
     wandb_dir=None,
     wandb_project=None,
+    compute_mask_variance=True,
+    mask_variance_image_max_side=128,
+    mask_variance_voxel_resolution=64,
+    mask_variance_min_observations=3,
+    mask_variance_accumulation_threshold=0.3,
 ):
     """Run full evaluation on a single experiment."""
     config_path = Path(config_path)
@@ -366,10 +584,15 @@ def evaluate_experiment(
     (output_dir / "rendered").mkdir(exist_ok=True)
 
     print(f"Loading checkpoint from {config_path}...")
-    rendered_images, gt_images, image_names, config = render_all_views(
+    rendered_images, gt_images, image_names, config, mask_variance_metrics = render_all_views(
         config_path,
         device,
         disable_wandb_during_load=True,
+        compute_mask_variance=compute_mask_variance,
+        mask_variance_image_max_side=mask_variance_image_max_side,
+        mask_variance_voxel_resolution=mask_variance_voxel_resolution,
+        mask_variance_min_observations=mask_variance_min_observations,
+        mask_variance_accumulation_threshold=mask_variance_accumulation_threshold,
     )
     num_views = len(rendered_images)
     print(f"Rendered {num_views} views.")
@@ -502,6 +725,8 @@ def evaluate_experiment(
             for i, name in enumerate(image_names)
         },
     }
+    if mask_variance_metrics is not None:
+        results["metrics"].update(mask_variance_metrics)
 
     # Save
     results_path = output_dir / "metrics.json"
@@ -535,6 +760,12 @@ def evaluate_experiment(
     print(f"  LPIPS (perceptual dist):       {m['LPIPS']['mean']:.4f} +/- {m['LPIPS']['std']:.4f}")
     print(f"  MV consistency (feat std):     {m['MultiView_consistency_std']:.6f}")
     print(f"  MV pairwise cos sim:           {m['MultiView_pairwise_cos_sim']:.4f}")
+    if "EditMaskVariance_3D" in m:
+        print(
+            f"  3D edit-mask variance:         {m['EditMaskVariance_3D']['mean']:.6f} "
+            f"+/- {m['EditMaskVariance_3D']['std']:.6f}"
+        )
+        print(f"  3D edit-mask voxels:           {m['EditMaskVariance_3D_num_voxels']}")
     print("=" * 60)
     print(f"  Results saved to: {results_path}")
 
@@ -554,6 +785,35 @@ def main():
     eval_parser.add_argument("--wandb-run-id", type=str, default=None, help="Attach metrics to an existing WandB run id")
     eval_parser.add_argument("--wandb-dir", type=str, default=None, help="Directory containing local WandB run files")
     eval_parser.add_argument("--wandb-project", type=str, default=None, help="Override the WandB project name")
+    eval_parser.add_argument(
+        "--disable-mask-variance",
+        action="store_true",
+        help="Disable the 3D edit-mask variance metric",
+    )
+    eval_parser.add_argument(
+        "--mask-variance-image-max-side",
+        type=int,
+        default=128,
+        help="Max rendered-image side used for 3D edit-mask variance samples",
+    )
+    eval_parser.add_argument(
+        "--mask-variance-voxel-resolution",
+        type=int,
+        default=64,
+        help="Voxel grid resolution used by the 3D edit-mask variance metric",
+    )
+    eval_parser.add_argument(
+        "--mask-variance-min-observations",
+        type=int,
+        default=3,
+        help="Minimum number of views observing a voxel for 3D edit-mask variance",
+    )
+    eval_parser.add_argument(
+        "--mask-variance-accumulation-threshold",
+        type=float,
+        default=0.3,
+        help="Rendered accumulation threshold for valid 3D edit-mask variance samples",
+    )
 
     args = parser.parse_args()
 
@@ -568,6 +828,11 @@ def main():
             wandb_run_id=args.wandb_run_id,
             wandb_dir=args.wandb_dir,
             wandb_project=args.wandb_project,
+            compute_mask_variance=not args.disable_mask_variance,
+            mask_variance_image_max_side=args.mask_variance_image_max_side,
+            mask_variance_voxel_resolution=args.mask_variance_voxel_resolution,
+            mask_variance_min_observations=args.mask_variance_min_observations,
+            mask_variance_accumulation_threshold=args.mask_variance_accumulation_threshold,
         )
     else:
         parser.print_help()

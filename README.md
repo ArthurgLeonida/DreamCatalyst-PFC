@@ -16,7 +16,7 @@ Photos/Video ──► COLMAP ──► Nerfacto (NeRF) ──► DreamCatalyst 
 ## Research scope
 
 The contributions of this work are concentrated in **Step 3**. Extensions target:
-- stronger DDS guidance (TAG family, STG, Perp-Neg),
+- stronger DDS guidance (TAG family, STG),
 - better localization / background preservation (self-derived relevance mask, source-blended localization, cross-attention semantic mask, outside-mask background anchor),
 - cleaner multi-scene evaluation.
 
@@ -101,7 +101,6 @@ The main DDS orchestration lives in `nerfstudio/dc/dc.py`; reusable novelty math
 
 | Novelty | Config | Description |
 |---|---|---|
-| **Self-derived relevance mask** | `gradient_mask_enabled` | Builds a soft mask `M` from the per-pixel norm of `eps_tgt − eps_src` (pre-TAG / pre-STG / pre-PN snapshot). Inspired by LatentEditor. |
 | **Source-blended localization** | `source_blend_localization_enabled` | Replaces the DDS target with `eps_src + M·(eps_tgt − eps_src)`, so the edit signal vanishes outside the mask. Motivated by LatentEditor / FoI / ZONE. |
 | **Outside-mask background anchor** | `outside_mask_anchor_weight` | Strengthens the preservation term by `w_out · (1 − M)`, tightening `x0` outside the mask. Conceptually aligned with RoMaP. |
 | **Edit-strength-adaptive anchor** | `outside_mask_anchor_edit_strength_adaptive` | Scales `w_out` by `(1 − s)`, where `s = ‖eps_tgt − eps_src‖ / (‖eps_tgt‖ + ‖eps_src‖) ∈ [0, 1]` is the scene-level edit strength from the raw pre-guidance noise predictions. Time-invariant (numerator and denominator scale together with timestep). Low on identity-preserving edits (face / elf), high on structural edits (person → stormtrooper). Replaces an earlier mask-coverage approach that was shown to be undiscriminative once both masks are percentile-normalized. |
@@ -123,12 +122,6 @@ The main DDS orchestration lives in `nerfstudio/dc/dc.py`; reusable novelty math
 | **STG schedule** | `stg_schedule_enabled`, `stg_schedule_mode`, `stg_schedule_{start,end}_ratio`, `stg_bump_peak_ratio` | Three shapes: `"decay"` (STG early, off late — best on identity-preserving edits), `"growth"` (STG off early, on late — lets TAG commit the edit first), `"bump"` (triangle: STG peaks mid-phase and returns to 0 before the end — prevents late STG from locking in view-dependent partial-state inconsistencies on creative edits). |
 | **Edit-strength-adaptive STG** | `stg_edit_strength_adaptive` | Multiplies the scheduled STG scale by `(1 − s)`, where `s` is the same per-step edit strength used by the anchor. Identity edits keep STG near full strength; structural edits fade STG automatically. |
 
-### Perp-Neg branch (creative direction separation)
-
-| Novelty | Config | Description |
-|---|---|---|
-| **Perpendicular Gradient Projection** | `perp_neg`, `perp_neg_alpha` | Orthogonalizes `eps_tgt` with respect to `eps_src` via Gram-Schmidt. Kept as an optional global branch; earlier depth/cached-mask foreground variants were retired in favor of self-mask + CA-mask localization, which subsume their role. Based on PCGrad (Yu et al., NeurIPS 2020) and Perp-Neg (Armandpour et al., ICML 2023). |
-
 ### Central config
 
 ```python
@@ -137,19 +130,19 @@ DC_CUSTOM_PARAMS = dict(
     # Localization
     psi=0.075,
     source_blend_localization_enabled=True,
-    gradient_mask_enabled=False,
     outside_mask_anchor_weight=0.2,
     outside_mask_anchor_edit_strength_adaptive=True,
     gradient_mask_blur=1.0,
     gradient_mask_gamma=1.2,
-    gradient_mask_ema_beta=0.0,
+    gradient_mask_ema_beta=0.99,
+    gradient_mask_ema_beta_auto=True,
     gradient_mask_warmup=0,
     cross_attention_mask_enabled=True,
     cross_attention_mask_layers=[1, 2],
     cross_attention_mask_weight=0.7,
     cross_attention_mask_blur=0.5,
     cross_attention_mask_gamma=1.2,
-    latent_mean_anchor_weight=0.005, # N2: latent-mean anchor (0.0 = off)
+    latent_mean_anchor_weight=0.005,
 
     # TAG
     eta_tag=1.25,
@@ -163,13 +156,10 @@ DC_CUSTOM_PARAMS = dict(
     stg_schedule_enabled=True,
     stg_schedule_start_ratio=0.4,
     stg_schedule_end_ratio=0.7,
-    stg_schedule_mode="bump",        # "decay" | "growth" | "bump"
-    stg_bump_peak_ratio=0.5,         # only used in "bump" mode
+    stg_schedule_mode="bump",
+    stg_bump_peak_ratio=0.5,
     stg_edit_strength_adaptive=True,
-
-    # Perp-Neg (optional; earlier depth/cached-mask variants retired)
-    perp_neg=False,
-    perp_neg_alpha=1.0,
+    stg_tag_compose_mode="sequential",
 )
 ```
 

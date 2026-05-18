@@ -140,7 +140,6 @@ if enabled:
         f"{voxel['mask_voxel_cache_warmup_end']})"
     )
     print(f"   {branch} fusion:     {dc['external_mask_fusion']}")
-    print(f"   {branch} gate src:   {dc['external_mask_screen_gate_source']}")
     print(f"   {branch} gate str:   {dc['external_mask_screen_attn_gate_strength']}")
     neg_var_p = dc.get('external_mask_negative_variance_power', 0.0)
     if neg_var_p > 0.0:

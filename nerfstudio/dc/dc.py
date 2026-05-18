@@ -14,7 +14,6 @@ from dc.attention_utils import (
 from dc.dc_unet import CustomUNet2DConditionModel
 from dc.guidance_utils import (
     apply_latent_mean_anchor,
-    apply_perp_neg,
     apply_source_blend,
     apply_stg,
     apply_tag,
@@ -68,8 +67,6 @@ class DCConfig:
     adaptive_tag: bool = False
     asymmetric_tag: bool = False
 
-    perp_neg: bool = False
-    perp_neg_alpha: float = 1.0
 
     stg_enabled: bool = False
     stg_scale: float = 0.5
@@ -100,16 +97,8 @@ class DCConfig:
     stg_tag_compose_mode: str = "sequential"
 
     # Self-derived relevance masking
-    gradient_mask_enabled: bool = False
     gradient_mask_blur: float = 3.0
     gradient_mask_ema_beta: float = 0.9
-    # When True, the per-view self-mask EMA reuses the voxel-cache's
-    # camera-count-aware β:
-    #   β = 1 − 1 / (camera_factor · N_cameras)
-    # The same `camera_factor` from VOXEL_CACHE_PARAMS is consumed (no
-    # duplicate knob). With N_cam=65 and factor=2: β ≈ 0.9923.
-    # `gradient_mask_ema_beta` above remains the manual fallback if auto
-    # cannot resolve N_cameras at construction time.
     gradient_mask_ema_beta_auto: bool = False
     gradient_mask_gamma: float = 1.0
     gradient_mask_warmup: int = 50
@@ -123,90 +112,15 @@ class DCConfig:
     cross_attention_mask_weight: float = 1.0
     cross_attention_mask_blur: float = 0.0
     cross_attention_mask_gamma: float = 1.0
-    # Optional active-range reverse-TAG CA schedule:
-    #     progress = (max_t - t_norm) / (max_t - min_t)
-    #     w_CA(t) = cross_attention_mask_weight * progress^(power * e)
-    # This keeps CA soft at high-noise steps and strengthens it later.
     cross_attention_mask_weight_schedule_enabled: bool = False
     cross_attention_mask_weight_schedule_power: float = 0.75
 
     latent_mean_anchor_weight: float = 0.0
 
-    # Modes (all use `b = external_mask_blend ∈ [0, 1]`):
-    #   "screen" (default): M = M_int + b · M_ext · (1 − M_int)
-    #       Probabilistic-union form. Cache contribution shrinks to zero as
-    #       the internal mask saturates toward 1, so per-view edit peaks are
-    #       fully preserved. Cache supplies cross-view consensus only where
-    #       the internal mask is weak (e.g. the occluded arm in a clown view).
-    #   "blend":            M = (1 − b) · M_int + b · M_ext
-    #       Linear blend (legacy / replacement-style). Reduces edit strength
-    #       where internal > cache value; useful as a baseline ablation.
-    #   "max":              M = max(M_int, b · M_ext)
-    #       Hard upper-envelope. Same "never lower" property as screen but
-    #       discontinuous at the crossover; good for diagnostics.
-    #   "min":              M = min(M_int, M_ext)
-    #       Restrictive (intersection): both must agree to edit. Filters
-    #       per-view false positives but kills cross-view support.
-    external_mask_fusion: str = "screen"
-    # For "screen" and the upward branch of "bidirectional" fusion: how
-    # strongly the cache's positive contribution is gated by the selected gate
-    # signal. The gate is a convex blend between full gating and no gating:
-    #     gate = (1 - strength) + strength * gate_signal
-    # so:
-    #   strength = 1.0: full gating by gate_signal.
-    #   strength = 0.5: softened gating (gate in [0.5, 1.0]).
-    #   strength = 0.0: no gating (equivalent to plain screen).
+    external_mask_fusion: str = "screen"  # screen | bidirectional
     external_mask_screen_attn_gate_strength: float = 1.0
-    # Which signal opens the screen-mode cache gate. Background:
-    # CA mask (`M_attn`) is a *late confirmation* signal — it brightens on
-    # a region only after the diffusion model semantically commits to
-    # editing it. For late-forming objects (e.g. stormtrooper helmet,
-    # which only emerges after iter ~1400 because the model spends the
-    # early budget on the body), CA-only gating gives no cache support
-    # during discovery, so the helmet edit never gets the cross-view
-    # consensus boost the body got. Self-mask (`M_self`) is *responsive*:
-    # it fires on the raw DDS delta the moment the model attempts an
-    # edit, before commitment. Gating by `M_self` lets the cache help
-    # discover late-forming structure but risks self-reinforcing
-    # per-view artifacts.
-    #
-    # Modes (the `gate` factor multiplied into the cache contribution):
-    #   "ca"           : gate_signal = M_attn          (current default)
-    #   "self"         : gate_signal = M_self          (responsive but circular)
-    #   "hybrid_max"   : gate_signal = max(M_self, M_attn)  (most aggressive)
-    #   "hybrid_mean"  : gate_signal = 0.5(M_self + M_attn) (averaged; can underperform
-    #                                                       pure CA when M_self < M_attn
-    #                                                       in target region)
-    #   "self_boost"   : gate_signal = M_attn + λ · max(M_self − M_attn, 0)
-    #                    Monotone over CA: gate_signal ≥ M_attn always. Self contributes
-    #                    only where it discovers signal CA missed (e.g. early helmet
-    #                    formation). λ is `external_mask_screen_self_boost_lambda`.
-    # Where `gate = (1 - strength) + strength * gate_signal`.
-    external_mask_screen_gate_source: str = "ca"
-    # For "self_boost" mode only: how strongly self-mask is allowed to lift
-    # the gate above CA when M_self > M_attn. λ=0 collapses to pure CA;
-    # λ=1.0 fully uses self where self exceeds CA; λ>1 over-boosts (risky).
     external_mask_screen_self_boost_lambda: float = 1.0
-    # For "bidirectional" fusion only: how strongly a trusted low cache value
-    # suppresses the internal mask where they disagree. This suppression is
-    # intentionally not semantic-gated: confidence already means repeated 3D
-    # observations agree, so low cache values are allowed to clean background
-    # self-mask speckles even when CA/self gate is weak.
     external_mask_interp_suppression_ratio: float = 0.4
-    # Extra confidence exponent applied to the bidirectional negative
-    # branch only. The negative branch already inherits cache confidence
-    # (count + variance + angular + mass) through `blend_tensor`, but
-    # symmetric gating treats subtraction and addition as equally
-    # destructive. Empirically subtraction is more dangerous: removing
-    # edit signal on legitimate high-frequency detail (stormtrooper
-    # armor segments) is visually worse than adding spurious edit signal
-    # on noisy regions. This knob asks the negative branch for stricter
-    # variance/confidence agreement than the positive branch.
-    #   power = 0.0 → no extra gating (legacy)
-    #   power = 1.0 → confidence enters the negative branch squared
-    #                 (since blend_tensor already includes one factor)
-    #   power = 2.0 → confidence enters cubed; only very-high-confidence
-    #                 voxels (clean background) survive
     external_mask_negative_variance_power: float = 0.0
 
 
@@ -520,8 +434,7 @@ class DC(object):
         grad_mask = None
         self_grad_mask = None
         needs_self_mask = (
-            self.config.gradient_mask_enabled
-            or self.config.source_blend_localization_enabled
+            self.config.source_blend_localization_enabled
             or self.config.outside_mask_anchor_weight > 0
             or self.config.cross_attention_mask_enabled
         )
@@ -626,18 +539,13 @@ class DC(object):
                         target_ca = _to_target(target_cross_attention_mask)
                         sm = _to_target(self_grad_mask)
 
-                        gate_source = str(self.config.external_mask_screen_gate_source).lower()
-
                         gate_signal = compute_gate_signal(
-                            gate_source=gate_source,
                             target_ca=target_ca,
                             sm=sm,
                             self_boost_lambda=self.config.external_mask_screen_self_boost_lambda,
                         )
 
-                if mode == "blend":
-                    fused = (1.0 - blend_tensor) * grad_mask + blend_tensor * ext
-                elif mode == "bidirectional":
+                if mode == "bidirectional":
                     diff = ext - grad_mask
                     gate = 1.0
 
@@ -650,32 +558,11 @@ class DC(object):
                     else:
                         blend_map = torch.full_like(diff, float(blend_tensor))
 
-                    # Positive cache corrections add 3D-consistent support to
-                    # weak internal-mask regions, so they remain semantic-gated
-                    # to avoid opening the background. Negative corrections are
-                    # cleanup: if the cache confidently says this 3D point is
-                    # low-mask, suppress the internal self-mask noise even when
-                    # the semantic gate is low.
                     up = blend_map * gate * diff.clamp_min(0.0)
                     neg_var_power = float(
-                        getattr(
-                            self.config,
-                            "external_mask_negative_variance_power",
-                            0.0,
-                        )
+                        getattr(self.config, "external_mask_negative_variance_power", 0.0)
                     )
                     if neg_var_power > 0.0 and confidence is not None:
-                        # Negative-branch-only extra variance/confidence gate.
-                        # The positive branch keeps its single-power
-                        # `blend_map ∝ confidence`. The negative branch
-                        # multiplies in `confidence^neg_var_power` so that
-                        # subtraction requires stricter cross-view agreement
-                        # than addition. High-variance voxels (where views
-                        # disagree about edit content — typical of fine
-                        # detail like stormtrooper armor segments) are
-                        # protected from negative cleanup. Low-variance
-                        # low-cache-value voxels (consistent background
-                        # noise) still get cleaned.
                         neg_extra = confidence.clamp(0.0, 1.0).pow(neg_var_power)
                     else:
                         neg_extra = 1.0
@@ -760,9 +647,6 @@ class DC(object):
             eps[name] = noise_pred
             pred_x0s[name] = pred_x0
 
-        if self.config.perp_neg:
-            eps["tgt"] = apply_perp_neg(eps["tgt"], eps["src"], self.config.perp_neg_alpha)
-
         eps_tgt_for_grad = eps["tgt"]
         if self.config.source_blend_localization_enabled and grad_mask is not None:
             eps_tgt_for_grad = apply_source_blend(eps["tgt"], eps["src"], grad_mask)
@@ -780,9 +664,6 @@ class DC(object):
             w_DDS * (eps_tgt_for_grad - eps["src"])
             + math.exp(t_normalized) * preserve_weight * (tgt_x0 - src_x0)
         )
-
-        if self.config.gradient_mask_enabled and grad_mask is not None:
-            grad = grad * grad_mask
 
         grad = apply_latent_mean_anchor(
             grad,
