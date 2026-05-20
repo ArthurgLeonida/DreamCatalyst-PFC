@@ -8,7 +8,7 @@ DC_CUSTOM_PARAMS = dict(
     # ---------------------------------------------------------------------
     psi=0.075,
     source_blend_localization_enabled=True,
-    outside_mask_anchor_weight=0.2,
+    outside_mask_anchor_weight=0.15,
     outside_mask_anchor_edit_strength_adaptive=True,
     outside_mask_anchor_edit_strength_power=1.0,
 
@@ -20,11 +20,11 @@ DC_CUSTOM_PARAMS = dict(
 
     cross_attention_mask_enabled=True,
     cross_attention_mask_layers=[1, 2],
-    cross_attention_mask_weight=0.7,
+    cross_attention_mask_weight=1.0,
     cross_attention_mask_blur=0.5,
     cross_attention_mask_gamma=1.2,
-    cross_attention_mask_weight_schedule_enabled=False,
-    cross_attention_mask_weight_schedule_power=0.5,
+    cross_attention_mask_weight_schedule_enabled=True,
+    cross_attention_mask_weight_schedule_power=0.7,
 
     latent_mean_anchor_weight=0.005,
 
@@ -37,7 +37,7 @@ DC_CUSTOM_PARAMS = dict(
     # ---------------------------------------------------------------------
     # 2. TAG branch
     # ---------------------------------------------------------------------
-    eta_tag=1.25,
+    eta_tag=1.15,
     adaptive_tag=True,
     asymmetric_tag=True,
 
@@ -45,7 +45,7 @@ DC_CUSTOM_PARAMS = dict(
     # 3. STG branch
     # ---------------------------------------------------------------------
     stg_enabled=True,
-    stg_scale=2.0,
+    stg_scale=2.5,
     stg_skip_layers=[2],
     stg_schedule_enabled=True,
     stg_schedule_start_ratio=0.4,
@@ -53,7 +53,7 @@ DC_CUSTOM_PARAMS = dict(
     stg_schedule_mode="bump",  # decay | growth | bump
     stg_bump_peak_ratio=0.5,
     stg_edit_strength_adaptive=True,
-    stg_tag_compose_mode="sequential",  # sequential | parallel
+    stg_tag_compose_mode="parallel",  # sequential | parallel
 )
 
 
@@ -61,7 +61,7 @@ DC_CUSTOM_PARAMS = dict(
 # 4. 3D voxel-cache localization
 # ---------------------------------------------------------------------
 VOXEL_CACHE_PARAMS = dict(
-    mask_voxel_cache_enabled=True,
+    mask_voxel_cache_enabled=False,
     mask_voxel_cache_resolution=64,
 
     mask_voxel_cache_ema_beta=0.99,

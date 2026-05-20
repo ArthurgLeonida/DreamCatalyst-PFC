@@ -63,20 +63,20 @@ class DCConfig:
 
     max_iteration: int = 3000
 
-    eta_tag: float = 1.0
-    adaptive_tag: bool = False
-    asymmetric_tag: bool = False
+    eta_tag: float = 1.25
+    adaptive_tag: bool = True
+    asymmetric_tag: bool = True
 
 
-    stg_enabled: bool = False
-    stg_scale: float = 0.5
+    stg_enabled: bool = True
+    stg_scale: float = 2.0
     stg_skip_layers: List[int] = field(default_factory=lambda: [2])
-    stg_schedule_enabled: bool = False
-    stg_schedule_start_ratio: float = 0.0
-    stg_schedule_end_ratio: float = 1.0
-    stg_schedule_mode: str = "decay"
+    stg_schedule_enabled: bool = True
+    stg_schedule_start_ratio: float = 0.4
+    stg_schedule_end_ratio: float = 0.7
+    stg_schedule_mode: str = "bump"
     stg_bump_peak_ratio: float = 0.5
-    stg_edit_strength_adaptive: bool = False
+    stg_edit_strength_adaptive: bool = True
     # How STG and TAG compose when both are active.
     #   "sequential" (default, current behavior):
     #       eps_stg = eps_full + s · (eps_full − eps_weak)
@@ -97,31 +97,31 @@ class DCConfig:
     stg_tag_compose_mode: str = "sequential"
 
     # Self-derived relevance masking
-    gradient_mask_blur: float = 3.0
-    gradient_mask_ema_beta: float = 0.9
-    gradient_mask_ema_beta_auto: bool = False
-    gradient_mask_gamma: float = 1.0
-    gradient_mask_warmup: int = 50
-    source_blend_localization_enabled: bool = False
+    gradient_mask_blur: float = 0.5
+    gradient_mask_ema_beta: float = 0.99
+    gradient_mask_ema_beta_auto: bool = True
+    gradient_mask_gamma: float = 1.2
+    gradient_mask_warmup: int = 0
+    source_blend_localization_enabled: bool = True
 
-    outside_mask_anchor_weight: float = 0.0
-    outside_mask_anchor_edit_strength_adaptive: bool = False
+    outside_mask_anchor_weight: float = 0.2
+    outside_mask_anchor_edit_strength_adaptive: bool = True
     outside_mask_anchor_edit_strength_power: float = 1.0
 
-    cross_attention_mask_enabled: bool = False
+    cross_attention_mask_enabled: bool = True
     cross_attention_mask_layers: List[int] = field(default_factory=lambda: [1, 2])
-    cross_attention_mask_weight: float = 1.0
-    cross_attention_mask_blur: float = 0.0
-    cross_attention_mask_gamma: float = 1.0
+    cross_attention_mask_weight: float = 0.7
+    cross_attention_mask_blur: float = 0.5
+    cross_attention_mask_gamma: float = 1.2
     cross_attention_mask_weight_schedule_enabled: bool = False
-    cross_attention_mask_weight_schedule_power: float = 0.75
+    cross_attention_mask_weight_schedule_power: float = 0.5
 
-    latent_mean_anchor_weight: float = 0.0
+    latent_mean_anchor_weight: float = 0.005
 
-    external_mask_fusion: str = "screen"  # screen | bidirectional
+    external_mask_fusion: str = "bidirectional"  # bidirectional | screen
     external_mask_screen_attn_gate_strength: float = 1.0
     external_mask_screen_self_boost_lambda: float = 1.0
-    external_mask_interp_suppression_ratio: float = 0.4
+    external_mask_interp_suppression_ratio: float = 0.3
     external_mask_negative_variance_power: float = 0.0
 
 
@@ -576,21 +576,17 @@ class DC(object):
                     fused = grad_mask + up + down
                 elif mode == "screen":
                     contribution = blend_tensor * ext * (1.0 - grad_mask)
-                    
+
                     if gate_signal is not None:
                         strength = float(self.config.external_mask_screen_attn_gate_strength)
                         strength = min(max(strength, 0.0), 1.0)
                         gate = (1.0 - strength) + strength * gate_signal
                         contribution = contribution * gate
                     fused = grad_mask + contribution
-                elif mode == "max":
-                    fused = torch.maximum(grad_mask, blend_tensor * ext)
-                elif mode == "min":
-                    fused = torch.minimum(grad_mask, ext)
                 else:
                     raise ValueError(
                         f"Unknown external_mask_fusion={mode!r}; expected "
-                        f"'screen', 'blend', 'max', 'min', or 'bidirectional'."
+                        f"'bidirectional' or 'screen'."
                     )
                 grad_mask = torch.where(valid, fused, grad_mask) if valid is not None else fused
             grad_mask = grad_mask.clamp(0.0, 1.0)

@@ -14,14 +14,14 @@ def compute_tag_eta(eta_tag: float, t_normalized: float, adaptive_tag: bool) -> 
 def compute_ca_mask_weight(
     weight: float,
     t_normalized: float,
-    reverse_tag_schedule: bool,
+    schedule_enabled: bool,
     min_step_ratio: float,
     max_step_ratio: float,
     schedule_power: float,
 ) -> float:
     """Return the Cross-Attention mask weight for the current timestep."""
     weight = min(max(float(weight), 0.0), 1.0)
-    if not reverse_tag_schedule:
+    if not schedule_enabled:
         return weight
 
     min_t = min(max(float(min_step_ratio), 0.0), 1.0)

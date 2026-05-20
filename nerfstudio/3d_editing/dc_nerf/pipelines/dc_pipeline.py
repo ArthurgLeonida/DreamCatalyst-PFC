@@ -174,27 +174,16 @@ class DCPipelineConfig(VanillaPipelineConfig):
     mask_voxel_cache_mass_power: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_mass_power", 0.0
     )
-    # Step at which to freeze the scene-relative denominator. If > 0, the
-    # cache snapshots mean_angular_factor_at(min_observations) at this step
-    # and reuses it for all subsequent queries. Without freezing, the mean
-    # keeps drifting downward as late-arriving edge voxels reach min_obs,
-    # eventually saturating every voxel's normalized factor to 1.0 (gate
-    # becomes a no-op). Recommended value: mask_voxel_cache_warmup_end —
-    # the trusted-population voxels are sufficiently populated by then.
-    # Set to 0 to disable freezing (legacy behavior; per-call recompute).
-    mask_voxel_cache_angular_freeze_step: int = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_angular_freeze_step", 0
-    )
     # Patience (in edit-steps) for the scene-adaptive auto-freeze of the
     # angular denominator. The cache tracks the running maximum of the
     # trusted angular factor each iteration; when no improvement is seen
     # for this many consecutive edit-steps, the denominator snapshots
     # the peak value. Lower → freezes sooner but more sensitive to noise
     # in the trusted curve; higher → more robust but may freeze after
-    # drift has begun. 500 strikes a balance: long enough to confirm the
-    # peak isn't transient, short enough to fire before significant decay.
+    # drift has begun. 100 is the current setting: short enough to fire
+    # before significant decay on typical scenes (≤2500 edit-steps).
     mask_voxel_cache_angular_freeze_patience: int = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_angular_freeze_patience", 500
+        "mask_voxel_cache_angular_freeze_patience", 100
     )
     # Warmup window (edit-steps) during which the auto-freeze does not
     # track peaks. Avoids treating the cache's startup transient — when
