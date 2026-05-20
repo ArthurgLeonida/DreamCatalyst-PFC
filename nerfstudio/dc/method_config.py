@@ -10,6 +10,7 @@ DC_CUSTOM_PARAMS = dict(
     source_blend_localization_enabled=True,
     outside_mask_anchor_weight=0.2,
     outside_mask_anchor_edit_strength_adaptive=True,
+    outside_mask_anchor_edit_strength_power=1.0,
 
     gradient_mask_blur=0.5,
     gradient_mask_gamma=1.2,

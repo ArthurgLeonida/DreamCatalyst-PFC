@@ -160,14 +160,17 @@ def compute_preserve_weight(
     grad_mask: Optional[torch.Tensor],
     outside_mask_anchor_weight: float,
     outside_mask_anchor_edit_strength_adaptive: bool,
+    outside_mask_anchor_edit_strength_power: float = 1.0,
     edit_strength: Optional[float] = None,
 ):
     """Compute DreamCatalyst preservation weight plus optional outside-mask anchor.
 
     `edit_strength` ∈ [0, 1] is the precomputed scalar from `compute_edit_strength`.
-    When the adaptive flag is on and edit_strength is provided, the anchor weight
-    is attenuated by `(1 − edit_strength)` so creative edits relax the background
-    anchor while identity edits keep it near full strength.
+    When the adaptive flag is on, the anchor weight is attenuated by
+    `(1 − edit_strength)^power`. Higher power → more aggressive scaling: scenes
+    with high edit strength get their anchor reduced much more than scenes with
+    low edit strength, decoupling per-scene difficulty from the universal config.
+    Power 1.0 reproduces the original linear scaling.
     """
     preserve_weight = psi
 
@@ -175,7 +178,8 @@ def compute_preserve_weight(
         w_out_effective = outside_mask_anchor_weight
         if outside_mask_anchor_edit_strength_adaptive and edit_strength is not None:
             s = min(max(float(edit_strength), 0.0), 1.0)
-            w_out_effective = w_out_effective * (1.0 - s)
+            power = max(float(outside_mask_anchor_edit_strength_power), 0.0)
+            w_out_effective = w_out_effective * ((1.0 - s) ** power)
         preserve_weight = preserve_weight + w_out_effective * (1.0 - grad_mask)
 
     return preserve_weight

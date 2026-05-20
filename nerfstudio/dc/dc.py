@@ -106,6 +106,7 @@ class DCConfig:
 
     outside_mask_anchor_weight: float = 0.0
     outside_mask_anchor_edit_strength_adaptive: bool = False
+    outside_mask_anchor_edit_strength_power: float = 1.0
 
     cross_attention_mask_enabled: bool = False
     cross_attention_mask_layers: List[int] = field(default_factory=lambda: [1, 2])
@@ -656,6 +657,7 @@ class DC(object):
             grad_mask=grad_mask,
             outside_mask_anchor_weight=self.config.outside_mask_anchor_weight,
             outside_mask_anchor_edit_strength_adaptive=self.config.outside_mask_anchor_edit_strength_adaptive,
+            outside_mask_anchor_edit_strength_power=self.config.outside_mask_anchor_edit_strength_power,
             edit_strength=current_edit_strength,
         )
 
