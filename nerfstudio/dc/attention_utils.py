@@ -206,6 +206,124 @@ class CrossAttentionCaptureProcessor:
         return hidden_states
 
 
+class PAGIdentitySelfAttnProcessor:
+    """Perturbed-Attention Guidance (PAG) self-attention processor.
+
+    PAG replaces the self-attention map with the identity matrix so that each
+    spatial token attends only to itself: SA'(Q, K, V) = I @ V = V (where I
+    is the identity over the query/key positions). This breaks spatial
+    coherence in the chosen layer, producing a "structurally-perturbed" weak
+    prediction whose difference vs the full prediction carries spatial-
+    structure information rather than semantic-completion information.
+
+    Compare to STGIdentityValueAttnProcessor: STG sets the attention matrix
+    to identity over heads (preserving values, skipping QK score computation).
+    PAG sets the attention matrix to identity over spatial positions, which
+    is a stronger spatial-coherence perturbation.
+
+    Cross-attention is untouched — the perturbation is applied only to
+    self-attention (attn1 in diffusers' transformer blocks).
+    """
+
+    def __call__(
+        self,
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        temb=None,
+        *args,
+        **kwargs,
+    ):
+        residual = hidden_states
+
+        if getattr(attn, "spatial_norm", None) is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+
+        input_ndim = hidden_states.ndim
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
+        if getattr(attn, "group_norm", None) is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif getattr(attn, "norm_cross", False):
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        # Compute V only — Q and K are unused because the attention map is
+        # forced to the identity over spatial positions, so the output is V
+        # directly (each token "attends" only to its own position).
+        value = attn.to_v(encoder_hidden_states)
+        value = attn.head_to_batch_dim(value)
+        hidden_states = attn.batch_to_head_dim(value)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+        if getattr(attn, "residual_connection", False):
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / getattr(attn, "rescale_output_factor", 1.0)
+        return hidden_states
+
+
+def run_unet_with_pag(unet, device, skip_layers, latent_model_input, t, text_embeddings):
+    """Run UNet forward pass with PAG self-attention perturbation in selected up_blocks.
+
+    Mirrors `run_unet_with_skipped_attn` (the STG runner) but installs a
+    PAGIdentitySelfAttnProcessor on `attn1` (self-attention) of the chosen
+    layers instead of the STG processor. The forward pass is otherwise
+    identical: same latent input, same 3-way text embeddings (IP2P CFG),
+    same no-grad context.
+    """
+    hooks = []
+    original_processors = []
+    pag_processor = PAGIdentitySelfAttnProcessor()
+
+    def _zero_attn_branch_output(module, inputs, output):
+        return torch.zeros_like(output)
+
+    try:
+        for layer_idx in skip_layers:
+            block = unet.up_blocks[layer_idx]
+            if not hasattr(block, "attentions"):
+                continue
+            for attn_module in block.attentions:
+                for transformer_block in attn_module.transformer_blocks:
+                    attn = transformer_block.attn1
+                    if hasattr(attn, "processor"):
+                        original_processors.append((attn, attn.processor))
+                        if hasattr(attn, "set_processor"):
+                            attn.set_processor(pag_processor)
+                        else:
+                            attn.processor = pag_processor
+                    else:
+                        hook = attn.register_forward_hook(_zero_attn_branch_output)
+                        hooks.append(hook)
+
+        with torch.no_grad():
+            output = unet.forward(
+                latent_model_input,
+                torch.cat([t] * 3).to(device),
+                encoder_hidden_states=text_embeddings,
+            )
+        return output.sample
+    finally:
+        for attn, processor in original_processors:
+            if hasattr(attn, "set_processor"):
+                attn.set_processor(processor)
+            else:
+                attn.processor = processor
+        for hook in hooks:
+            hook.remove()
+
+
 def run_unet_with_skipped_attn(unet, device, skip_layers, latent_model_input, t, text_embeddings):
     """Run UNet forward pass with STG-A attention skip in selected up_blocks."""
     hooks = []

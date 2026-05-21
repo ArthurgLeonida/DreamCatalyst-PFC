@@ -9,6 +9,7 @@ from PIL import Image
 from typing import List, Dict, Optional
 from dc.attention_utils import (
     run_unet_with_cross_attention_capture,
+    run_unet_with_pag,
     run_unet_with_skipped_attn,
 )
 from dc.dc_unet import CustomUNet2DConditionModel
@@ -77,6 +78,14 @@ class DCConfig:
     stg_schedule_mode: str = "bump"
     stg_bump_peak_ratio: float = 0.5
     stg_edit_strength_adaptive: bool = True
+    # Weak-model perturbation method. "stg" preserves the current behavior
+    # (skip QK attention, V passes through). "pag" replaces self-attention
+    # with the identity over spatial positions, perturbing spatial coherence
+    # instead of cross-attention. PAG amplifies structural-edit signal while
+    # leaving the symmetric-body semantic prior untouched, addressing STG's
+    # ghost-feature artifact on invention scenes (stormtrooper helmet).
+    # Shares stg_scale / stg_skip_layers / stg_schedule_* knobs.
+    stg_weak_method: str = "stg"  # stg | pag
     # How STG and TAG compose when both are active.
     #   "sequential" (default, current behavior):
     #       eps_stg = eps_full + s · (eps_full − eps_weak)
@@ -615,7 +624,17 @@ class DC(object):
             )
 
             if stg_active:
-                weak_pred = run_unet_with_skipped_attn(
+                weak_method = str(self.config.stg_weak_method).lower()
+                if weak_method == "pag":
+                    weak_runner = run_unet_with_pag
+                elif weak_method == "stg":
+                    weak_runner = run_unet_with_skipped_attn
+                else:
+                    raise ValueError(
+                        f"Unknown stg_weak_method={weak_method!r}; expected "
+                        f"'stg' or 'pag'."
+                    )
+                weak_pred = weak_runner(
                     self.unet,
                     self.device,
                     self.config.stg_skip_layers,

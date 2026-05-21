@@ -2,6 +2,15 @@
 # DC_CUSTOM_PARAMS → DCConfig
 # VOXEL_CACHE_PARAMS → DCPipelineConfig
 
+# Experiment: st_PAG_TAG115_STG25_CAsch05_bg015
+# PAG (Perturbed-Attention Guidance) ablation: replaces STG's QK-skip
+# perturbation with PAG's identity-self-attention perturbation. Same scale,
+# same skip-layers, same schedule — only the weak-prediction mechanism
+# differs. Tests whether the symmetric-body ghost is driven by STG's
+# specific cross-attention amplification pattern (which PAG should avoid).
+# Same config as ghost-present baseline `CAsch075_TAG115_STG25_bg015`
+# (CLIP_dir 0.169, helmet+ghost) except stg_weak_method "stg" → "pag".
+
 DC_CUSTOM_PARAMS = dict(
     # ---------------------------------------------------------------------
     # 1. Localization branch
@@ -24,7 +33,7 @@ DC_CUSTOM_PARAMS = dict(
     cross_attention_mask_blur=0.5,
     cross_attention_mask_gamma=1.2,
     cross_attention_mask_weight_schedule_enabled=True,
-    cross_attention_mask_weight_schedule_power=0.7,
+    cross_attention_mask_weight_schedule_power=0.5,
 
     latent_mean_anchor_weight=0.005,
 
@@ -42,7 +51,7 @@ DC_CUSTOM_PARAMS = dict(
     asymmetric_tag=True,
 
     # ---------------------------------------------------------------------
-    # 3. STG branch
+    # 3. STG / PAG branch
     # ---------------------------------------------------------------------
     stg_enabled=True,
     stg_scale=2.5,
@@ -54,6 +63,7 @@ DC_CUSTOM_PARAMS = dict(
     stg_bump_peak_ratio=0.5,
     stg_edit_strength_adaptive=True,
     stg_tag_compose_mode="parallel",  # sequential | parallel
+    stg_weak_method="pag",  # stg | pag  ← THE TEST KNOB
 )
 
 
@@ -92,7 +102,6 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_angular_power=1.0,
     mask_voxel_cache_min_angular_factor=0.0,
     mask_voxel_cache_angular_relative=True,
-    mask_voxel_cache_angular_freeze_step=2500,
     mask_voxel_cache_angular_freeze_patience=100,
     mask_voxel_cache_angular_freeze_warmup=50,
 
