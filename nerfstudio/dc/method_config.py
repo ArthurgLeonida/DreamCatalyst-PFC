@@ -20,6 +20,9 @@ DC_CUSTOM_PARAMS = dict(
     outside_mask_anchor_weight=0.15,
     outside_mask_anchor_edit_strength_adaptive=True,
     outside_mask_anchor_edit_strength_power=1.0,
+    outside_mask_anchor_schedule_enabled=False,
+    outside_mask_anchor_schedule_power=0.5,
+    outside_mask_anchor_schedule_direction="decay",  # decay | growth
 
     gradient_mask_blur=0.5,
     gradient_mask_gamma=1.2,

@@ -18,6 +18,7 @@ from dc.guidance_utils import (
     apply_source_blend,
     apply_stg,
     apply_tag,
+    compute_bg_anchor_schedule_factor,
     compute_ca_mask_weight,
     compute_edit_strength,
     compute_gate_signal,
@@ -116,6 +117,16 @@ class DCConfig:
     outside_mask_anchor_weight: float = 0.2
     outside_mask_anchor_edit_strength_adaptive: bool = True
     outside_mask_anchor_edit_strength_power: float = 1.0
+    # Temporal schedule on the outside-mask anchor weight. When enabled, scales
+    # the (already edit-strength-adapted) anchor by a t-dependent factor.
+    # "decay": factor goes 1 → 0 across the noise schedule (high t → low t),
+    #          protecting background strongly during coarse-structure denoising
+    #          and relaxing during refinement.
+    # "growth": reverse (0 → 1). Disabled by default; factor = 1 reproduces
+    # prior behavior.
+    outside_mask_anchor_schedule_enabled: bool = False
+    outside_mask_anchor_schedule_power: float = 0.5
+    outside_mask_anchor_schedule_direction: str = "decay"  # decay | growth
 
     cross_attention_mask_enabled: bool = True
     cross_attention_mask_layers: List[int] = field(default_factory=lambda: [1, 2])
@@ -667,6 +678,15 @@ class DC(object):
         if self.config.source_blend_localization_enabled and grad_mask is not None:
             eps_tgt_for_grad = apply_source_blend(eps["tgt"], eps["src"], grad_mask)
 
+        bg_anchor_schedule_factor = compute_bg_anchor_schedule_factor(
+            t_normalized=t_normalized,
+            schedule_enabled=self.config.outside_mask_anchor_schedule_enabled,
+            min_step_ratio=self.config.min_step_ratio,
+            max_step_ratio=self.config.max_step_ratio,
+            schedule_power=self.config.outside_mask_anchor_schedule_power,
+            direction=self.config.outside_mask_anchor_schedule_direction,
+        )
+
         preserve_weight = compute_preserve_weight(
             psi=self.config.psi,
             grad_mask=grad_mask,
@@ -674,6 +694,7 @@ class DC(object):
             outside_mask_anchor_edit_strength_adaptive=self.config.outside_mask_anchor_edit_strength_adaptive,
             outside_mask_anchor_edit_strength_power=self.config.outside_mask_anchor_edit_strength_power,
             edit_strength=current_edit_strength,
+            schedule_factor=bg_anchor_schedule_factor,
         )
 
         w_DDS = self.config.delta + self.config.gamma * (t_normalized ** (1/math.e))
