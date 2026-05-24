@@ -274,7 +274,7 @@ class DCPipeline(ModifiedVanillaPipeline):
                 len(self.datamanager.train_dataparser_outputs.image_filenames),
             )
             factor = max(
-                float(self.config.mask_voxel_cache_ema_beta_camera_factor), 1e-6
+                float(self.config.dc.gradient_mask_ema_beta_camera_factor), 1e-6
             )
             auto_beta = 1.0 - 1.0 / (factor * float(n_cameras))
             auto_beta = min(max(auto_beta, 0.0), 0.9999)

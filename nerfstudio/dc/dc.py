@@ -110,6 +110,7 @@ class DCConfig:
     gradient_mask_blur: float = 0.5
     gradient_mask_ema_beta: float = 0.99
     gradient_mask_ema_beta_auto: bool = True
+    gradient_mask_ema_beta_camera_factor: float = 2.0
     gradient_mask_gamma: float = 1.2
     gradient_mask_warmup: int = 0
     source_blend_localization_enabled: bool = True

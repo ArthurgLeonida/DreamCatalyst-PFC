@@ -325,9 +325,16 @@ class DCDataParser(DataParser):
                     df += 1
 
                 self.downscale_factor = 2**df
-                CONSOLE.log(f"Auto image downscale factor of {self.downscale_factor}")
+                CONSOLE.log(
+                    f"Resolved image downscale factor: {self.downscale_factor} "
+                    f"(source=auto, max_res={max_res}, MAX_AUTO_RESOLUTION={MAX_AUTO_RESOLUTION})"
+                )
             else:
                 self.downscale_factor = self.config.downscale_factor
+                CONSOLE.log(
+                    f"Resolved image downscale factor: {self.downscale_factor} "
+                    f"(source=explicit config)"
+                )
 
         if self.downscale_factor > 1:
             return data_dir / f"{downsample_folder_prefix}{self.downscale_factor}" / filepath.name
