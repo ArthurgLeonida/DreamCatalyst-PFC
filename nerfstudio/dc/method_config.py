@@ -2,77 +2,79 @@
 # DC_CUSTOM_PARAMS → DCConfig
 # VOXEL_CACHE_PARAMS → DCPipelineConfig
 
-# Experiment: st_PAG_TAG115_STG25_CAsch05_bg015
-# PAG (Perturbed-Attention Guidance) ablation: replaces STG's QK-skip
-# perturbation with PAG's identity-self-attention perturbation. Same scale,
-# same skip-layers, same schedule — only the weak-prediction mechanism
-# differs. Tests whether the symmetric-body ghost is driven by STG's
-# specific cross-attention amplification pattern (which PAG should avoid).
-# Same config as ghost-present baseline `CAsch075_TAG115_STG25_bg015`
-# (CLIP_dir 0.169, helmet+ghost) except stg_weak_method "stg" → "pag".
+# Experiment: dc_baseline
+# DreamCatalyst baseline — all Part 1 / Part 2 novelties disabled.
+# Reproduces the closest in-repo approximation to upstream DreamCatalyst:
+# raw DDS + IP2P + FreeU + delta/gamma w_DDS schedule + psi preservation.
+# No TAG, no STG/PAG, no self-mask EMA gating, no source blend, no CA mask,
+# no outside-mask anchor, no latent-mean anchor, no voxel cache.
+#
+# NOTE: not bit-identical to upstream KAIST DreamCatalyst — the upstream
+# perpendicular-projection step was removed from this repo on 2026-05-18.
+# Use this as a "minus our additions" baseline, not an upstream reproduction.
 
 DC_CUSTOM_PARAMS = dict(
     # ---------------------------------------------------------------------
-    # 1. Localization branch
+    # 1. Localization branch — OFF
     # ---------------------------------------------------------------------
     psi=0.075,
-    source_blend_localization_enabled=True,
-    outside_mask_anchor_weight=0.15,
-    outside_mask_anchor_edit_strength_adaptive=True,
+    source_blend_localization_enabled=False,
+    outside_mask_anchor_weight=0.0,
+    outside_mask_anchor_edit_strength_adaptive=False,
     outside_mask_anchor_edit_strength_power=1.0,
     outside_mask_anchor_schedule_enabled=False,
     outside_mask_anchor_schedule_power=0.5,
-    outside_mask_anchor_schedule_direction="decay",  # decay | growth
+    outside_mask_anchor_schedule_direction="decay",
 
-    gradient_mask_blur=0.5,
-    gradient_mask_gamma=1.2,
+    gradient_mask_blur=0.0,
+    gradient_mask_gamma=1.0,
     gradient_mask_ema_beta=0.99,
-    gradient_mask_ema_beta_auto=True,
+    gradient_mask_ema_beta_auto=False,
     gradient_mask_ema_beta_camera_factor=2.0,
     gradient_mask_warmup=0,
 
-    cross_attention_mask_enabled=True,
+    cross_attention_mask_enabled=False,
     cross_attention_mask_layers=[1, 2],
-    cross_attention_mask_weight=1.0,
-    cross_attention_mask_blur=0.5,
-    cross_attention_mask_gamma=1.2,
-    cross_attention_mask_weight_schedule_enabled=True,
+    cross_attention_mask_weight=0.0,
+    cross_attention_mask_blur=0.0,
+    cross_attention_mask_gamma=1.0,
+    cross_attention_mask_weight_schedule_enabled=False,
     cross_attention_mask_weight_schedule_power=0.5,
 
-    latent_mean_anchor_weight=0.005,
+    latent_mean_anchor_weight=0.0,
 
-    external_mask_fusion="bidirectional",  # bidirectional | screen
+    external_mask_fusion="bidirectional",
     external_mask_screen_attn_gate_strength=1.0,
     external_mask_interp_suppression_ratio=0.3,
     external_mask_negative_variance_power=0.0,
     external_mask_screen_self_boost_lambda=1.0,
 
     # ---------------------------------------------------------------------
-    # 2. TAG branch
+    # 2. TAG branch — OFF (eta_tag=1 → identity)
     # ---------------------------------------------------------------------
-    eta_tag=1.15,
-    adaptive_tag=True,
-    asymmetric_tag=True,
+    eta_tag=1.0,
+    adaptive_tag=False,
+    asymmetric_tag=False,
 
     # ---------------------------------------------------------------------
-    # 3. STG / PAG branch
+    # 3. STG / PAG branch — OFF
     # ---------------------------------------------------------------------
-    stg_enabled=True,
-    stg_scale=2.5,
+    stg_enabled=False,
+    stg_scale=0.0,
     stg_skip_layers=[2],
-    stg_schedule_enabled=True,
+    stg_schedule_enabled=False,
     stg_schedule_start_ratio=0.4,
     stg_schedule_end_ratio=0.7,
-    stg_schedule_mode="bump",  # decay | growth | bump
+    stg_schedule_mode="bump",
     stg_bump_peak_ratio=0.5,
-    stg_edit_strength_adaptive=True,
-    stg_tag_compose_mode="parallel",  # sequential | parallel
-    stg_weak_method="pag",  # stg | pag  ← THE TEST KNOB
+    stg_edit_strength_adaptive=False,
+    stg_tag_compose_mode="parallel",
+    stg_weak_method="stg",
 )
 
 
 # ---------------------------------------------------------------------
-# 4. 3D voxel-cache localization
+# 4. 3D voxel-cache localization — OFF
 # ---------------------------------------------------------------------
 VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_enabled=False,
