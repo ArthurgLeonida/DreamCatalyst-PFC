@@ -3,15 +3,11 @@
 # VOXEL_CACHE_PARAMS → DCPipelineConfig
 
 # Experiment: dc_baseline
-# DreamCatalyst baseline — all Part 1 / Part 2 novelties disabled.
-# Reproduces the closest in-repo approximation to upstream DreamCatalyst:
-# raw DDS + IP2P + FreeU + delta/gamma w_DDS schedule + psi preservation.
-# No TAG, no STG/PAG, no self-mask EMA gating, no source blend, no CA mask,
-# no outside-mask anchor, no latent-mean anchor, no voxel cache.
-#
-# NOTE: not bit-identical to upstream KAIST DreamCatalyst — the upstream
-# perpendicular-projection step was removed from this repo on 2026-05-18.
-# Use this as a "minus our additions" baseline, not an upstream reproduction.
+# DreamCatalyst baseline — all user-added Part 1 / Part 2 novelties disabled.
+# Reproduces upstream DreamCatalyst: raw DDS + IP2P + FreeU + δ/γ/χ w_DDS
+# schedule + ψ preservation. No TAG, no STG/PAG, no self-mask EMA gating,
+# no source blend, no CA mask, no outside-mask anchor, no latent-mean anchor,
+# no voxel cache.
 
 DC_CUSTOM_PARAMS = dict(
     # ---------------------------------------------------------------------
@@ -77,7 +73,7 @@ DC_CUSTOM_PARAMS = dict(
 # 4. 3D voxel-cache localization — OFF
 # ---------------------------------------------------------------------
 VOXEL_CACHE_PARAMS = dict(
-    mask_voxel_cache_enabled=False,
+    mask_voxel_cache_enabled=True,
     mask_voxel_cache_resolution=64,
 
     mask_voxel_cache_ema_beta=0.99,
@@ -87,23 +83,23 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_warmup_start=1300,
     mask_voxel_cache_warmup_end=2500,
     mask_voxel_cache_max_blend=0.4,
-    mask_voxel_cache_accumulation_threshold=0.3,
-    mask_voxel_cache_update_threshold=0.2,
+    mask_voxel_cache_accumulation_threshold=0.30,
+    mask_voxel_cache_update_threshold=0.1,
 
     mask_voxel_cache_confidence_enabled=True,
     mask_voxel_cache_min_observations=3,
     mask_voxel_cache_min_observations_auto=True,
     mask_voxel_cache_observation_fraction=0.10,
     mask_voxel_cache_min_observations_floor=5,
-    mask_voxel_cache_min_observations_cap=12,
-    mask_voxel_cache_max_variance=0.04,
+    mask_voxel_cache_min_observations_cap=12,      # saturates the auto-rule at N_cam > 120 for cross-scene consistency
+    mask_voxel_cache_max_variance=0.025,           # was 0.04 — ray-gen fix reduces real variance; keep gate tight
 
     mask_voxel_cache_bbox_source="observed",  # observed | cameras | scene_box
     mask_voxel_cache_bbox_observe_steps=50,
     mask_voxel_cache_bbox_observe_quantile=0.05,
     mask_voxel_cache_bbox_inflation=0.2,
 
-    mask_voxel_cache_update_source="raw_self",  # raw_self | internal
+    mask_voxel_cache_update_source="raw_self",     # avoid CA-schedule leakage into cache observations
 
     mask_voxel_cache_angular_power=1.0,
     mask_voxel_cache_min_angular_factor=0.0,
@@ -111,6 +107,6 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_angular_freeze_patience=100,
     mask_voxel_cache_angular_freeze_warmup=50,
 
-    mask_voxel_cache_mass_threshold=0.0,
-    mask_voxel_cache_mass_power=0.0,
+    mask_voxel_cache_mass_threshold=0.2,           # enable mass gating; addresses dim-mask without over-restricting
+    mask_voxel_cache_mass_power=1.0,
 )

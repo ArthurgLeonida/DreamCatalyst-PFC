@@ -421,7 +421,14 @@ class MaskVoxelCache:
 
         stats_idx = touched_idx
         stats_values = touched_values
-        if self.view_observed is not None and view_id is not None:
+        if self.view_observed is not None:
+            if view_id is None:
+                raise ValueError(
+                    "view_id is required when the cache was constructed with "
+                    "num_views (per-view unique-observation tracking is on). "
+                    "Pass the camera index, or rebuild the cache with "
+                    "num_views=None to disable per-view tracking."
+                )
             vid = int(view_id)
             if 0 <= vid < self.num_views:
                 is_new_view = ~self.view_observed[touched_idx, vid]
@@ -748,14 +755,20 @@ class MaskVoxelCache:
                 have elapsed. Avoids treating the cache's startup transient
                 as a "peak."
         """
-        if self._frozen_angular_denominator is not None:
-            return None
         if edit_step < int(warmup_steps):
             return None
         current = self.mean_angular_factor_at(min_views=min_views)
         if current > self._angular_peak_value:
             self._angular_peak_value = float(current)
             self._angular_peak_step = int(edit_step)
+            # If a prior freeze captured a premature peak and the true peak
+            # is still climbing, thaw and let the no-improvement check
+            # refire on the new peak. Idempotent under steady-state because
+            # `current > peak` is false once the peak is real.
+            if self._frozen_angular_denominator is not None:
+                self._frozen_angular_denominator = None
+            return None
+        if self._frozen_angular_denominator is not None:
             return None
         steps_since_peak = edit_step - self._angular_peak_step
         if (

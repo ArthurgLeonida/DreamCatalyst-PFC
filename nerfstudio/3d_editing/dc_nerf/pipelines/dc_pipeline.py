@@ -312,13 +312,12 @@ class DCPipeline(ModifiedVanillaPipeline):
         rendered_image = camera_outputs["rgb"].unsqueeze(dim=0).permute(0, 3, 1, 2)  # [B,3,H,W]
 
         # When the voxel cache is active we also need the rendered depth and
-        # the camera-space ray bundle (origins + directions in world frame) so
-        # we can backproject pixels to 3D world points. We compute them here
-        # under the same render call rather than re-rendering later.
+        # accumulation so we can backproject pixels to 3D world points later.
+        # Rays themselves are now generated at mask (latent) resolution
+        # directly in `get_train_loss_dict` via `Cameras.generate_rays(coords=)`,
+        # which avoids the geometric bias of interpolating ray directions.
         depth_world = None
         accumulation_world = None
-        ray_origins = None
-        ray_directions = None
         if self.config.mask_voxel_cache_enabled:
             depth_t = camera_outputs.get("depth", None)
             if depth_t is not None:
@@ -326,20 +325,13 @@ class DCPipeline(ModifiedVanillaPipeline):
                 accumulation_t = camera_outputs.get("accumulation", None)
                 if accumulation_t is not None:
                     accumulation_world = accumulation_t.detach().clone()  # [H, W, 1]
-                # Generate world-space rays (Nerfstudio convention: rays are
-                # already in world frame, so depth-along-ray gives world points
-                # directly via r(t) = o + t·d — same parametric form as the
-                # NeRF volume-rendering integral).
-                rays = current_camera.generate_rays(camera_indices=0, keep_shape=True)
-                ray_origins = rays.origins.detach().clone()  # [H, W, 3]
-                ray_directions = rays.directions.detach().clone()  # [H, W, 3]
 
         # delete to free up memory
         del camera_outputs
         del current_camera
         clean_gpu()
 
-        return rendered_image, current_spot, depth_world, accumulation_world, ray_origins, ray_directions
+        return rendered_image, current_spot, depth_world, accumulation_world
 
     def _ensure_voxel_cache(self):
         """Lazy-initialize the voxel cache.
@@ -533,7 +525,7 @@ class DCPipeline(ModifiedVanillaPipeline):
     def get_train_loss_dict(self, step: int):
         loss_dict = dict()
 
-        rendered_image, current_spot, depth_world, accumulation_world, ray_origins, ray_directions = (
+        rendered_image, current_spot, depth_world, accumulation_world = (
             self.get_current_rendering(step)
         )
         # Use the train-camera slot as the unique-view id. The datamanager's
@@ -596,8 +588,6 @@ class DCPipeline(ModifiedVanillaPipeline):
         if (
             self.config.mask_voxel_cache_enabled
             and depth_world is not None
-            and ray_origins is not None
-            and ray_directions is not None
         ):
             voxel_cache_edit_step = self._voxel_cache_edit_step(step)
             # For non-observed sources, build the cache eagerly (existing flow).
@@ -606,7 +596,38 @@ class DCPipeline(ModifiedVanillaPipeline):
             if str(self.config.mask_voxel_cache_bbox_source).lower() != "observed":
                 self._ensure_voxel_cache()
             mask_h, mask_w = x0.shape[-2:]
-            # Move spatial maps to [B, C, H, W] for F.interpolate, then to mask resolution.
+            H_cam, W_cam = int(depth_world.shape[0]), int(depth_world.shape[1])
+
+            # Generate rays directly at mask (latent) resolution. Each latent
+            # pixel center maps to a sub-pixel position halfway through its
+            # (H_cam/mask_h) × (W_cam/mask_w) image footprint. This replaces
+            # the previous "render at full resolution, interpolate down"
+            # path — bilinear-interpolating unit ray directions then
+            # renormalizing produces vectors that don't correspond to any
+            # actual ray at the resampled position. Nerfstudio convention:
+            # coords[..., 0] is y, coords[..., 1] is x.
+            current_index = self.datamanager.image_batch["image_idx"][current_spot]
+            current_camera = self.datamanager.train_dataparser_outputs.cameras[
+                current_index:current_index + 1
+            ].to(self.device)
+            yy = (
+                torch.arange(mask_h, device=self.device, dtype=torch.float32) + 0.5
+            ) * (H_cam / mask_h)
+            xx = (
+                torch.arange(mask_w, device=self.device, dtype=torch.float32) + 0.5
+            ) * (W_cam / mask_w)
+            grid_y, grid_x = torch.meshgrid(yy, xx, indexing="ij")
+            coords = torch.stack([grid_y, grid_x], dim=-1)  # [mask_h, mask_w, 2]
+            rays_lr = current_camera.generate_rays(
+                camera_indices=0, coords=coords, keep_shape=True
+            )
+            o = rays_lr.origins.detach()      # [mask_h, mask_w, 3]
+            dr = rays_lr.directions.detach()  # [mask_h, mask_w, 3]
+            del current_camera, rays_lr
+
+            # Depth and accumulation are rendered at full camera resolution
+            # and bilinear-downsampled to mask resolution. Scalar fields, so
+            # bilinear is geometrically fine (unlike unit vectors).
             d = depth_world.to(self.dc_device)
             if d.dim() == 2:
                 d = d.unsqueeze(-1)  # [H, W, 1]
@@ -618,16 +639,13 @@ class DCPipeline(ModifiedVanillaPipeline):
                 if acc.dim() == 2:
                     acc = acc.unsqueeze(-1)
                 acc = acc.permute(2, 0, 1).unsqueeze(0).float()  # [1, 1, H, W]
-            o = ray_origins.to(self.dc_device).permute(2, 0, 1).unsqueeze(0).float()  # [1, 3, H, W]
-            dr = ray_directions.to(self.dc_device).permute(2, 0, 1).unsqueeze(0).float()  # [1, 3, H, W]
             d = F.interpolate(d, size=(mask_h, mask_w), mode="bilinear", align_corners=False)
             acc = F.interpolate(acc, size=(mask_h, mask_w), mode="bilinear", align_corners=False)
-            o = F.interpolate(o, size=(mask_h, mask_w), mode="bilinear", align_corners=False)
-            dr = F.interpolate(dr, size=(mask_h, mask_w), mode="bilinear", align_corners=False)
-            # Renormalize directions: bilinear interpolation breaks unit norm and
-            # NeRF rays are conventionally unit-direction, so r(t) = o + t·d̂.
-            dr = dr / dr.norm(dim=1, keepdim=True).clamp_min(1e-8)
-            # Backproject: world points where each ray reaches `depth_world`.
+
+            # Reshape rays to [1, 3, mask_h, mask_w] for arithmetic with d, then
+            # backproject. World points where each ray reaches `depth_world`.
+            o = o.permute(2, 0, 1).unsqueeze(0).to(self.dc_device).float()
+            dr = dr.permute(2, 0, 1).unsqueeze(0).to(self.dc_device).float()
             world_points = o + d * dr  # [1, 3, mask_h, mask_w]
             mask_world_points = world_points.permute(0, 2, 3, 1).reshape(-1, 3)  # [N, 3]
             mask_ray_directions = dr.permute(0, 2, 3, 1).reshape(-1, 3)  # [N, 3]
@@ -775,6 +793,20 @@ class DCPipeline(ModifiedVanillaPipeline):
                     f"Unknown mask_voxel_cache_update_source={update_source!r}; "
                     "expected 'internal' or 'raw_self'."
                 )
+            if update_source == "internal" and not getattr(
+                self, "_warned_internal_update_source", False
+            ):
+                # 'internal' is the self·CA hybrid mask (set in dc.py:488 BEFORE
+                # external voxel fusion — so no self-feedback). It still couples
+                # the cache observations to the CA-mask temporal schedule, which
+                # is messier than feeding the raw self-mask. Prefer 'raw_self'.
+                print(
+                    "[voxel-cache] WARNING: mask_voxel_cache_update_source='internal' "
+                    "is deprecated. The CA-mask schedule leaks into cache "
+                    "observations. Prefer 'raw_self' for cleaner cross-view "
+                    "aggregation. (This warning fires once per run.)"
+                )
+                self._warned_internal_update_source = True
             if update_source == "raw_self" and dic.get("self_grad_mask_raw") is not None:
                 cache_mask_input = dic["self_grad_mask_raw"]
             else:
