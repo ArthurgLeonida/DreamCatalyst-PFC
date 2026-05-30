@@ -4,6 +4,11 @@ Text-driven 3D scene editing built on top of **DreamCatalyst** (DDS-based score 
 
 > Kim et al. *"DreamCatalyst: Fast and High-Quality 3D Editing via Controlling Editability and Identity Preservation"*. ICLR 2025. [arXiv:2407.11394](https://arxiv.org/abs/2407.11394)
 
+The work is organized as **two independent contributions** sharing one repository:
+
+- **Part 1 — Guidance & localization.** Universal-config improvements to DreamCatalyst's DDS guidance: TAG family, STG with scheduling, self-derived relevance mask, source-blended localization, cross-attention semantic mask, outside-mask background anchor, latent-mean anchor. Evaluated as a single config across multiple scenes.
+- **Part 2 — 3D voxel cache.** An optional non-parametric voxel grid that aggregates per-view diffusion masks across views to enforce 3D consistency. Layered on top of the Part 1 config. See [`docs/VoxelCacheExplained.md`](docs/VoxelCacheExplained.md).
+
 ## Pipeline
 
 ```
@@ -13,14 +18,7 @@ Photos/Video ──► COLMAP ──► Nerfacto (NeRF) ──► DreamCatalyst 
 
 3DGS alternative: substitute `splatfacto` in Step 2 and `dc_splat` / `dc_splat_refinement` in Steps 3–4.
 
-## Research scope
-
-The contributions of this work are concentrated in **Step 3**. Extensions target:
-- stronger DDS guidance (TAG family, STG),
-- better localization / background preservation (self-derived relevance mask, source-blended localization, cross-attention semantic mask, outside-mask background anchor),
-- cleaner multi-scene evaluation.
-
-Stormtrooper / person is the strongest localization showcase; face / elf is the naturalness and preservation stress test.
+All contributions live in **Step 3**.
 
 ## Setup
 
@@ -37,6 +35,8 @@ bash scripts/process_data.sh <scene> video      # from video
 ```
 
 Output: `data/<scene>_processed/` with `transforms.json`.
+
+> **Robust model selection.** COLMAP's mapper can emit several disconnected sub-models (`sparse/0`, `sparse/1`, …) numbered by creation order, not size. `ns-process-data` reads `sparse/0` by default, which is occasionally a tiny fragment while the real reconstruction sits elsewhere. `process_data.sh` automatically picks the model with the most registered images and regenerates `transforms.json` from it — no COLMAP recompute.
 
 ## Step 2 — Train NeRF reconstruction
 
@@ -91,77 +91,44 @@ RUN_NAME=my_refine bash scripts/refine.sh <scene> \
     30000
 ```
 
-Uses SDEdit (SD 1.5, 20 denoising steps with `skip=7`) to produce edited 2D images and retrains the NeRF against them. This step was part of the original DreamCatalyst pipeline and is kept here for completeness, but it is **not part of the current experimental evaluation**. The reasoning matches the original paper's evaluation protocol: Step 3 is where the contributions live, and refinement adds significant runtime without altering the scientific claim. The option remains available for anyone who wants to produce polished final renders.
+Uses SDEdit (SD 1.5, 20 denoising steps with `skip=7`) to produce edited 2D images and retrains the NeRF against them. This step was part of the original DreamCatalyst pipeline and is kept here for completeness, but it is **not part of the current experimental evaluation**: Step 3 is where the contributions live, and refinement adds significant runtime without altering the scientific claim. The option remains available for anyone who wants to produce polished final renders.
 
 ## Novelties
 
-The main DDS orchestration lives in `nerfstudio/dc/dc.py`; reusable novelty math lives in `nerfstudio/dc/guidance_utils.py`; settings are configured centrally in `nerfstudio/dc/method_config.py` (`DC_CUSTOM_PARAMS` and `VOXEL_CACHE_PARAMS`).
+The main DDS orchestration lives in `nerfstudio/dc/dc.py`; reusable novelty math lives in `nerfstudio/dc/guidance_utils.py`; **all knobs are configured centrally in `nerfstudio/dc/method_config.py`** — `DC_CUSTOM_PARAMS` (Part 1, unpacked into `DCConfig`) and `VOXEL_CACHE_PARAMS` (Part 2, loaded by `DCPipelineConfig`). That file is the single source of truth for which mechanisms are active in any run; consult it rather than any copy here.
 
-### Localization branch (main research direction)
+### Localization branch — Part 1 (main research direction)
 
 | Novelty | Config | Description |
 |---|---|---|
 | **Source-blended localization** | `source_blend_localization_enabled` | Replaces the DDS target with `eps_src + M·(eps_tgt − eps_src)`, so the edit signal vanishes outside the mask. Motivated by LatentEditor / FoI / ZONE. |
 | **Outside-mask background anchor** | `outside_mask_anchor_weight` | Strengthens the preservation term by `w_out · (1 − M)`, tightening `x0` outside the mask. Conceptually aligned with RoMaP. |
-| **Edit-strength-adaptive anchor** | `outside_mask_anchor_edit_strength_adaptive` | Scales `w_out` by `(1 − s)`, where `s = ‖eps_tgt − eps_src‖ / (‖eps_tgt‖ + ‖eps_src‖) ∈ [0, 1]` is the scene-level edit strength from the raw pre-guidance noise predictions. Time-invariant (numerator and denominator scale together with timestep). Low on identity-preserving edits (face / elf), high on structural edits (person → stormtrooper). Replaces an earlier mask-coverage approach that was shown to be undiscriminative once both masks are percentile-normalized. |
+| **Edit-strength-adaptive anchor** | `outside_mask_anchor_edit_strength_adaptive` | Scales `w_out` by `(1 − s)`, where `s = ‖eps_tgt − eps_src‖ / (‖eps_tgt‖ + ‖eps_src‖) ∈ [0, 1]` is the scene-level edit strength from the raw pre-guidance noise predictions. Time-invariant (numerator and denominator scale together with timestep). Low on identity-preserving edits (face / elf), high on structural edits (person → stormtrooper). |
 | **Cross-attention semantic mask** | `cross_attention_mask_enabled` + `cross_attention_mask_{layers,weight,gamma,blur}` | Aggregates target-token cross-attention from selected UNet up-blocks, fuses with the self-mask as `M_hybrid = M_self · ((1 − w) + w · M_attn)`. Target-token selection is auto-derived from src/tgt prompts (no manual keyword overrides). Based on Prompt-to-Prompt, What the DAAM, DiffEdit, LEDITS++. |
 | **Latent-mean anchor (N2)** | `latent_mean_anchor_weight` | Adds `λ · (mean(tgt_x0) − mean(src_x0))` per channel onto the final gradient — penalizes VAE-latent channel-mean drift and counteracts TAG brightness/saturation artifacts directly in latent statistics. `=0.0` disables. Conceptually aligned with Piva and Stable Score Distillation. |
 
-### TAG branch (edit strength)
+### TAG branch — Part 1 (edit strength)
 
 | Novelty | Config | Description |
 |---|---|---|
 | **TAG** | `eta_tag` | Amplifies the tangential component of `noise_pred` with respect to the noisy latent. `eta_tag=1.0` disables. Based on TAG (Cho et al., 2024). |
 | **Adaptive TAG** | `adaptive_tag` | Anneals `η(t) = 1 + (eta_tag − 1) · t_norm^(1/e)` so amplification is strongest at high noise and decays toward 1.0 near the clean regime. |
 | **Asymmetric TAG** | `asymmetric_tag` | Applies TAG only to the target branch, leaving `eps_src` at `η = 1.0`. |
-### STG branch (structural amplification)
+
+### STG branch — Part 1 (structural amplification)
 
 | Novelty | Config | Description |
 |---|---|---|
 | **STG** | `stg_enabled`, `stg_scale`, `stg_skip_layers` | Runs a weak UNet pass via `STGIdentityValueAttnProcessor` on selected up-blocks and amplifies `eps = eps_full + s · (eps_full − eps_weak)`. Based on STG (Hyung et al., CVPR 2025). Target-branch only. |
-| **STG schedule** | `stg_schedule_enabled`, `stg_schedule_mode`, `stg_schedule_{start,end}_ratio`, `stg_bump_peak_ratio` | Three shapes: `"decay"` (STG early, off late — best on identity-preserving edits), `"growth"` (STG off early, on late — lets TAG commit the edit first), `"bump"` (triangle: STG peaks mid-phase and returns to 0 before the end — prevents late STG from locking in view-dependent partial-state inconsistencies on creative edits). |
+| **STG schedule** | `stg_schedule_enabled`, `stg_schedule_mode`, `stg_schedule_{start,end}_ratio`, `stg_bump_peak_ratio` | Three shapes: `"decay"` (STG early, off late — strongest on monotonic edits where every step pushes the same direction), `"growth"` (STG off early, on late), `"bump"` (triangle: STG peaks mid-phase and returns to 0 before the end). |
 | **Edit-strength-adaptive STG** | `stg_edit_strength_adaptive` | Multiplies the scheduled STG scale by `(1 − s)`, where `s` is the same per-step edit strength used by the anchor. Identity edits keep STG near full strength; structural edits fade STG automatically. |
+| **STG/TAG composition** | `stg_tag_compose_mode` | `"parallel"` applies TAG and STG additively to the raw CFG prediction (no cross-amplification); `"sequential"` nests them (TAG amplifies STG's perturbation). |
 
-### Central config
+### 3D voxel cache — Part 2 (multi-view consistency)
 
-```python
-# nerfstudio/dc/method_config.py
-DC_CUSTOM_PARAMS = dict(
-    # Localization
-    psi=0.075,
-    source_blend_localization_enabled=True,
-    outside_mask_anchor_weight=0.2,
-    outside_mask_anchor_edit_strength_adaptive=True,
-    gradient_mask_blur=1.0,
-    gradient_mask_gamma=1.2,
-    gradient_mask_ema_beta=0.99,
-    gradient_mask_ema_beta_auto=True,
-    gradient_mask_warmup=0,
-    cross_attention_mask_enabled=True,
-    cross_attention_mask_layers=[1, 2],
-    cross_attention_mask_weight=0.7,
-    cross_attention_mask_blur=0.5,
-    cross_attention_mask_gamma=1.2,
-    latent_mean_anchor_weight=0.005,
-
-    # TAG
-    eta_tag=1.25,
-    adaptive_tag=True,
-    asymmetric_tag=True,
-
-    # STG
-    stg_enabled=True,
-    stg_scale=2,
-    stg_skip_layers=[2],
-    stg_schedule_enabled=True,
-    stg_schedule_start_ratio=0.4,
-    stg_schedule_end_ratio=0.7,
-    stg_schedule_mode="bump",
-    stg_bump_peak_ratio=0.5,
-    stg_edit_strength_adaptive=True,
-    stg_tag_compose_mode="sequential",
-)
-```
+| Novelty | Config | Description |
+|---|---|---|
+| **Voxel-grid mask cache** | `mask_voxel_cache_enabled` + `mask_voxel_cache_*` | Backprojects per-view diffusion masks into a coarse 3D voxel grid via rendered depth, EMA-aggregates across views, and queries them back per view to provide a 3D-consistent localization signal. Confidence gates on cross-view Welford variance, angular triangulation diversity, and cached mask mass. Full design in [`docs/VoxelCacheExplained.md`](docs/VoxelCacheExplained.md). |
 
 ## Evaluation
 
@@ -172,8 +139,18 @@ DC_CUSTOM_PARAMS = dict(
 - `SSIM` (↑) — identity preservation
 - `LPIPS` (↓) — perceptual distance
 - `MultiView_pairwise_cos_sim` (↑) — multi-view consistency
+- `EditMaskVariance_3D` (↓) — direct 3D mask-consistency metric for the Part 2 cache
 
 Comparisons across runs must use the **same `downscale`** for reconstruction, edit, and (when run) refinement; inconsistent downscales have produced spurious qualitative differences in the past.
+
+## Datasets
+
+Scenes are sourced from prior 3D-editing work and re-processed locally through `scripts/process_data.sh`:
+
+- **DreamCatalyst** release (which redistributes scenes originally introduced for **Posterior Distillation Sampling**, PDS).
+- **Instruct-NeRF2NeRF** (e.g. the `campsite` / `bear` / outdoor captures).
+
+Please cite the original sources if you use these scenes.
 
 ## Environment
 
@@ -195,6 +172,21 @@ Comparisons across runs must use the **same `downscale`** for reconstruction, ed
   booktitle = {ICLR},
   year      = {2025},
   url       = {https://arxiv.org/abs/2407.11394},
+}
+
+@inproceedings{instructnerf2023,
+  title     = {Instruct-NeRF2NeRF: Editing 3D Scenes with Instructions},
+  author    = {Haque, Ayaan and Tancik, Matthew and Efros, Alexei and Holynski, Aleksander and Kanazawa, Angjoo},
+  booktitle = {Proceedings of the IEEE/CVF International Conference on Computer Vision},
+  year      = {2023},
+}
+
+@inproceedings{koo2024pds,
+  title     = {Posterior Distillation Sampling},
+  author    = {Juil Koo and Chanho Park and Minhyuk Sung},
+  booktitle = {CVPR},
+  year      = {2024},
+  url       = {https://arxiv.org/abs/2311.13831},
 }
 
 @article{cho2024tag,
@@ -287,13 +279,5 @@ Comparisons across runs must use the **same `downscale`** for reconstruction, ed
   booktitle = {ICML},
   year      = {2025},
   url       = {https://arxiv.org/abs/2505.01888},
-}
-
-@inproceedings{koo2024pds,
-  title     = {Posterior Distillation Sampling},
-  author    = {Juil Koo and Chanho Park and Minhyuk Sung},
-  booktitle = {CVPR},
-  year      = {2024},
-  url       = {https://arxiv.org/abs/2311.13831},
 }
 ```

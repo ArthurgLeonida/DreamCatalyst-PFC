@@ -41,6 +41,51 @@ normalize_extensions() {
     done
 }
 
+# COLMAP's mapper can emit several disconnected sub-models (sparse/0,
+# sparse/1, ...), numbered by CREATION ORDER, not size. ns-process-data
+# always reads sparse/0, which is sometimes a tiny fragment while the real
+# reconstruction sits in another folder (observed on the campsite scene:
+# sparse/0 had 4 images, sparse/1 had all 174). This picks the model with
+# the most registered images and, if it isn't sparse/0, regenerates
+# transforms.json from it — no COLMAP recompute.
+select_best_colmap_model() {
+    local sparse_dir="${OUTPUT_DIR}/colmap/sparse"
+    [ -d "${sparse_dir}" ] || return 0
+
+    local best_idx="" best_count=-1
+    for d in "${sparse_dir}"/*/; do
+        [ -d "${d}" ] || continue
+        local idx count
+        idx="$(basename "${d}")"
+        count="$(colmap model_analyzer --path "${d}" 2>&1 \
+            | sed -n 's/.*Registered images:[[:space:]]*\([0-9]*\).*/\1/p' | head -1)"
+        count="${count:-0}"
+        echo "  COLMAP model ${idx}: ${count} registered images"
+        if [ "${count}" -gt "${best_count}" ]; then
+            best_count="${count}"
+            best_idx="${idx}"
+        fi
+    done
+
+    [ -n "${best_idx}" ] || { echo "WARNING: no COLMAP sub-models found."; return 0; }
+    echo "  Largest model: sparse/${best_idx} (${best_count} registered)"
+
+    if [ "${best_idx}" != "0" ]; then
+        echo "  sparse/0 was not the largest — regenerating transforms.json from sparse/${best_idx}..."
+        ns-process-data images \
+            --data "${OUTPUT_DIR}/images" \
+            --output-dir "${OUTPUT_DIR}" \
+            --skip-colmap \
+            --skip-image-processing \
+            --colmap-model-path "colmap/sparse/${best_idx}" \
+        || ns-process-data images \
+            --data "${OUTPUT_DIR}/images" \
+            --output-dir "${OUTPUT_DIR}" \
+            --skip-colmap \
+            --colmap-model-path "colmap/sparse/${best_idx}"
+    fi
+}
+
 if [ "${SOURCE_TYPE}" = "video" ]; then
     VIDEO_FILE=$(find "${DATA_DIR}" -maxdepth 1 \( -name "*.mp4" -o -name "*.mov" -o -name "*.avi" \) | head -1)
     if [ -z "${VIDEO_FILE}" ]; then
@@ -84,6 +129,11 @@ else
 
 fi
 
+# Guard against COLMAP's multi-model numbering quirk (see function comment).
+echo ""
+echo "Selecting best COLMAP model..."
+select_best_colmap_model
+
 echo ""
 echo "============================================"
 echo " Processing complete!"
@@ -92,9 +142,12 @@ echo ""
 echo " Verify:"
 echo "   ls ${OUTPUT_DIR}/transforms.json"
 echo "   ls ${OUTPUT_DIR}/images/"
-if [ "${IMAGE_COUNT}" -gt 0 ]; then
-    REGISTERED=$(grep -v '^#' "${OUTPUT_DIR}/colmap/sparse/0/images.txt" 2>/dev/null \
-        | grep -v '^$' | wc -l | awk '{print int($1/2)}')
-    echo "   COLMAP registered: ${REGISTERED} / ${IMAGE_COUNT} images"
+if [ -f "${OUTPUT_DIR}/transforms.json" ]; then
+    FRAMES=$(python -c "import json; print(len(json.load(open('${OUTPUT_DIR}/transforms.json'))['frames']))" 2>/dev/null || echo "?")
+    if [ "${IMAGE_COUNT}" -gt 0 ]; then
+        echo "   Frames in transforms.json: ${FRAMES} / ${IMAGE_COUNT} input images"
+    else
+        echo "   Frames in transforms.json: ${FRAMES}"
+    fi
 fi
 echo "============================================"
