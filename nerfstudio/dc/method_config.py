@@ -15,6 +15,8 @@ DC_CUSTOM_PARAMS = dict(
     # ---------------------------------------------------------------------
     psi=0.075,
     source_blend_localization_enabled=True,
+    source_blend_floor=0.0,  # 0.0 = hard gate; ~0.1 lets edits grow into M≈0 regions
+
     outside_mask_anchor_weight=0.15,
     outside_mask_anchor_edit_strength_adaptive=True,
     outside_mask_anchor_edit_strength_power=1.0,

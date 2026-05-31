@@ -114,6 +114,11 @@ class DCConfig:
     gradient_mask_gamma: float = 1.2
     gradient_mask_warmup: int = 0
     source_blend_localization_enabled: bool = True
+    # Leaky source-blend gate. 0.0 = original hard gate (edit zeroed where M=0).
+    # A small floor (e.g. 0.1) lets a fraction of the edit drive reach M≈0
+    # regions so novel structure can grow into empty space and bootstrap its
+    # own mask. 1.0 = no localization. See apply_source_blend.
+    source_blend_floor: float = 0.0
 
     outside_mask_anchor_weight: float = 0.2
     outside_mask_anchor_edit_strength_adaptive: bool = True
@@ -677,7 +682,9 @@ class DC(object):
 
         eps_tgt_for_grad = eps["tgt"]
         if self.config.source_blend_localization_enabled and grad_mask is not None:
-            eps_tgt_for_grad = apply_source_blend(eps["tgt"], eps["src"], grad_mask)
+            eps_tgt_for_grad = apply_source_blend(
+                eps["tgt"], eps["src"], grad_mask, floor=self.config.source_blend_floor
+            )
 
         bg_anchor_schedule_factor = compute_bg_anchor_schedule_factor(
             t_normalized=t_normalized,

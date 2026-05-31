@@ -25,6 +25,7 @@ eggs/
 .mypy_cache/
 .pytest_cache/
 .ipynb_checkpoints/
+.vscode/
 
 # Outputs / checkpoints
 outputs/

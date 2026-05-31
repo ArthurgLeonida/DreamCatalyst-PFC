@@ -92,9 +92,31 @@ def apply_stg(noise_pred: torch.Tensor, noise_pred_weak: torch.Tensor, scale: fl
     return noise_pred + scale * (noise_pred - noise_pred_weak)
 
 
-def apply_source_blend(eps_tgt: torch.Tensor, eps_src: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Localize DDS by falling back to the source branch outside the mask."""
-    return eps_src + mask * (eps_tgt - eps_src)
+def apply_source_blend(
+    eps_tgt: torch.Tensor,
+    eps_src: torch.Tensor,
+    mask: torch.Tensor,
+    floor: float = 0.0,
+) -> torch.Tensor:
+    """Localize DDS by falling back to the source branch outside the mask.
+
+    With ``floor=0`` (default) this reproduces the original hard gate
+    ``eps_src + M·(eps_tgt − eps_src)``: the edit is exactly zero where M=0.
+
+    A positive ``floor ∈ (0, 1]`` softens the gate to a leaky one,
+    ``M' = floor + (1 − floor)·M``, so a fraction ``floor`` of the full edit
+    drive reaches M≈0 regions. This breaks the chicken-and-egg lock where the
+    edit can only grow where the relevance mask is already nonzero (the mask is
+    built from ‖eps_tgt − eps_src‖, which is ~0 in regions the edit has not yet
+    reached): the leaked drive lets a novel structure begin growing into empty
+    space and bootstrap its own mask. ``floor=1`` disables localization entirely
+    (edit applied everywhere, equivalent to source_blend off).
+    """
+    if floor <= 0.0:
+        return eps_src + mask * (eps_tgt - eps_src)
+    floor = min(float(floor), 1.0)
+    effective_mask = floor + (1.0 - floor) * mask
+    return eps_src + effective_mask * (eps_tgt - eps_src)
 
 
 def compute_stg_scale(
