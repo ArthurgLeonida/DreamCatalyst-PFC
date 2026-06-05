@@ -45,6 +45,17 @@ class DCPipelineConfig(VanillaPipelineConfig):
     # queried back per-view to override (or blend with) the internal mask.
     # See `nerfstudio/dc/mask_voxel_cache.py` for the math + paper references.
     mask_voxel_cache_enabled: bool = VOXEL_CACHE_PARAMS["mask_voxel_cache_enabled"]
+    # Passive cache-off control. When True (with `mask_voxel_cache_enabled`
+    # False), the cache is built and its cross-view Welford statistics are
+    # accumulated from the observed per-view masks, but it is NEVER queried or
+    # blended into the DDS gradient — the edit trajectory is identical to the
+    # standard (cache-off) run while `dc_debug/voxel_cache_mean_observed_variance`
+    # is still logged. This makes the cache-on vs cache-off A/B on the cache's
+    # own internal mask-consistency statistic apples-to-apples, since the eval
+    # metric EditMaskVariance_3D cannot observe the training-time latent mask.
+    mask_voxel_cache_measure_only: bool = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_measure_only", False
+    )
     mask_voxel_cache_resolution: int = VOXEL_CACHE_PARAMS["mask_voxel_cache_resolution"]
     mask_voxel_cache_ema_beta: float = VOXEL_CACHE_PARAMS["mask_voxel_cache_ema_beta"]
     # Optional camera-count-aware EMA:
@@ -318,7 +329,7 @@ class DCPipeline(ModifiedVanillaPipeline):
         # which avoids the geometric bias of interpolating ray directions.
         depth_world = None
         accumulation_world = None
-        if self.config.mask_voxel_cache_enabled:
+        if self._voxel_cache_active():
             depth_t = camera_outputs.get("depth", None)
             if depth_t is not None:
                 depth_world = depth_t.detach().clone()  # [H, W, 1]
@@ -332,6 +343,19 @@ class DCPipeline(ModifiedVanillaPipeline):
         clean_gpu()
 
         return rendered_image, current_spot, depth_world, accumulation_world
+
+    def _voxel_cache_active(self) -> bool:
+        """Whether the voxel cache should be built and updated this run.
+
+        True when the cache is enabled (it influences the gradient) OR when
+        `mask_voxel_cache_measure_only` is set (passive cache-off control: the
+        cache accumulates cross-view statistics but never blends into the
+        gradient). Gates depth capture, lazy build, and the update path, while
+        the query/blend stays gated on `mask_voxel_cache_enabled` alone.
+        """
+        return bool(self.config.mask_voxel_cache_enabled) or bool(
+            getattr(self.config, "mask_voxel_cache_measure_only", False)
+        )
 
     def _ensure_voxel_cache(self):
         """Lazy-initialize the voxel cache.
@@ -362,7 +386,7 @@ class DCPipeline(ModifiedVanillaPipeline):
         """
         if self.mask_voxel_cache is not None:
             return
-        if not self.config.mask_voxel_cache_enabled:
+        if not self._voxel_cache_active():
             return
 
         source = str(self.config.mask_voxel_cache_bbox_source).lower()
@@ -586,7 +610,7 @@ class DCPipeline(ModifiedVanillaPipeline):
         voxel_cache_query_variance = None
         voxel_cache_edit_step = None
         if (
-            self.config.mask_voxel_cache_enabled
+            self._voxel_cache_active()
             and depth_world is not None
         ):
             voxel_cache_edit_step = self._voxel_cache_edit_step(step)
@@ -687,49 +711,57 @@ class DCPipeline(ModifiedVanillaPipeline):
                     else 1
                 )
                 self.mask_voxel_cache_effective_min_observations = min_observations
-                (
-                    queried,
-                    cache_valid,
-                    cache_confidence,
-                    cache_count,
-                    cache_variance,
-                ) = self.mask_voxel_cache.query(
-                    mask_world_points,
-                    in_bounds=mask_world_points_valid,
-                    return_valid=True,
-                    return_stats=True,
-                    min_observations=min_observations,
-                    max_variance=(
-                        self.config.mask_voxel_cache_max_variance
-                        if self.config.mask_voxel_cache_confidence_enabled
-                        else None
-                    ),
-                    angular_power=float(self.config.mask_voxel_cache_angular_power),
-                    min_angular_factor=float(
-                        self.config.mask_voxel_cache_min_angular_factor
-                    ),
-                    angular_relative=bool(
-                        self.config.mask_voxel_cache_angular_relative
-                    ),
-                    mass_threshold=float(
-                        self.config.mask_voxel_cache_mass_threshold
-                    ),
-                    mass_power=float(
-                        self.config.mask_voxel_cache_mass_power
-                    ),
-                )
-                external_grad_mask = queried.view(1, 1, mask_h, mask_w).to(
-                    device=x0.device, dtype=x0.dtype
-                )
-                external_grad_mask_valid = cache_valid.view(1, 1, mask_h, mask_w).to(
-                    device=x0.device
-                )
-                external_grad_mask_confidence = cache_confidence.view(1, 1, mask_h, mask_w).to(
-                    device=x0.device, dtype=x0.dtype
-                )
-                voxel_cache_query_count = cache_count.view(1, 1, mask_h, mask_w)
-                voxel_cache_query_variance = cache_variance.view(1, 1, mask_h, mask_w)
-                external_mask_blend = self._voxel_cache_warmup_blend(voxel_cache_edit_step)
+                # Query + blend influence the gradient ONLY when the cache is
+                # enabled. In measure-only mode (cache-off control) we skip the
+                # blend entirely — the cache is still updated below for its
+                # cross-view statistics, but external_grad_mask stays None and
+                # external_mask_blend stays 0.0, so the edit trajectory matches
+                # the standard run exactly. (min_observations is set above
+                # regardless, since the update-log path references it.)
+                if self.config.mask_voxel_cache_enabled:
+                    (
+                        queried,
+                        cache_valid,
+                        cache_confidence,
+                        cache_count,
+                        cache_variance,
+                    ) = self.mask_voxel_cache.query(
+                        mask_world_points,
+                        in_bounds=mask_world_points_valid,
+                        return_valid=True,
+                        return_stats=True,
+                        min_observations=min_observations,
+                        max_variance=(
+                            self.config.mask_voxel_cache_max_variance
+                            if self.config.mask_voxel_cache_confidence_enabled
+                            else None
+                        ),
+                        angular_power=float(self.config.mask_voxel_cache_angular_power),
+                        min_angular_factor=float(
+                            self.config.mask_voxel_cache_min_angular_factor
+                        ),
+                        angular_relative=bool(
+                            self.config.mask_voxel_cache_angular_relative
+                        ),
+                        mass_threshold=float(
+                            self.config.mask_voxel_cache_mass_threshold
+                        ),
+                        mass_power=float(
+                            self.config.mask_voxel_cache_mass_power
+                        ),
+                    )
+                    external_grad_mask = queried.view(1, 1, mask_h, mask_w).to(
+                        device=x0.device, dtype=x0.dtype
+                    )
+                    external_grad_mask_valid = cache_valid.view(1, 1, mask_h, mask_w).to(
+                        device=x0.device
+                    )
+                    external_grad_mask_confidence = cache_confidence.view(1, 1, mask_h, mask_w).to(
+                        device=x0.device, dtype=x0.dtype
+                    )
+                    voxel_cache_query_count = cache_count.view(1, 1, mask_h, mask_w)
+                    voxel_cache_query_variance = cache_variance.view(1, 1, mask_h, mask_w)
+                    external_mask_blend = self._voxel_cache_warmup_blend(voxel_cache_edit_step)
 
             if self.use_wandb and step % self.config.log_step == 0:
                 import wandb
@@ -782,7 +814,7 @@ class DCPipeline(ModifiedVanillaPipeline):
         # frame label accumulation, adapted here to soft mask values.
         # ----------------------------------------------------------------
         if (
-            self.config.mask_voxel_cache_enabled
+            self._voxel_cache_active()
             and self.mask_voxel_cache is not None
             and mask_world_points is not None
             and dic.get("internal_grad_mask", None) is not None
@@ -882,6 +914,14 @@ class DCPipeline(ModifiedVanillaPipeline):
                 payload = {
                     "dc_debug/voxel_cache_occupancy": float(self.mask_voxel_cache.occupancy),
                     "dc_debug/voxel_cache_blend": float(external_mask_blend),
+                    "dc_debug/voxel_cache_measure_only": (
+                        1.0
+                        if (
+                            getattr(self.config, "mask_voxel_cache_measure_only", False)
+                            and not self.config.mask_voxel_cache_enabled
+                        )
+                        else 0.0
+                    ),
                     "dc_debug/voxel_cache_valid_ratio": valid_ratio,
                     "dc_debug/voxel_cache_edit_step": float(voxel_cache_edit_step or 0),
                     "dc_debug/voxel_cache_ema_beta": float(
