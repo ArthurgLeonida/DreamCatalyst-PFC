@@ -56,6 +56,17 @@ class DCPipelineConfig(VanillaPipelineConfig):
     mask_voxel_cache_measure_only: bool = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_measure_only", False
     )
+    # Scale-matched fusion. When True, the queried cache mask is contrast-
+    # stretched to [0,1] over its observed voxels before being fused with the
+    # sharp 2D mask in DC.__call__ — fixes the subtractive term firing on the
+    # edit region purely from the cache's compressed value range. See
+    # `_scale_normalize_cache_mask`. False = legacy (raw cache value).
+    mask_voxel_cache_scale_normalize: bool = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_scale_normalize", False
+    )
+    mask_voxel_cache_scale_normalize_quantile: float = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_scale_normalize_quantile", 0.95
+    )
     mask_voxel_cache_resolution: int = VOXEL_CACHE_PARAMS["mask_voxel_cache_resolution"]
     mask_voxel_cache_ema_beta: float = VOXEL_CACHE_PARAMS["mask_voxel_cache_ema_beta"]
     # Optional camera-count-aware EMA:
@@ -356,6 +367,38 @@ class DCPipeline(ModifiedVanillaPipeline):
         return bool(self.config.mask_voxel_cache_enabled) or bool(
             getattr(self.config, "mask_voxel_cache_measure_only", False)
         )
+
+    def _scale_normalize_cache_mask(self, ext, valid):
+        """Contrast-stretch the queried voxel-cache mask to [0,1] over its
+        observed voxels before it is fused with the sharp 2D mask in DC.
+
+        The cache value is a multi-view MEAN (compressed toward mid-range, with
+        a 0.5 fallback for under-observed voxels), while the 2D hybrid mask is a
+        sharp [0,1] indicator. DC's bidirectional fusion differences the two
+        (``ext - grad_mask``); because the compressed cache sits below the 2D
+        peaks across the whole edit region, the subtractive ("negative
+        correction") term fires on the genuine edit, not just background — a
+        scale artifact, not real 3D disagreement. Rescaling the cache's active
+        range (its ``[1-q, q]`` percentiles over observed voxels) to [0,1] makes
+        the comparison like-for-like, so the down-term only cleans background.
+
+        Selection uses the observed/in-bounds mask (not confidence) so the low
+        end of the range captures background voxels; invalid/fallback pixels
+        carry zero confidence downstream, so their post-stretch value never
+        reaches the gradient.
+        """
+        if valid is None:
+            return ext
+        sel = valid.reshape(-1).bool()
+        if int(sel.sum().item()) < 16:
+            return ext  # too few observed voxels to estimate a stable range
+        vals = ext.reshape(-1)[sel].float()
+        q = float(getattr(self.config, "mask_voxel_cache_scale_normalize_quantile", 0.95))
+        q = min(max(q, 0.5), 0.999)
+        lo = torch.quantile(vals, 1.0 - q).to(ext.dtype)
+        hi = torch.quantile(vals, q).to(ext.dtype)
+        span = (hi - lo).clamp_min(1e-4)
+        return ((ext - lo) / span).clamp(0.0, 1.0)
 
     def _ensure_voxel_cache(self):
         """Lazy-initialize the voxel cache.
@@ -759,6 +802,14 @@ class DCPipeline(ModifiedVanillaPipeline):
                     external_grad_mask_confidence = cache_confidence.view(1, 1, mask_h, mask_w).to(
                         device=x0.device, dtype=x0.dtype
                     )
+                    # Scale-match the compressed cache mask to the sharp 2D mask
+                    # before fusion so the bidirectional down-term stops firing on
+                    # the edit region (see `_scale_normalize_cache_mask`). Applied
+                    # here so the debug panels below reflect the corrected mask.
+                    if getattr(self.config, "mask_voxel_cache_scale_normalize", False):
+                        external_grad_mask = self._scale_normalize_cache_mask(
+                            external_grad_mask, external_grad_mask_valid
+                        )
                     voxel_cache_query_count = cache_count.view(1, 1, mask_h, mask_w)
                     voxel_cache_query_variance = cache_variance.view(1, 1, mask_h, mask_w)
                     external_mask_blend = self._voxel_cache_warmup_blend(voxel_cache_edit_step)

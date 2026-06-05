@@ -120,4 +120,15 @@ VOXEL_CACHE_PARAMS = dict(
 
     mask_voxel_cache_mass_threshold=0.18,   # was 0.15 | 0.18 | 0.22
     mask_voxel_cache_mass_power=1.0,       # was 1.0 | 1.5 | 2.0
+
+    # Scale-matched fusion fix. The queried cache value is a multi-view MEAN
+    # (compressed toward mid-range, 0.5 fallback), while the 2D hybrid mask is a
+    # sharp [0,1] indicator. DC's bidirectional fusion differences them, so the
+    # subtractive "negative correction" term fires across the whole edit region
+    # purely from the scale gap (visible as negative-correction lighting up the
+    # edited subject). When True, the queried cache mask is contrast-stretched to
+    # [0,1] over its observed voxels (its [1-q, q] percentiles) before fusion, so
+    # the down-term only cleans genuine background disagreement. False = legacy.
+    mask_voxel_cache_scale_normalize=False,
+    mask_voxel_cache_scale_normalize_quantile=0.95,
 )
