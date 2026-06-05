@@ -215,8 +215,16 @@ def flatten_wandb_metrics(metrics, num_views):
             flattened[f"eval/{key}"] = value["mean"]
             if "std" in value:
                 flattened[f"eval/{key}_std"] = value["std"]
-        else:
+        elif isinstance(value, bool) or isinstance(value, (int, float)):
             flattened[f"eval/{key}"] = value
+        elif isinstance(value, (list, tuple)) and all(
+            isinstance(v, (int, float)) for v in value
+        ):
+            # e.g. the EMV3D bbox 3-vectors -> key_0/_1/_2 scalar columns.
+            for i, v in enumerate(value):
+                flattened[f"eval/{key}_{i}"] = v
+        # else: non-numeric values (e.g. the bbox-source string) stay in
+        # metrics.json only — never sent to wandb.log, which rejects them.
     return flattened
 
 
@@ -362,12 +370,34 @@ def compute_3d_edit_mask_variance(
     min_observations=3,
     bbox_quantile=0.05,
     bbox_inflation=0.2,
+    bbox_min=None,
+    bbox_max=None,
 ):
     """Measure per-voxel disagreement of rendered edit masks across views.
 
     Each view first contributes one mean edit-mask value per occupied voxel.
     The final metric is the variance of those per-view values over voxels
     observed by at least `min_observations` views.
+
+    Two reported variants:
+      - ``EditMaskVariance_3D``: the raw mean per-voxel cross-view variance.
+        This is confounded by edit magnitude/sparsity — a config that edits
+        harder or more bimodally scores higher purely from the wider value
+        range, and a weak/uniform edit scores "better" for the wrong reason.
+      - ``EditMaskVariance_3D_normalized``: the raw variance divided by the
+        squared mean edit mass over eligible voxels (a squared coefficient of
+        variation). This is scale-invariant in edit magnitude, so it isolates
+        *relative* cross-view disagreement — the apples-to-apples consistency
+        number to compare across configs.
+
+    Cross-config comparability also requires a SHARED voxel partition. Pass an
+    explicit ``bbox_min``/``bbox_max`` (each a length-3 sequence) so every
+    config of a scene voxelizes on the same grid; otherwise the bbox is derived
+    per-run from this run's own point cloud (``bbox_quantile``/
+    ``bbox_inflation``), which means two runs are partitioned differently and
+    their raw numbers are not strictly comparable. The bbox actually used is
+    returned (and printed) so it can be captured from a reference run and reused
+    verbatim across the other configs of the same scene.
     """
     mask_samples = [sample for sample in mask_samples if sample is not None]
     valid_points = [
@@ -382,13 +412,28 @@ def compute_3d_edit_mask_variance(
     if all_points.numel() == 0:
         return None
 
-    q = min(max(float(bbox_quantile), 0.0), 0.49)
-    bbox_min = torch.quantile(all_points, q, dim=0)
-    bbox_max = torch.quantile(all_points, 1.0 - q, dim=0)
+    if bbox_min is not None and bbox_max is not None:
+        # Fixed shared partition (cross-config comparable). The caller is
+        # expected to pass an already-inflated bbox — typically copied from a
+        # reference run's returned EditMaskVariance_3D_bbox_min/max — so no
+        # per-run inflation is applied here.
+        bbox_min = torch.as_tensor(bbox_min, dtype=all_points.dtype).reshape(3)
+        bbox_max = torch.as_tensor(bbox_max, dtype=all_points.dtype).reshape(3)
+        bbox_source = "fixed"
+    else:
+        q = min(max(float(bbox_quantile), 0.0), 0.49)
+        bbox_min = torch.quantile(all_points, q, dim=0)
+        bbox_max = torch.quantile(all_points, 1.0 - q, dim=0)
+        span = (bbox_max - bbox_min).clamp_min(1e-6)
+        bbox_min = bbox_min - float(bbox_inflation) * span
+        bbox_max = bbox_max + float(bbox_inflation) * span
+        bbox_source = "per_run_quantile"
     span = (bbox_max - bbox_min).clamp_min(1e-6)
-    bbox_min = bbox_min - float(bbox_inflation) * span
-    bbox_max = bbox_max + float(bbox_inflation) * span
-    span = (bbox_max - bbox_min).clamp_min(1e-6)
+    print(
+        f"[EMV3D] bbox_source={bbox_source} "
+        f"bbox_min={[round(float(v), 5) for v in bbox_min]} "
+        f"bbox_max={[round(float(v), 5) for v in bbox_max]}"
+    )
 
     resolution = int(voxel_resolution)
     n_voxels = resolution ** 3
@@ -434,13 +479,26 @@ def compute_3d_edit_mask_variance(
         return None
 
     variance = m2[eligible] / (obs_count[eligible] - 1.0).clamp_min(1.0)
+    raw_mean = float(variance.mean().item())
+    # Foreground edit mass over eligible voxels = the mean per-voxel edit value.
+    # Normalizing the variance by its square removes the "amount of editing"
+    # scaling, so the result reflects relative cross-view disagreement rather
+    # than how hard the config edited. eps guards the near-zero-edit degenerate.
+    mean_value = float(mean[eligible].mean().item())
+    eps = 1e-6
+    normalized = raw_mean / (mean_value * mean_value + eps)
     return {
         "EditMaskVariance_3D": {
-            "mean": float(variance.mean().item()),
+            "mean": raw_mean,
             "std": float(variance.std(unbiased=False).item()),
         },
+        "EditMaskVariance_3D_normalized": normalized,
+        "EditMaskVariance_3D_mean_value": mean_value,
         "EditMaskVariance_3D_num_voxels": int(eligible.sum().item()),
         "EditMaskVariance_3D_mean_observations": float(obs_count[eligible].mean().item()),
+        "EditMaskVariance_3D_bbox_min": [float(v) for v in bbox_min],
+        "EditMaskVariance_3D_bbox_max": [float(v) for v in bbox_max],
+        "EditMaskVariance_3D_bbox_source": bbox_source,
     }
 
 
@@ -496,6 +554,8 @@ def render_all_views(
     mask_variance_voxel_resolution=64,
     mask_variance_min_observations=3,
     mask_variance_accumulation_threshold=0.3,
+    mask_variance_bbox_min=None,
+    mask_variance_bbox_max=None,
 ):
     """Load an edited nerfstudio checkpoint and render all training views.
     Returns list of (rendered_image_tensor, gt_image_tensor) pairs.
@@ -554,6 +614,8 @@ def render_all_views(
             mask_variance_samples,
             voxel_resolution=mask_variance_voxel_resolution,
             min_observations=mask_variance_min_observations,
+            bbox_min=mask_variance_bbox_min,
+            bbox_max=mask_variance_bbox_max,
         )
         if mask_variance_metrics is None:
             print("WARNING: 3D edit-mask variance unavailable; depth/ray samples were insufficient.")
@@ -576,6 +638,8 @@ def evaluate_experiment(
     mask_variance_voxel_resolution=64,
     mask_variance_min_observations=3,
     mask_variance_accumulation_threshold=0.3,
+    mask_variance_bbox_min=None,
+    mask_variance_bbox_max=None,
 ):
     """Run full evaluation on a single experiment."""
     config_path = Path(config_path)
@@ -593,6 +657,8 @@ def evaluate_experiment(
         mask_variance_voxel_resolution=mask_variance_voxel_resolution,
         mask_variance_min_observations=mask_variance_min_observations,
         mask_variance_accumulation_threshold=mask_variance_accumulation_threshold,
+        mask_variance_bbox_min=mask_variance_bbox_min,
+        mask_variance_bbox_max=mask_variance_bbox_max,
     )
     num_views = len(rendered_images)
     print(f"Rendered {num_views} views.")
@@ -765,7 +831,14 @@ def evaluate_experiment(
             f"  3D edit-mask variance:         {m['EditMaskVariance_3D']['mean']:.6f} "
             f"+/- {m['EditMaskVariance_3D']['std']:.6f}"
         )
+        if "EditMaskVariance_3D_normalized" in m:
+            print(
+                f"  3D edit-mask variance (norm):  {m['EditMaskVariance_3D_normalized']:.6f} "
+                f"(mean edit mass {m['EditMaskVariance_3D_mean_value']:.4f})"
+            )
         print(f"  3D edit-mask voxels:           {m['EditMaskVariance_3D_num_voxels']}")
+        if "EditMaskVariance_3D_bbox_source" in m:
+            print(f"  3D edit-mask bbox source:      {m['EditMaskVariance_3D_bbox_source']}")
     print("=" * 60)
     print(f"  Results saved to: {results_path}")
 
@@ -814,6 +887,27 @@ def main():
         default=0.3,
         help="Rendered accumulation threshold for valid 3D edit-mask variance samples",
     )
+    eval_parser.add_argument(
+        "--mask-variance-bbox-min",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("X", "Y", "Z"),
+        help="Fixed shared voxel-grid min corner for EMV3D (3 floats). Pass the "
+             "SAME value across all configs of a scene for cross-config "
+             "comparable EMV3D; copy it from a reference run's "
+             "EditMaskVariance_3D_bbox_min in metrics.json. If omitted, the "
+             "bbox is derived per-run (NOT comparable across configs).",
+    )
+    eval_parser.add_argument(
+        "--mask-variance-bbox-max",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("X", "Y", "Z"),
+        help="Fixed shared voxel-grid max corner for EMV3D (3 floats). "
+             "See --mask-variance-bbox-min.",
+    )
 
     args = parser.parse_args()
 
@@ -833,6 +927,8 @@ def main():
             mask_variance_voxel_resolution=args.mask_variance_voxel_resolution,
             mask_variance_min_observations=args.mask_variance_min_observations,
             mask_variance_accumulation_threshold=args.mask_variance_accumulation_threshold,
+            mask_variance_bbox_min=args.mask_variance_bbox_min,
+            mask_variance_bbox_max=args.mask_variance_bbox_max,
         )
     else:
         parser.print_help()
