@@ -67,6 +67,18 @@ class DCPipelineConfig(VanillaPipelineConfig):
     mask_voxel_cache_scale_normalize_quantile: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_scale_normalize_quantile", 0.95
     )
+    # Observed-weighted trilinear read of the queried cache value. When True,
+    # the per-pixel cache value is trilinearly interpolated over the 8
+    # surrounding voxel centers (weighted by observation), instead of a
+    # nearest-voxel lookup. Smooths blocky discretization artifacts — where one
+    # voxel straddling two surfaces fakes cross-view disagreement — WITHOUT
+    # raising the grid resolution, so per-voxel observation density (and the
+    # variance/angular statistics that depend on it) is unchanged. Trust gates
+    # (count, variance, angular, mass, valid) are still read nearest-voxel.
+    # False = legacy nearest-voxel value lookup.
+    mask_voxel_cache_trilinear: bool = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_trilinear", False
+    )
     mask_voxel_cache_resolution: int = VOXEL_CACHE_PARAMS["mask_voxel_cache_resolution"]
     mask_voxel_cache_ema_beta: float = VOXEL_CACHE_PARAMS["mask_voxel_cache_ema_beta"]
     # Optional camera-count-aware EMA:
@@ -791,6 +803,9 @@ class DCPipeline(ModifiedVanillaPipeline):
                         ),
                         mass_power=float(
                             self.config.mask_voxel_cache_mass_power
+                        ),
+                        trilinear=bool(
+                            getattr(self.config, "mask_voxel_cache_trilinear", False)
                         ),
                     )
                     external_grad_mask = queried.view(1, 1, mask_h, mask_w).to(

@@ -217,6 +217,55 @@ class MaskVoxelCache:
         idx = (normalized * self.resolution).long().clamp_(0, self.resolution - 1)
         return idx, in_bounds
 
+    def _trilinear_observed_read(self, flat_points: torch.Tensor) -> torch.Tensor:
+        """Observed-weighted trilinear read of the grid mean value.
+
+        Standard trilinear interpolation over the 8 voxel centers surrounding
+        each point, but every corner is weighted by whether that voxel has been
+        observed — so unobserved (fallback) voxels never bleed into the result.
+        Where no surrounding voxel is observed, returns ``fallback_value``.
+
+        Args:
+            flat_points: [N, 3] world-space points.
+
+        Returns:
+            [N] interpolated mean values.
+        """
+        V = self.resolution
+        normalized = (flat_points - self.bbox_min) / (
+            self.bbox_max - self.bbox_min
+        ).clamp_min(1e-8)
+        # Continuous voxel-center-aligned coordinate: a point at the center of
+        # voxel i (normalized = (i + 0.5)/V) maps to c = i, so floor() picks the
+        # lower neighbor and `frac` blends toward the upper one.
+        c = (normalized * V - 0.5).clamp(0.0, float(V - 1))
+        i0 = c.floor().long().clamp_(0, V - 1)      # [N, 3]
+        i1 = (i0 + 1).clamp_(0, V - 1)              # [N, 3]
+        frac = (c - i0.float()).clamp(0.0, 1.0)     # [N, 3]
+
+        num = torch.zeros(flat_points.shape[0], device=self.device, dtype=torch.float32)
+        den = torch.zeros_like(num)
+        # Accumulate the 8 cube corners.
+        for cx in (0, 1):
+            wx = frac[:, 0] if cx else (1.0 - frac[:, 0])
+            gx = i1[:, 0] if cx else i0[:, 0]
+            for cy in (0, 1):
+                wy = frac[:, 1] if cy else (1.0 - frac[:, 1])
+                gy = i1[:, 1] if cy else i0[:, 1]
+                for cz in (0, 1):
+                    wz = frac[:, 2] if cz else (1.0 - frac[:, 2])
+                    gz = i1[:, 2] if cz else i0[:, 2]
+                    w = wx * wy * wz                 # [N] trilinear weight
+                    obs = self.observed[gx, gy, gz].float()
+                    val = self.grid[gx, gy, gz]
+                    num = num + w * obs * val
+                    den = den + w * obs
+        return torch.where(
+            den > 1e-6,
+            num / den.clamp_min(1e-6),
+            torch.full_like(num, self.fallback_value),
+        )
+
     # -----------------------------------------------------------------
     # Depth-backprojection helper
     # -----------------------------------------------------------------
@@ -505,6 +554,7 @@ class MaskVoxelCache:
         angular_relative: bool = False,
         mass_threshold: float = 0.0,
         mass_power: float = 0.0,
+        trilinear: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """Look up mask values at world-space positions.
 
@@ -546,6 +596,17 @@ class MaskVoxelCache:
         typical diversity — voxels above the scene mean keep most of their
         confidence, voxels below get damped, regardless of the absolute
         scale set by the capture rig.
+
+        `trilinear` (default False) reads the stored mean value via
+        observed-weighted trilinear interpolation over the 8 surrounding voxel
+        centers instead of nearest-voxel lookup. This smooths the value the
+        cache feeds back — reducing blocky discretization artifacts where one
+        voxel straddles two surfaces (which otherwise look like cross-view
+        disagreement) — without raising the grid resolution, so per-voxel
+        observation density (and thus the variance/angular statistics) is
+        unchanged. The trust signals (counts, variance, angular factor,
+        observed/valid, mass) are still read at the nearest voxel, so gating
+        semantics are identical; only the interpolated magnitude differs.
         """
         original_shape = points_world.shape[:-1]
         flat_points = points_world.reshape(-1, 3).to(self.device)
@@ -556,7 +617,10 @@ class MaskVoxelCache:
             in_bounds = in_bounds.reshape(-1).to(self.device) & default_in_bounds
 
         ix, iy, iz = idx[:, 0], idx[:, 1], idx[:, 2]
-        values = self.grid[ix, iy, iz]
+        if trilinear:
+            values = self._trilinear_observed_read(flat_points)
+        else:
+            values = self.grid[ix, iy, iz]
         observed = self.observed[ix, iy, iz]
         counts = self.unique_view_count[ix, iy, iz].float()
         m2 = self.running_m2[ix, iy, iz]

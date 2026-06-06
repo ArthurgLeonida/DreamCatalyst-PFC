@@ -113,6 +113,20 @@ class DCConfig:
     gradient_mask_ema_beta_camera_factor: float = 2.0
     gradient_mask_gamma: float = 1.2
     gradient_mask_warmup: int = 0
+    # Per-frame normalization divisor for the RAW relevance mask (the
+    # ``self_grad_mask_raw`` / ``raw_self`` variant fed to the voxel cache).
+    #   1.0  = divide by the per-frame max (legacy). A single hot pixel then
+    #          rescales the whole frame, so the same 3D point reads different
+    #          normalized values across views purely because each frame's max
+    #          differs — spurious cross-view variance the cache mistakes for
+    #          real inconsistency.
+    #   q in (0.5, 1.0) = divide by that per-frame quantile (e.g. 0.95 → p95).
+    #          A robust scale: preserves absolute foreground/background
+    #          structure (still a monotone linear rescale, so the §10 contrast
+    #          fix holds) but is insensitive to single-pixel outliers.
+    # Only affects ``self_grad_mask_raw``; the DDS gradient mask keeps its
+    # percentile normalization. Default 1.0 reproduces prior behavior exactly.
+    gradient_mask_raw_norm_quantile: float = 1.0
     source_blend_localization_enabled: bool = True
     # Leaky source-blend gate. 0.0 = original hard gate (edit zeroed where M=0).
     # A small floor (e.g. 0.1) lets a fraction of the edit drive reach M≈0
@@ -219,10 +233,20 @@ class DC(object):
         # frame while keeping values in [0, 1]. Each frame is rescaled by its
         # own max so values are comparable across the cache's spatial extent.
         B = relevance.shape[0]
-        max_per_sample = (
-            relevance.view(B, -1).amax(dim=1).clamp_min(1e-8).view(B, 1, 1, 1)
-        )
-        raw_mask = (relevance / max_per_sample).clamp(0.0, 1.0).detach()
+        flat_relevance = relevance.view(B, -1)
+        q_norm = float(getattr(self.config, "gradient_mask_raw_norm_quantile", 1.0))
+        if q_norm >= 1.0:
+            # Legacy per-frame max: one outlier pixel can rescale the frame.
+            per_sample_scale = flat_relevance.amax(dim=1)
+        else:
+            # Robust per-frame scale: divide by the q-quantile so a single hot
+            # pixel can no longer deflate the whole frame's mask (a major source
+            # of spurious cross-view variance once these masks are aggregated
+            # into the 3D voxel cache). Pixels above the quantile saturate to 1.
+            q_norm = min(max(q_norm, 0.5), 0.999)
+            per_sample_scale = torch.quantile(flat_relevance, q_norm, dim=1)
+        per_sample_scale = per_sample_scale.clamp_min(1e-8).view(B, 1, 1, 1)
+        raw_mask = (relevance / per_sample_scale).clamp(0.0, 1.0).detach()
 
         normalized = normalize_relevance_map(relevance)
 
