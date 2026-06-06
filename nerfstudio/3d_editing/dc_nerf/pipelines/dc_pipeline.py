@@ -871,10 +871,10 @@ class DCPipeline(ModifiedVanillaPipeline):
             and dic.get("internal_grad_mask", None) is not None
         ):
             update_source = str(self.config.mask_voxel_cache_update_source).lower()
-            if update_source not in {"internal", "raw_self"}:
+            if update_source not in {"internal", "raw_self", "raw_attn"}:
                 raise ValueError(
                     f"Unknown mask_voxel_cache_update_source={update_source!r}; "
-                    "expected 'internal' or 'raw_self'."
+                    "expected 'internal', 'raw_self', or 'raw_attn'."
                 )
             if update_source == "internal" and not getattr(
                 self, "_warned_internal_update_source", False
@@ -890,7 +890,24 @@ class DCPipeline(ModifiedVanillaPipeline):
                     "aggregation. (This warning fires once per run.)"
                 )
                 self._warned_internal_update_source = True
-            if update_source == "raw_self" and dic.get("self_grad_mask_raw") is not None:
+            if update_source == "raw_attn" and dic.get("cross_attention_mask") is not None:
+                # Lift the (unscheduled) semantic Cross-Attention mask instead of
+                # the view-dependent self-mask. The self-mask is an edit MAGNITUDE
+                # (||eps_tgt - eps_src||) that legitimately varies with viewpoint,
+                # so 3D aggregation has no view-invariant target to converge to.
+                # The CA mask is a semantic spatial prior ("where is the edited
+                # subject") and is far closer to view-invariant — the correct kind
+                # of signal to aggregate into a shared 3D grid. Resized to mask
+                # resolution to match the world points being scattered into.
+                cache_mask_input = dic["cross_attention_mask"]
+                if cache_mask_input.shape[-2:] != (mask_h, mask_w):
+                    cache_mask_input = F.interpolate(
+                        cache_mask_input.float(),
+                        size=(mask_h, mask_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+            elif update_source == "raw_self" and dic.get("self_grad_mask_raw") is not None:
                 cache_mask_input = dic["self_grad_mask_raw"]
             else:
                 cache_mask_input = dic["internal_grad_mask"]
@@ -1045,7 +1062,9 @@ class DCPipeline(ModifiedVanillaPipeline):
                         src_2d.mean().item()
                     )
                     payload["dc_debug/voxel_cache_input_mask_source"] = (
-                        1.0 if update_source == "raw_self" else 0.0
+                        2.0 if update_source == "raw_attn"
+                        else 1.0 if update_source == "raw_self"
+                        else 0.0
                     )
                 wandb.log(payload, step=step, commit=False)
         grad = dic["grad"].cpu()

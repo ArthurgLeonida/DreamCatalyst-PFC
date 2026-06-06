@@ -110,7 +110,13 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_bbox_observe_quantile=0.05,
     mask_voxel_cache_bbox_inflation=0.2,
 
-    mask_voxel_cache_update_source="raw_self",     # avoid CA-schedule leakage into cache observations
+    # "raw_self" lifts the view-DEPENDENT edit-magnitude self-mask (the original
+    # signal — aggregating it in 3D has no view-invariant target, which is why the
+    # cache tops out at redundant-with-2D). "raw_attn" lifts the (unscheduled)
+    # semantic Cross-Attention mask, which is far closer to view-invariant and is
+    # the principled quantity to aggregate in 3D. "internal" = scheduled self·CA
+    # hybrid (deprecated: CA-schedule leakage).
+    mask_voxel_cache_update_source="raw_self",
 
     mask_voxel_cache_angular_power=1.0,    # was 1.0
     mask_voxel_cache_min_angular_factor=0.0,
