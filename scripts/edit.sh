@@ -126,10 +126,12 @@ if enabled:
             )
         else:
             obs = str(voxel["mask_voxel_cache_min_observations"])
+        vdecay = voxel.get('mask_voxel_cache_variance_decay', 0.0)
+        var_mode = f"EW(a={vdecay})" if vdecay and vdecay > 0.0 else "Welford"
         print(
             f"   {branch} trust:      "
             f"obs>={obs}, "
-            f"var<={voxel['mask_voxel_cache_max_variance']}"
+            f"var<={voxel['mask_voxel_cache_max_variance']} [{var_mode}]"
         )
     else:
         print(f"   {branch} trust:      off")

@@ -161,6 +161,17 @@ class DCPipelineConfig(VanillaPipelineConfig):
     mask_voxel_cache_max_variance: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_max_variance", 0.0
     )
+    # Cross-view variance estimator. 0.0 = cumulative Welford (every distinct
+    # view weighted equally over the whole run). A value in (0,1) switches to an
+    # exponentially-weighted variance with this as the new-view weight, so stale
+    # early-training observations decay out and the statistic tracks *current*
+    # cross-view disagreement rather than the edit's evolution over training
+    # (which otherwise makes `mean_observed_variance` climb monotonically).
+    # The EW estimate is biased low by ≈(1−value), so re-read query_variance_mean
+    # and re-tune max_variance after enabling. 0.0 preserves prior behavior.
+    mask_voxel_cache_variance_decay: float = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_variance_decay", 0.0
+    )
     # Angular-diversity factor for cache confidence. The factor for each voxel
     # is (1 − ‖Σ unit_view_dir / unique_view_count‖) ∈ [0, 1]: 1 if observing
     # rays span the full sphere, 0 if they are all parallel. This is raised to
@@ -503,6 +514,9 @@ class DCPipeline(ModifiedVanillaPipeline):
             resolution=self.config.mask_voxel_cache_resolution,
             ema_beta=ema_beta,
             num_views=n_views if self.config.mask_voxel_cache_confidence_enabled else None,
+            variance_decay=float(
+                getattr(self.config, "mask_voxel_cache_variance_decay", 0.0)
+            ),
             device=self.device,
         )
 

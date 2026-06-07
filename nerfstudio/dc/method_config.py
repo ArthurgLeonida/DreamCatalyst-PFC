@@ -57,11 +57,6 @@ DC_CUSTOM_PARAMS = dict(
 
     external_mask_fusion="bidirectional",
     external_mask_screen_attn_gate_strength=1.0,
-    # Positive-only cache fusion: 0.0 disables the negative (subtractive) branch.
-    # With raw_self the cache mean sits below this view's true peak on view-
-    # dependent regions, so a negative branch erodes legitimate edit force
-    # (stormtrooper armor, elf eyes). 0.0 lets the cache only ADD agreed-upon
-    # force, never subtract. (Was 0.3.) See VoxelCacheExplained §5b.
     external_mask_interp_suppression_ratio=0.0,
     external_mask_negative_variance_power=0.0,
     external_mask_screen_self_boost_lambda=1.0,
@@ -114,19 +109,22 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_observation_fraction=0.10,
     mask_voxel_cache_min_observations_floor=5,
     mask_voxel_cache_min_observations_cap=12,      # saturates the auto-rule at N_cam > 120 for cross-scene consistency
-    mask_voxel_cache_max_variance=0.02,            # tightened from 0.035: with the robust raw_self norm (p95) spurious variance drops, so the gate should only pass genuinely view-invariant force. Sweep {0.02, 0.015, 0.01} after reading measure-only baseline variance per scene.
+    mask_voxel_cache_max_variance=0.035,
+    # 0.0 = cumulative Welford (default; every distinct view weighted equally).
+    # >0 = exponentially-weighted variance with this as the new-view weight, so
+    # stale early-training observations decay out and mean_observed_variance
+    # stops climbing over the run. Try 0.15-0.2 (memory ≈ 5-7 views). The EW
+    # estimate is biased low ≈(1-value), so re-read query_variance_mean and
+    # re-tune max_variance after enabling. A/B vs 0.0 to isolate its effect.
+    mask_voxel_cache_variance_decay=0.0,
 
     mask_voxel_cache_bbox_source="observed",  # observed | cameras | scene_box
     mask_voxel_cache_bbox_observe_steps=50,
     mask_voxel_cache_bbox_observe_quantile=0.05,
     mask_voxel_cache_bbox_inflation=0.2,
 
-    mask_voxel_cache_update_source="raw_self", # raw_self | internal | raw_attn  -- lift the edit-force (||eps_tgt-eps_src||) mask, not the semantic CA mask
-    # Observed-weighted trilinear cache read. Implemented and ready; kept OFF so
-    # the first experiment isolates the raw_self-normalization + fusion + gate
-    # changes. Flip to True to ablate the discretization fix (no density penalty,
-    # unlike raising resolution). See dc_pipeline mask_voxel_cache_trilinear.
-    mask_voxel_cache_trilinear=False,
+    mask_voxel_cache_update_source="raw_self", # raw_self | internal | raw_attn 
+    mask_voxel_cache_trilinear=True, # Test with True
 
     mask_voxel_cache_angular_power=1.0,    # was 1.0
     mask_voxel_cache_min_angular_factor=0.0,

@@ -51,6 +51,7 @@ class MaskVoxelCache:
         ema_beta: float = 0.9,
         fallback_value: float = 0.5,
         num_views: Optional[int] = None,
+        variance_decay: float = 0.0,
         device: Optional[torch.device] = None,
     ) -> None:
         """
@@ -65,6 +66,21 @@ class MaskVoxelCache:
             fallback_value: returned for voxels never observed. 0.5 is
                 "uncertain"; safer than 0.0 (would over-suppress edits in
                 unseen regions) or 1.0 (would over-edit them).
+            variance_decay: 0.0 (default) = cumulative Welford cross-view
+                variance (every distinct view that ever observed a voxel is
+                weighted equally). A value in (0, 1) switches to an
+                exponentially-weighted variance (Finch 2009, "Incremental
+                calculation of weighted mean and variance"), where it is the
+                weight on the newest view's sample and (1 − value) the
+                retention of past evidence. Because views first-observe a
+                voxel in training-time order, exponential weighting down-
+                weights stale early-training (immature-edit) observations, so
+                the variance tracks *current* cross-view disagreement instead
+                of accumulating the edit's evolution over training as fake
+                inconsistency. Effective memory ≈ 1/value views (0.2 ≈ last 5).
+                Note: the EW estimator is biased low by ≈ (1 − value), so its
+                absolute scale differs from the cumulative one — re-read
+                `query_variance_mean` and re-tune `max_variance` after enabling.
             device: torch device. Defaults to current CUDA device.
         """
         self.device = device if device is not None else torch.device(
@@ -75,6 +91,9 @@ class MaskVoxelCache:
         self.resolution = int(resolution)
         self.ema_beta = float(ema_beta)
         self.fallback_value = float(fallback_value)
+        # 0.0 = cumulative Welford variance; (0,1) = exponentially-weighted
+        # variance with this as the new-sample weight. See __init__ docstring.
+        self.variance_decay = min(max(float(variance_decay), 0.0), 0.999)
         self.num_views = int(num_views) if num_views is not None and int(num_views) > 0 else None
 
         V = self.resolution
@@ -499,13 +518,35 @@ class MaskVoxelCache:
         # is unreliable for suppressing or amplifying the 2D mask.
         if stats_idx.numel() > 0:
             old_count = (flat_unique_view_count[stats_idx].float() - 1.0).clamp_min(0.0)
-            new_count = old_count + 1.0
             old_mean = flat_running_mean[stats_idx]
             delta = stats_values - old_mean
-            new_mean = old_mean + delta / new_count
-            delta2 = stats_values - new_mean
-            flat_running_mean[stats_idx] = new_mean
-            flat_running_m2[stats_idx] = flat_running_m2[stats_idx] + delta * delta2
+            if self.variance_decay > 0.0:
+                # Exponentially-weighted mean + variance (Finch 2009). Here
+                # `flat_running_m2` stores the EW VARIANCE directly (not the
+                # sum of squared deviations). The first view for a voxel
+                # (old_count == 0) seeds mean = value, variance = 0; every
+                # later view blends with weight `alpha` on the newest sample,
+                # so stale early-training observations decay out.
+                alpha = self.variance_decay
+                first = old_count == 0.0
+                ew_incr = alpha * delta
+                # Mean: first obs takes the value directly (old_mean is 0),
+                # else EW blend toward the newest sample.
+                new_mean = old_mean + torch.where(first, delta, ew_incr)
+                new_var = torch.where(
+                    first,
+                    torch.zeros_like(old_mean),
+                    (1.0 - alpha) * (flat_running_m2[stats_idx] + delta * ew_incr),
+                )
+                flat_running_mean[stats_idx] = new_mean
+                flat_running_m2[stats_idx] = new_var
+            else:
+                # Cumulative Welford: every distinct view weighted equally.
+                new_count = old_count + 1.0
+                new_mean = old_mean + delta / new_count
+                delta2 = stats_values - new_mean
+                flat_running_mean[stats_idx] = new_mean
+                flat_running_m2[stats_idx] = flat_running_m2[stats_idx] + delta * delta2
 
         # Angular-diversity update: accumulate this view's per-voxel mean
         # direction into the running view-direction sum. Same gating as
@@ -624,11 +665,15 @@ class MaskVoxelCache:
         observed = self.observed[ix, iy, iz]
         counts = self.unique_view_count[ix, iy, iz].float()
         m2 = self.running_m2[ix, iy, iz]
-        variance = torch.where(
-            counts > 1.0,
-            m2 / (counts - 1.0).clamp_min(1.0),
-            torch.zeros_like(m2),
-        )
+        if self.variance_decay > 0.0:
+            # running_m2 already holds the EW variance; single-view voxels read 0.
+            variance = torch.where(counts > 1.0, m2, torch.zeros_like(m2))
+        else:
+            variance = torch.where(
+                counts > 1.0,
+                m2 / (counts - 1.0).clamp_min(1.0),
+                torch.zeros_like(m2),
+            )
 
         # Replace unobserved or out-of-bounds with fallback.
         valid = observed & in_bounds
@@ -781,7 +826,11 @@ class MaskVoxelCache:
         valid = counts > 1.0
         if not valid.any():
             return 0.0
-        variance = self.running_m2[valid] / (counts[valid] - 1.0).clamp_min(1.0)
+        if self.variance_decay > 0.0:
+            # running_m2 already holds the EW variance per voxel.
+            variance = self.running_m2[valid]
+        else:
+            variance = self.running_m2[valid] / (counts[valid] - 1.0).clamp_min(1.0)
         return float(variance.mean().item())
 
     def try_auto_freeze_angular_denominator(
