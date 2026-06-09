@@ -97,9 +97,9 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_ema_beta_auto=True,
     mask_voxel_cache_ema_beta_camera_factor=2.0,
 
-    mask_voxel_cache_warmup_start=300,
-    mask_voxel_cache_warmup_end=1100,
-    mask_voxel_cache_max_blend=0.4,
+    mask_voxel_cache_warmup_start=100, # Was 300
+    mask_voxel_cache_warmup_end=1100, # Was 1100
+    mask_voxel_cache_max_blend=0.2,
     mask_voxel_cache_accumulation_threshold=0.30,
     mask_voxel_cache_update_threshold=0.0,
 
@@ -109,14 +109,8 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_observation_fraction=0.10,
     mask_voxel_cache_min_observations_floor=5,
     mask_voxel_cache_min_observations_cap=12,      # saturates the auto-rule at N_cam > 120 for cross-scene consistency
-    mask_voxel_cache_max_variance=0.035,
-    # 0.0 = cumulative Welford (default; every distinct view weighted equally).
-    # >0 = exponentially-weighted variance with this as the new-view weight, so
-    # stale early-training observations decay out and mean_observed_variance
-    # stops climbing over the run. Try 0.15-0.2 (memory ≈ 5-7 views). The EW
-    # estimate is biased low ≈(1-value), so re-read query_variance_mean and
-    # re-tune max_variance after enabling. A/B vs 0.0 to isolate its effect.
-    mask_voxel_cache_variance_decay=0.0,
+    mask_voxel_cache_max_variance=0.020,           # Was 0.035
+    mask_voxel_cache_variance_decay=0.2,
 
     mask_voxel_cache_bbox_source="observed",  # observed | cameras | scene_box
     mask_voxel_cache_bbox_observe_steps=50,

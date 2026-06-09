@@ -39,113 +39,45 @@ class DCPipelineConfig(VanillaPipelineConfig):
     change_view_step: int = 1
     log_step: int = 10
 
-    # 3D voxel-cache for cross-view-consistent localization (Stage 1 prototype).
-    # When enabled, per-view diffusion masks are scattered into a coarse 3D
-    # voxel grid via depth backprojection, EMA-aggregated across views, and
-    # queried back per-view to override (or blend with) the internal mask.
-    # See `nerfstudio/dc/mask_voxel_cache.py` for the math + paper references.
     mask_voxel_cache_enabled: bool = VOXEL_CACHE_PARAMS["mask_voxel_cache_enabled"]
-    # Passive cache-off control. When True (with `mask_voxel_cache_enabled`
-    # False), the cache is built and its cross-view Welford statistics are
-    # accumulated from the observed per-view masks, but it is NEVER queried or
-    # blended into the DDS gradient — the edit trajectory is identical to the
-    # standard (cache-off) run while `dc_debug/voxel_cache_mean_observed_variance`
-    # is still logged. This makes the cache-on vs cache-off A/B on the cache's
-    # own internal mask-consistency statistic apples-to-apples, since the eval
-    # metric EditMaskVariance_3D cannot observe the training-time latent mask.
     mask_voxel_cache_measure_only: bool = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_measure_only", False
     )
-    # Scale-matched fusion. When True, the queried cache mask is contrast-
-    # stretched to [0,1] over its observed voxels before being fused with the
-    # sharp 2D mask in DC.__call__ — fixes the subtractive term firing on the
-    # edit region purely from the cache's compressed value range. See
-    # `_scale_normalize_cache_mask`. False = legacy (raw cache value).
     mask_voxel_cache_scale_normalize: bool = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_scale_normalize", False
     )
     mask_voxel_cache_scale_normalize_quantile: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_scale_normalize_quantile", 0.95
     )
-    # Observed-weighted trilinear read of the queried cache value. When True,
-    # the per-pixel cache value is trilinearly interpolated over the 8
-    # surrounding voxel centers (weighted by observation), instead of a
-    # nearest-voxel lookup. Smooths blocky discretization artifacts — where one
-    # voxel straddling two surfaces fakes cross-view disagreement — WITHOUT
-    # raising the grid resolution, so per-voxel observation density (and the
-    # variance/angular statistics that depend on it) is unchanged. Trust gates
-    # (count, variance, angular, mass, valid) are still read nearest-voxel.
-    # False = legacy nearest-voxel value lookup.
     mask_voxel_cache_trilinear: bool = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_trilinear", False
     )
     mask_voxel_cache_resolution: int = VOXEL_CACHE_PARAMS["mask_voxel_cache_resolution"]
     mask_voxel_cache_ema_beta: float = VOXEL_CACHE_PARAMS["mask_voxel_cache_ema_beta"]
-    # Optional camera-count-aware EMA:
-    #     beta = 1 - 1 / (factor * N_cameras)
-    # This keeps the cache memory proportional to scene coverage. Larger
-    # datasets get slower updates; smaller datasets stay responsive.
     mask_voxel_cache_ema_beta_auto: bool = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_ema_beta_auto", False
     )
     mask_voxel_cache_ema_beta_camera_factor: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_ema_beta_camera_factor", 2.0
     )
-    # Warmup ramp for the external-mask blend factor inside DC.__call__.
-    # `blend(step) = clamp((step - start) / (end - start), 0, 1) * max_blend`.
-    # During [0, start] iterations the cache is built but not yet used in the
-    # gradient. During [start, end] the cache phases in. After `end`, blend
-    # stays at `max_blend`.
     mask_voxel_cache_warmup_start: int = VOXEL_CACHE_PARAMS["mask_voxel_cache_warmup_start"]
     mask_voxel_cache_warmup_end: int = VOXEL_CACHE_PARAMS["mask_voxel_cache_warmup_end"]
     mask_voxel_cache_max_blend: float = VOXEL_CACHE_PARAMS["mask_voxel_cache_max_blend"]
     mask_voxel_cache_accumulation_threshold: float = VOXEL_CACHE_PARAMS[
         "mask_voxel_cache_accumulation_threshold"
     ]
-    # Confidence gate on cache updates — pixels with internal mask below
-    # this threshold are skipped from the EMA accumulation. Prevents the
-    # cache from learning "this region is not edited" priors on voxels
-    # where the model has not yet committed any edit signal (e.g. the
-    # stormtrooper helmet stays unobserved during iters 0–1400; once
-    # internal_grad_mask(head) rises past the threshold, learning kicks
-    # in fresh against the fallback rather than against a stale low EMA).
     mask_voxel_cache_update_threshold: float = VOXEL_CACHE_PARAMS[
         "mask_voxel_cache_update_threshold"
     ]
-    # Which 2D mask source feeds the voxel cache update().
-    #   "internal" : the fused, post-percentile, post-EMA, post-blur mask used
-    #                by the DDS gradient (current behavior). Spatially clean
-    #                but value-compressed by percentile normalization, so per-
-    #                voxel evidence sits in a narrow band near the median.
-    #   "raw_self" : the raw per-sample max-normalized ||eps_tgt - eps_src||
-    #                without percentile / EMA / blur. Preserves within-view
-    #                foreground/background contrast better than percentile
-    #                normalization — foreground voxels tend to keep high values
-    #                and background voxels tend to keep low ones — at the cost
-    #                of being noisier per-view. The cache's EMA-then-cross-view
-    #                aggregation is the intended denoiser for this source.
-    # Diagnosed empirically: with "internal" the update histogram is unimodal
-    # near zero with a thin tail, no separable trough — no threshold value
-    # can cleanly partition foreground from background. The raw source is
-    # the experimental fix.
     mask_voxel_cache_update_source: str = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_update_source", "internal"
     )
-    # TransSplat-style trust signal for the non-parametric NeRF cache: a voxel
-    # is useful only after several views have observed it and those view-level
-    # mask values agree. This is a cheap correspondence-consistency proxy: all
-    # pixels that backproject to the same voxel are treated as observations of
-    # the same 3D point.
     mask_voxel_cache_confidence_enabled: bool = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_confidence_enabled", False
     )
     mask_voxel_cache_min_observations: int = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_min_observations", 1
     )
-    # Optional camera-count-aware observation threshold:
-    #     min_obs = clamp(ceil(N_cameras * fraction), floor, cap)
-    # This scales the trust threshold with dataset size while respecting that
-    # many valid surface points are visible from only a subset of cameras.
     mask_voxel_cache_min_observations_auto: bool = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_min_observations_auto", False
     )
@@ -161,130 +93,37 @@ class DCPipelineConfig(VanillaPipelineConfig):
     mask_voxel_cache_max_variance: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_max_variance", 0.0
     )
-    # Cross-view variance estimator. 0.0 = cumulative Welford (every distinct
-    # view weighted equally over the whole run). A value in (0,1) switches to an
-    # exponentially-weighted variance with this as the new-view weight, so stale
-    # early-training observations decay out and the statistic tracks *current*
-    # cross-view disagreement rather than the edit's evolution over training
-    # (which otherwise makes `mean_observed_variance` climb monotonically).
-    # The EW estimate is biased low by ≈(1−value), so re-read query_variance_mean
-    # and re-tune max_variance after enabling. 0.0 preserves prior behavior.
     mask_voxel_cache_variance_decay: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_variance_decay", 0.0
     )
-    # Angular-diversity factor for cache confidence. The factor for each voxel
-    # is (1 − ‖Σ unit_view_dir / unique_view_count‖) ∈ [0, 1]: 1 if observing
-    # rays span the full sphere, 0 if they are all parallel. This is raised to
-    # `angular_power` and multiplied into confidence. 0.0 disables it (current
-    # default; preserves prior behavior for stormtrooper/clown). Empirical
-    # motivation: on the elf scene with 65 cameras and clustered viewpoints,
-    # cross-view variance read ~0.005 (near-saturated confidence) while voxels
-    # were observed only from a narrow cone — the variance gate alone could
-    # not detect this failure mode because parallel views agree by
-    # construction. The angular factor distinguishes "consistent because well
-    # triangulated" from "consistent because seen from one direction".
     mask_voxel_cache_angular_power: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_angular_power", 0.0
     )
-    # Scene-relative normalization for the angular factor. With it enabled,
-    # the per-voxel factor is divided by the scene-wide mean angular factor
-    # before exponentiation. This makes the gate behave consistently across
-    # capture geometries — a clown voxel with absolute factor 0.06 (its
-    # scene mean) reads as "average for its scene" rather than "almost
-    # zero." Empirically necessary: without normalization, the clown scene
-    # (horizontal-arc capture, mean angular factor ~0.05) suffered the same
-    # confidence collapse as elf (forward-facing, mean ~0.01), erasing the
-    # cache's contribution on both. With normalization, each scene is
-    # judged against its own typical diversity.
     mask_voxel_cache_angular_relative: bool = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_angular_relative", False
     )
-    # Mass gate (C_mass). Damps the cache's confidence on voxels whose
-    # cached mean value is below `mass_threshold`, effectively turning
-    # off the cache's contribution where the model isn't actively
-    # editing. Made the previously-implicit coupling (via the
-    # value-gated angular factor) explicit. Empirical motivation: pre-
-    # Fix-B runs accidentally had this coupling and produced correct
-    # behavior on stormtrooper hand/crotch; Fix B decoupled angular
-    # from evidence and broke those regions; this gate re-establishes
-    # the coupling in a controllable way.
-    #
-    #   mass_threshold: cache-mean value below which the gate starts
-    #                   damping. 0.0 disables (legacy / debug).
-    #   mass_power:     exponent on (m/threshold). 1.0 = linear ramp.
-    #                   Higher = steeper cliff. 0.0 disables.
     mask_voxel_cache_mass_threshold: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_mass_threshold", 0.0
     )
     mask_voxel_cache_mass_power: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_mass_power", 0.0
     )
-    # Patience (in edit-steps) for the scene-adaptive auto-freeze of the
-    # angular denominator. The cache tracks the running maximum of the
-    # trusted angular factor each iteration; when no improvement is seen
-    # for this many consecutive edit-steps, the denominator snapshots
-    # the peak value. Lower → freezes sooner but more sensitive to noise
-    # in the trusted curve; higher → more robust but may freeze after
-    # drift has begun. 100 is the current setting: short enough to fire
-    # before significant decay on typical scenes (≤2500 edit-steps).
     mask_voxel_cache_angular_freeze_patience: int = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_angular_freeze_patience", 100
     )
-    # Warmup window (edit-steps) during which the auto-freeze does not
-    # track peaks. Avoids treating the cache's startup transient — when
-    # only one or two views have been observed and the trusted population
-    # is tiny and noisy — as a "peak."
     mask_voxel_cache_angular_freeze_warmup: int = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_angular_freeze_warmup", 50
     )
-    # Floor on the angular factor before exponentiation. Prevents the factor
-    # from collapsing to 0 on voxels observed by very few unique views (where
-    # the resultant length is necessarily 1 and the diversity necessarily 0).
-    # With min_observations active above, this guards against the boundary
-    # case rather than carrying real semantic weight.
     mask_voxel_cache_min_angular_factor: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_min_angular_factor", 0.0
     )
-    # Source for the cache's world-space bbox.
-    #   "observed" (default) — observe `bbox_observe_steps` iterations of
-    #                          backprojected world points first, take their
-    #                          AABB, inflate by `bbox_inflation`, then build
-    #                          the cache. By construction this bbox contains
-    #                          exactly the points the cache will need to index.
-    #                          Robust to any dataparser convention.
-    #   "cameras"            — camera-position AABB inflated by `bbox_inflation`.
-    #                          WARNING: for object-centric capture (cameras
-    #                          looking inward at a subject), the subject is
-    #                          *outside* the camera AABB along the viewing
-    #                          direction — every backprojected point will fall
-    #                          out of bbox. Diagnosed empirically: failed with
-    #                          `voxel_pure_in_bbox_frac = 0` on the clown scene.
-    #   "scene_box"          — use `dataparser_outputs.scene_box.aabb`. Fast
-    #                          but only correct when the dataparser sets
-    #                          scene_box in the same frame as the rays.
     mask_voxel_cache_bbox_source: str = VOXEL_CACHE_PARAMS["mask_voxel_cache_bbox_source"]
-    # For "observed" source: number of iterations to accumulate world points
-    # before constructing the cache. Cache is dormant during this window, then
-    # built once at iteration `bbox_observe_steps` and used onward.
     mask_voxel_cache_bbox_observe_steps: int = VOXEL_CACHE_PARAMS[
         "mask_voxel_cache_bbox_observe_steps"
     ]
-    # Per-iteration quantile clip applied to observed world points. Robust
-    # alternative to min/max — clips far-depth outliers from low-confidence
-    # rays so the bbox tightly fits the actual subject region.
-    #   0.0  → use min/max (old behavior, sensitive to far-plane outliers).
-    #   0.05 → use 5th/95th percentile per iteration (default, robust).
-    # Empirical motivation: with min/max + accumulation_threshold=0.05, the
-    # observed bbox extent ballooned to ~240 units along x/z (subject is ~2),
-    # making 64³ voxels too coarse to distinguish body parts. Percentile
-    # clipping at 5/95 collapses the bbox to the actual surface support.
     mask_voxel_cache_bbox_observe_quantile: float = VOXEL_CACHE_PARAMS[
         "mask_voxel_cache_bbox_observe_quantile"
     ]
-    # Inflation factor around the chosen AABB. With "observed" source the
-    # bbox already contains all observed points, so a small margin (10–25%)
-    # is enough. With "cameras" or "scene_box", more inflation is usually
-    # needed.
     mask_voxel_cache_bbox_inflation: float = VOXEL_CACHE_PARAMS[
         "mask_voxel_cache_bbox_inflation"
     ]
@@ -334,15 +173,11 @@ class DCPipeline(ModifiedVanillaPipeline):
         self.src_encodeds = dict()
         self.current_spot = None
 
-        # Optional 3D voxel-cache for cross-view-consistent localization.
-        # Initialized lazily on first iteration (or after observing a few
-        # iterations of backprojected world points, depending on bbox source).
         self.mask_voxel_cache: Optional[MaskVoxelCache] = None
         self.mask_voxel_cache_start_step: Optional[int] = None
         self.mask_voxel_cache_effective_ema_beta: Optional[float] = None
         self.mask_voxel_cache_effective_min_observations: Optional[int] = None
-        # For "observed" bbox source: rolling per-axis min/max accumulated
-        # across the first `bbox_observe_steps` iterations.
+
         self._observed_pts_min: Optional[torch.Tensor] = None
         self._observed_pts_max: Optional[torch.Tensor] = None
         self._observed_pts_count: int = 0
@@ -356,11 +191,6 @@ class DCPipeline(ModifiedVanillaPipeline):
         camera_outputs = self.model.diff_get_outputs_for_camera(current_camera)
         rendered_image = camera_outputs["rgb"].unsqueeze(dim=0).permute(0, 3, 1, 2)  # [B,3,H,W]
 
-        # When the voxel cache is active we also need the rendered depth and
-        # accumulation so we can backproject pixels to 3D world points later.
-        # Rays themselves are now generated at mask (latent) resolution
-        # directly in `get_train_loss_dict` via `Cameras.generate_rays(coords=)`,
-        # which avoids the geometric bias of interpolating ray directions.
         depth_world = None
         accumulation_world = None
         if self._voxel_cache_active():
@@ -460,11 +290,7 @@ class DCPipeline(ModifiedVanillaPipeline):
         cameras = self.datamanager.train_dataparser_outputs.cameras
 
         if source == "observed":
-            # Caller is responsible for accumulating observed world points
-            # via `_observe_points()` and only invoking this method once
-            # enough observations are in. Use the rolling min/max here.
             if self._observed_pts_min is None or self._observed_pts_max is None:
-                # Not enough observations yet — caller should retry later.
                 return
             bbox_min = self._observed_pts_min.clone()
             bbox_max = self._observed_pts_max.clone()
@@ -718,9 +544,6 @@ class DCPipeline(ModifiedVanillaPipeline):
             dr = rays_lr.directions.detach()  # [mask_h, mask_w, 3]
             del current_camera, rays_lr
 
-            # Depth and accumulation are rendered at full camera resolution
-            # and bilinear-downsampled to mask resolution. Scalar fields, so
-            # bilinear is geometrically fine (unlike unit vectors).
             d = depth_world.to(self.dc_device)
             if d.dim() == 2:
                 d = d.unsqueeze(-1)  # [H, W, 1]
@@ -748,11 +571,6 @@ class DCPipeline(ModifiedVanillaPipeline):
                 & (d > 0.0)
             ).reshape(-1)
 
-            # Observation-then-build flow for bbox_source="observed".
-            # The cache stays None during the observation window; once enough
-            # samples are accumulated, `_ensure_voxel_cache()` reads the rolling
-            # AABB and builds. Until then we just observe; the DDS gradient
-            # runs with the internal mask only.
             if (
                 str(self.config.mask_voxel_cache_bbox_source).lower() == "observed"
                 and self.mask_voxel_cache is None
@@ -780,13 +598,6 @@ class DCPipeline(ModifiedVanillaPipeline):
                     else 1
                 )
                 self.mask_voxel_cache_effective_min_observations = min_observations
-                # Query + blend influence the gradient ONLY when the cache is
-                # enabled. In measure-only mode (cache-off control) we skip the
-                # blend entirely — the cache is still updated below for its
-                # cross-view statistics, but external_grad_mask stays None and
-                # external_mask_blend stays 0.0, so the edit trajectory matches
-                # the standard run exactly. (min_observations is set above
-                # regardless, since the update-log path references it.)
                 if self.config.mask_voxel_cache_enabled:
                     (
                         queried,
@@ -831,10 +642,6 @@ class DCPipeline(ModifiedVanillaPipeline):
                     external_grad_mask_confidence = cache_confidence.view(1, 1, mask_h, mask_w).to(
                         device=x0.device, dtype=x0.dtype
                     )
-                    # Scale-match the compressed cache mask to the sharp 2D mask
-                    # before fusion so the bidirectional down-term stops firing on
-                    # the edit region (see `_scale_normalize_cache_mask`). Applied
-                    # here so the debug panels below reflect the corrected mask.
                     if getattr(self.config, "mask_voxel_cache_scale_normalize", False):
                         external_grad_mask = self._scale_normalize_cache_mask(
                             external_grad_mask, external_grad_mask_valid
@@ -882,17 +689,6 @@ class DCPipeline(ModifiedVanillaPipeline):
             external_mask_blend=external_mask_blend,
         )
 
-        # ----------------------------------------------------------------
-        # 3D voxel-cache update: scatter the fresh internal per-view DC mask
-        # into the voxel grid at the same world points we queried from. The
-        # teacher is intentionally the pre-voxel-blend hybrid mask, so after
-        # warmup the cache keeps learning from the diffusion mask instead of
-        # feeding its own values back into itself.
-        #
-        # Reference: same scatter-mean-then-EMA pattern used in
-        # Panoptic Lifting (Siddiqui et al., CVPR 2023, §3.1) for cross-
-        # frame label accumulation, adapted here to soft mask values.
-        # ----------------------------------------------------------------
         if (
             self._voxel_cache_active()
             and self.mask_voxel_cache is not None
@@ -908,10 +704,6 @@ class DCPipeline(ModifiedVanillaPipeline):
             if update_source == "internal" and not getattr(
                 self, "_warned_internal_update_source", False
             ):
-                # 'internal' is the self·CA hybrid mask (set in dc.py:488 BEFORE
-                # external voxel fusion — so no self-feedback). It still couples
-                # the cache observations to the CA-mask temporal schedule, which
-                # is messier than feeding the raw self-mask. Prefer 'raw_self'.
                 print(
                     "[voxel-cache] WARNING: mask_voxel_cache_update_source='internal' "
                     "is deprecated. The CA-mask schedule leaks into cache "
@@ -920,14 +712,6 @@ class DCPipeline(ModifiedVanillaPipeline):
                 )
                 self._warned_internal_update_source = True
             if update_source == "raw_attn" and dic.get("cross_attention_mask") is not None:
-                # Lift the (unscheduled) semantic Cross-Attention mask instead of
-                # the view-dependent self-mask. The self-mask is an edit MAGNITUDE
-                # (||eps_tgt - eps_src||) that legitimately varies with viewpoint,
-                # so 3D aggregation has no view-invariant target to converge to.
-                # The CA mask is a semantic spatial prior ("where is the edited
-                # subject") and is far closer to view-invariant — the correct kind
-                # of signal to aggregate into a shared 3D grid. Resized to mask
-                # resolution to match the world points being scattered into.
                 cache_mask_input = dic["cross_attention_mask"]
                 if cache_mask_input.shape[-2:] != (mask_h, mask_w):
                     cache_mask_input = F.interpolate(
@@ -953,20 +737,6 @@ class DCPipeline(ModifiedVanillaPipeline):
                 return_per_voxel_mean=log_this_step,
                 ray_directions=mask_ray_directions,
             )
-            # Freeze the scene-relative angular denominator once the trusted
-            # population has had time to populate (typically at warmup_end).
-            # Without this, the per-call mean drifts downward as late-arriving
-            # edge voxels reach min_observations, eventually saturating the
-            # normalized factor at 1.0 everywhere (gate becomes no-op).
-            # Auto-freeze the scene-relative angular denominator at the
-            # peak of the trusted curve. The cache tracks its own running
-            # max of mean_angular_factor_at(min_views); when the peak has
-            # not improved for `patience` edit-steps, the denominator
-            # snapshots that peak. Scene-adaptive — each scene's peak
-            # location is determined by its own observation geometry,
-            # rather than a hardcoded step that over- or under-shoots
-            # depending on the rig. Empirically: clown peaks ~edit-step 100,
-            # elf peaks later; one fixed freeze step couldn't catch both.
             if (
                 self.config.mask_voxel_cache_angular_relative
                 and not self.mask_voxel_cache.angular_denominator_is_frozen
@@ -1077,11 +847,6 @@ class DCPipeline(ModifiedVanillaPipeline):
                     payload["dc_debug/voxel_cache_update_above_threshold_frac"] = float(
                         (snap >= threshold).float().mean().item()
                     ) if threshold > 0.0 else 1.0
-                # Bonus diagnostic: histogram of the 2D mask values fed into the
-                # cache, BEFORE any voxel aggregation. Lets us tell whether a
-                # mushy update histogram (Shape B) is caused by per-voxel
-                # averaging mixing fg/bg pixels along rays, or by the 2D
-                # source mask already lacking absolute confidence.
                 src_2d = new_mask.detach().float().cpu()
                 if src_2d.numel() > 0:
                     payload["dc_debug/voxel_cache_input_mask_hist"] = wandb.Histogram(
@@ -1202,6 +967,24 @@ class DCPipeline(ModifiedVanillaPipeline):
                 if voxel_cache_query_variance is not None:
                     payload["dc_debug/voxel_cache_query_variance_mean"] = float(
                         voxel_cache_query_variance.detach().float().mean().item()
+                    )
+                    max_var_gate = float(
+                        getattr(self.config, "mask_voxel_cache_max_variance", 0.0)
+                    )
+                    var_scale = max_var_gate if max_var_gate > 1e-8 else 1.0
+                    voxel_var_vis = F.interpolate(
+                        (voxel_cache_query_variance.detach().float().cpu() / var_scale).clamp(0.0, 1.0),
+                        size=(h, w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    voxel_var_img = Image.fromarray(
+                        (voxel_var_vis[0, 0].numpy() * 255).astype(np.uint8)
+                    )
+                    voxel_var_img.save(self.base_dir / f"logging/{step}_voxel_cache_variance.png")
+                    payload["dc_debug/voxel_cache_variance_map"] = wandb.Image(
+                        TF.resize(voxel_var_img, min_size),
+                        caption=f"step={step} | cross-view variance / max_variance (bright = views disagree; >= gate is damped)",
                     )
                 if external_grad_mask is not None:
                     trusted = (

@@ -254,9 +254,7 @@ class MaskVoxelCache:
         normalized = (flat_points - self.bbox_min) / (
             self.bbox_max - self.bbox_min
         ).clamp_min(1e-8)
-        # Continuous voxel-center-aligned coordinate: a point at the center of
-        # voxel i (normalized = (i + 0.5)/V) maps to c = i, so floor() picks the
-        # lower neighbor and `frac` blends toward the upper one.
+
         c = (normalized * V - 0.5).clamp(0.0, float(V - 1))
         i0 = c.floor().long().clamp_(0, V - 1)      # [N, 3]
         i1 = (i0 + 1).clamp_(0, V - 1)              # [N, 3]
