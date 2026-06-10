@@ -21,18 +21,19 @@
 #   - agreement gate max_variance. TUNE PER SCENE against the variance map
 #     (dc_debug/voxel_cache_variance_map): set it in the gap between the wanted-edit
 #     variance (low) and the over-edit-region variance (high), above the former.
-#   - variance PEAK-HOLD (mask_voxel_cache_variance_peak_decay=1.0) — the gate sees
-#     each voxel's worst-ever disagreement, so an over-edit that consolidates across
-#     views can no longer collapse the variance below the gate and re-admit itself.
-#     The per-(view,voxel) stats freeze after each view's first observation; the EW
-#     decay made the frozen value recency-biased toward late (possibly already-
-#     consolidated) samples — the peak preserves the early disagreement instead.
+#   - variance PEAK-HOLD (mask_voxel_cache_variance_peak_decay) — implemented but
+#     OFF (0.0): the warmup transient dominates the run-wide peak and zeroes
+#     confidence body-wide (clown A/B 2026-06-10). Kept in code as documented
+#     mechanism history (VoxelCacheExplained §6c).
 #   mass 0.18/pow1.0 ON, angular power 1.0 relative, warmup 100->1100 universal
 #   (current values are the clown override: 500->1200 gentle/late).
 # Per-scene status: elf FIXED (cache now neutral-to-better + MV_cos up; trilinear is
-# the lever; reproduce with peak_decay=0.0). clown TESTING: arm over-edit traced to
-# the variance-collapse feedback loop -> peak-hold + max_variance=0.015 + max_blend
-# 0.2 (0.4 doubled the push). einstein/stormtrooper/bear pending.
+# the lever). clown ARM RATE RESTORED TO BASE: the bundle max_blend 0.2 (0.4 doubled
+# the push) + max_variance 0.015 + warmup 500->1200 brings arm failures back to the
+# ~1/3 cache-off base rate (n=3); the variance map confirms the gate separates arms
+# (bright/gated) from head (dark/trusted) — the residual 1/3 is the 2D process, not
+# the cache. Next: confirm cache aliveness (confidence coverage) + MV_cos/EMV vs
+# cache-off, +3 seeds. einstein/stormtrooper/bear pending.
 # Scene is selected via the scripts/edit.sh argument, not here.
 
 DC_CUSTOM_PARAMS = dict(
@@ -128,15 +129,15 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_max_variance=0.015,           # clown: inside the head↔arm gap read off the variance map (was 0.020; head ≈ dark, arms ≈ bright)
     mask_voxel_cache_variance_decay=0.2,
     # Peak-hold of the cross-view variance: the gate sees the WORST
-    # disagreement each voxel ever showed, not the instantaneous (decayed,
-    # recency-biased) estimate. Fixes the clown-arm feedback collapse: once
-    # the cache amplifies the arms past painting, views agree, the
-    # instantaneous variance drops below any gate value, and the gate
-    # reopens — tightening max_variance alone cannot help at that point.
-    # 1.0 = pure latch; (0,1) = slow per-sample forgiveness; 0.0 = legacy
-    # instantaneous gate (use 0.0 to reproduce the elf-validated package
-    # exactly in the pending 3-way runs).
-    mask_voxel_cache_variance_peak_decay=1.0,
+    # disagreement each voxel ever showed. TESTED ON CLOWN 2026-06-10 (n=3,
+    # vs n=3 latch-off) and RETIRED at 0.0: the peak is dominated by the
+    # immature-edit warmup transient (mean peak ~0.03 >> gate 0.015), which
+    # zeroes confidence body-wide — the cache silently no-ops and runs
+    # revert to the 2D base rate. With the late warmup (500->1200) the
+    # stats accumulate uncontaminated and the plain gate already separates
+    # arms (bright) from head (dark), so the latch solves an already-solved
+    # problem. Do not re-enable without a post-maturity start for the peak.
+    mask_voxel_cache_variance_peak_decay=0.0,
 
     mask_voxel_cache_bbox_source="observed",  # observed | cameras | scene_box
     mask_voxel_cache_bbox_observe_steps=50,
