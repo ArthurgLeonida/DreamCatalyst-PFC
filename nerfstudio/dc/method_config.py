@@ -3,20 +3,36 @@
 # VOXEL_CACHE_PARAMS → DCPipelineConfig
 
 # Experiment: voxel "view-invariant force" package on top of the standard Part-1 config.
-# DC_CUSTOM_PARAMS = the proposed universal 2D config (source-blend + CA mask +
-# adaptive/asymmetric TAG + STG bump + outside/latent anchors) — the same config
-# that produced the Part-1 "standard" results.
-# VOXEL_CACHE_PARAMS = 3D cache ON, lifting raw_self (edit force). The package
-# targets the helps-clown/hurts-faces split by extracting only the view-invariant
-# component of the edit force:
-#   1. raw_self normalized by p95 (gradient_mask_raw_norm_quantile=0.95) — kills
-#      single-pixel-max jitter that faked cross-view variance.
-#   2. positive-only fusion (external_mask_interp_suppression_ratio=0.0) — the
-#      cache may add agreed-upon force, never subtract (was 0.3, eroded detail).
-#   3. tighter agreement gate (max_variance=0.02, was 0.035) — only genuinely
-#      view-consistent voxels contribute. Sweep down per measure-only baseline.
-#   mass 0.18/pow1.0, angular gate power 1.0, warmup 300/1100 unchanged.
-#   trilinear cache read implemented but OFF (isolate the above first).
+# DC_CUSTOM_PARAMS = universal 2D config (source-blend + CA mask + adaptive/asymmetric
+# TAG + STG bump + outside/latent anchors) — the Part-1 "standard" config.
+# VOXEL_CACHE_PARAMS = 3D cache ON, lifting raw_self (edit force). Active package:
+#   - raw_self p95-normalized (gradient_mask_raw_norm_quantile=0.95) — kills
+#     single-pixel-max jitter that faked cross-view variance.
+#   - positive-only fusion (external_mask_interp_suppression_ratio=0.0) — cache adds
+#     agreed force, never subtracts. Negative branch is redundant when the over-edit
+#     region is variance-distinguished (clown A/B); p_neg only weakens suppression
+#     (do not use it for over-edits).
+#   - observed-weighted trilinear readback (mask_voxel_cache_trilinear=True) —
+#     converts mask-level consistency into rendered multi-view consistency (the elf
+#     MV_cos gain), no resolution/density penalty.
+#   - decayed/EW cross-view variance (mask_voxel_cache_variance_decay=0.2) — KEPT;
+#     recency-weighting is principled (non-stationary edit) and improved elf. The EW
+#     bias is a uniform rescale, so it preserves the variance separation.
+#   - agreement gate max_variance. TUNE PER SCENE against the variance map
+#     (dc_debug/voxel_cache_variance_map): set it in the gap between the wanted-edit
+#     variance (low) and the over-edit-region variance (high), above the former.
+#   - variance PEAK-HOLD (mask_voxel_cache_variance_peak_decay=1.0) — the gate sees
+#     each voxel's worst-ever disagreement, so an over-edit that consolidates across
+#     views can no longer collapse the variance below the gate and re-admit itself.
+#     The per-(view,voxel) stats freeze after each view's first observation; the EW
+#     decay made the frozen value recency-biased toward late (possibly already-
+#     consolidated) samples — the peak preserves the early disagreement instead.
+#   mass 0.18/pow1.0 ON, angular power 1.0 relative, warmup 100->1100 universal
+#   (current values are the clown override: 500->1200 gentle/late).
+# Per-scene status: elf FIXED (cache now neutral-to-better + MV_cos up; trilinear is
+# the lever; reproduce with peak_decay=0.0). clown TESTING: arm over-edit traced to
+# the variance-collapse feedback loop -> peak-hold + max_variance=0.015 + max_blend
+# 0.2 (0.4 doubled the push). einstein/stormtrooper/bear pending.
 # Scene is selected via the scripts/edit.sh argument, not here.
 
 DC_CUSTOM_PARAMS = dict(
@@ -97,9 +113,9 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_ema_beta_auto=True,
     mask_voxel_cache_ema_beta_camera_factor=2.0,
 
-    mask_voxel_cache_warmup_start=100, # Was 300
-    mask_voxel_cache_warmup_end=1100, # Was 1100
-    mask_voxel_cache_max_blend=0.2,
+    mask_voxel_cache_warmup_start=500, # clown override: gentle/late warmup (universal: 100)
+    mask_voxel_cache_warmup_end=1200, # clown override (universal: 1100)
+    mask_voxel_cache_max_blend=0.2,   # validated package value — 0.4 doubles the cache push and accelerates the arm over-edit feedback loop; keep 0.2 while fighting over-edits
     mask_voxel_cache_accumulation_threshold=0.30,
     mask_voxel_cache_update_threshold=0.0,
 
@@ -109,8 +125,18 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_observation_fraction=0.10,
     mask_voxel_cache_min_observations_floor=5,
     mask_voxel_cache_min_observations_cap=12,      # saturates the auto-rule at N_cam > 120 for cross-scene consistency
-    mask_voxel_cache_max_variance=0.020,           # Was 0.035
+    mask_voxel_cache_max_variance=0.015,           # clown: inside the head↔arm gap read off the variance map (was 0.020; head ≈ dark, arms ≈ bright)
     mask_voxel_cache_variance_decay=0.2,
+    # Peak-hold of the cross-view variance: the gate sees the WORST
+    # disagreement each voxel ever showed, not the instantaneous (decayed,
+    # recency-biased) estimate. Fixes the clown-arm feedback collapse: once
+    # the cache amplifies the arms past painting, views agree, the
+    # instantaneous variance drops below any gate value, and the gate
+    # reopens — tightening max_variance alone cannot help at that point.
+    # 1.0 = pure latch; (0,1) = slow per-sample forgiveness; 0.0 = legacy
+    # instantaneous gate (use 0.0 to reproduce the elf-validated package
+    # exactly in the pending 3-way runs).
+    mask_voxel_cache_variance_peak_decay=1.0,
 
     mask_voxel_cache_bbox_source="observed",  # observed | cameras | scene_box
     mask_voxel_cache_bbox_observe_steps=50,

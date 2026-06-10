@@ -96,6 +96,9 @@ class DCPipelineConfig(VanillaPipelineConfig):
     mask_voxel_cache_variance_decay: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_variance_decay", 0.0
     )
+    mask_voxel_cache_variance_peak_decay: float = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_variance_peak_decay", 0.0
+    )
     mask_voxel_cache_angular_power: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_angular_power", 0.0
     )
@@ -342,6 +345,9 @@ class DCPipeline(ModifiedVanillaPipeline):
             num_views=n_views if self.config.mask_voxel_cache_confidence_enabled else None,
             variance_decay=float(
                 getattr(self.config, "mask_voxel_cache_variance_decay", 0.0)
+            ),
+            variance_peak_decay=float(
+                getattr(self.config, "mask_voxel_cache_variance_peak_decay", 0.0)
             ),
             device=self.device,
         )
@@ -805,6 +811,9 @@ class DCPipeline(ModifiedVanillaPipeline):
                     "dc_debug/voxel_cache_mean_observed_variance": float(
                         self.mask_voxel_cache.mean_observed_variance
                     ),
+                    "dc_debug/voxel_cache_mean_observed_variance_peak": float(
+                        self.mask_voxel_cache.mean_observed_variance_peak
+                    ),
                     "dc_debug/voxel_cache_mean_angular_factor": float(
                         self.mask_voxel_cache.mean_angular_factor
                     ),
@@ -982,9 +991,20 @@ class DCPipeline(ModifiedVanillaPipeline):
                         (voxel_var_vis[0, 0].numpy() * 255).astype(np.uint8)
                     )
                     voxel_var_img.save(self.base_dir / f"logging/{step}_voxel_cache_variance.png")
+                    peak_held = (
+                        float(
+                            getattr(
+                                self.config,
+                                "mask_voxel_cache_variance_peak_decay",
+                                0.0,
+                            )
+                        )
+                        > 0.0
+                    )
+                    var_kind = "peak-held cross-view variance" if peak_held else "cross-view variance"
                     payload["dc_debug/voxel_cache_variance_map"] = wandb.Image(
                         TF.resize(voxel_var_img, min_size),
-                        caption=f"step={step} | cross-view variance / max_variance (bright = views disagree; >= gate is damped)",
+                        caption=f"step={step} | {var_kind} / max_variance (bright = views disagree; >= gate is damped)",
                     )
                 if external_grad_mask is not None:
                     trusted = (

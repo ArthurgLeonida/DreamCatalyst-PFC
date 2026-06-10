@@ -52,6 +52,7 @@ class MaskVoxelCache:
         fallback_value: float = 0.5,
         num_views: Optional[int] = None,
         variance_decay: float = 0.0,
+        variance_peak_decay: float = 0.0,
         device: Optional[torch.device] = None,
     ) -> None:
         """
@@ -81,6 +82,30 @@ class MaskVoxelCache:
                 Note: the EW estimator is biased low by ≈ (1 − value), so its
                 absolute scale differs from the cumulative one — re-read
                 `query_variance_mean` and re-tune `max_variance` after enabling.
+            variance_peak_decay: 0.0 (default) = off; the variance gate in
+                `query` sees the instantaneous variance estimate (legacy
+                behavior). A value in (0, 1] enables a per-voxel PEAK-HOLD of
+                the variance: on every new per-view sample the peak updates as
+                    peak ← max(peak · variance_peak_decay, variance_now)
+                and `query` gates on max(variance_now, peak). 1.0 is a pure
+                latch ("once views disagreed about this voxel, never trust it
+                again"); values just below 1.0 forgive old disagreement one
+                decay step per new-view sample. Note the decay is NOT
+                time-based: stats samples fire only on each view's first
+                observation, so a voxel receives at most num_views decay
+                steps and the peak freezes once every covering view has
+                first-observed it.
+                Why this exists: the per-(view, voxel) statistics update only on
+                each view's FIRST observation, and with `variance_decay` > 0
+                the estimate is recency-biased — so when an over-edit
+                consolidates across views while first observations are still
+                arriving, the late agreeing samples erase the early
+                disagreement and the frozen variance ends LOW. The gate then
+                trusts exactly the voxels it was meant to exclude (the clown
+                arm over-edit failure: cache amplifies arms → views agree →
+                variance collapses → gate reopens → more amplification). The
+                peak preserves the worst-case disagreement seen during
+                accumulation, making the gate immune to that feedback collapse.
             device: torch device. Defaults to current CUDA device.
         """
         self.device = device if device is not None else torch.device(
@@ -94,6 +119,9 @@ class MaskVoxelCache:
         # 0.0 = cumulative Welford variance; (0,1) = exponentially-weighted
         # variance with this as the new-sample weight. See __init__ docstring.
         self.variance_decay = min(max(float(variance_decay), 0.0), 0.999)
+        # 0.0 = gate on the instantaneous variance (legacy); (0,1] = gate on a
+        # peak-held variance with this per-sample retention. See __init__.
+        self.variance_peak_decay = min(max(float(variance_peak_decay), 0.0), 1.0)
         self.num_views = int(num_views) if num_views is not None and int(num_views) > 0 else None
 
         V = self.resolution
@@ -170,6 +198,16 @@ class MaskVoxelCache:
             dtype=torch.float32,
         )
         self.running_m2 = torch.zeros(
+            (V, V, V),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        # Peak-held cross-view variance (see `variance_peak_decay` in
+        # __init__). Updated alongside the running statistics; read by
+        # `query` when peak-holding is enabled. Kept allocated even when
+        # disabled — one extra fp32 grid (same size as `running_m2`),
+        # which avoids Optional/None handling on the access paths.
+        self.running_var_peak = torch.zeros(
             (V, V, V),
             device=self.device,
             dtype=torch.float32,
@@ -538,13 +576,33 @@ class MaskVoxelCache:
                 )
                 flat_running_mean[stats_idx] = new_mean
                 flat_running_m2[stats_idx] = new_var
+                inst_var = new_var
             else:
                 # Cumulative Welford: every distinct view weighted equally.
                 new_count = old_count + 1.0
                 new_mean = old_mean + delta / new_count
                 delta2 = stats_values - new_mean
                 flat_running_mean[stats_idx] = new_mean
-                flat_running_m2[stats_idx] = flat_running_m2[stats_idx] + delta * delta2
+                new_m2 = flat_running_m2[stats_idx] + delta * delta2
+                flat_running_m2[stats_idx] = new_m2
+                # Sample variance after this update; 0 until a voxel has ≥2
+                # views, matching the read-side convention in `query`.
+                inst_var = torch.where(
+                    new_count > 1.0,
+                    new_m2 / (new_count - 1.0).clamp_min(1.0),
+                    torch.zeros_like(new_m2),
+                )
+            # Peak-hold the variance estimate (see `variance_peak_decay` in
+            # __init__): remember the largest cross-view disagreement each
+            # voxel has shown, so late-arriving agreement (e.g. an over-edit
+            # that consolidated across views) cannot erase early disagreement
+            # from the gate's view.
+            if self.variance_peak_decay > 0.0:
+                flat_var_peak = self.running_var_peak.view(-1)
+                flat_var_peak[stats_idx] = torch.maximum(
+                    flat_var_peak[stats_idx] * self.variance_peak_decay,
+                    inst_var,
+                )
 
         # Angular-diversity update: accumulate this view's per-voxel mean
         # direction into the running view-direction sum. Same gating as
@@ -605,6 +663,10 @@ class MaskVoxelCache:
         counts, and cross-view variance estimates. Confidence is zero until a
         voxel has at least `min_observations`; if `max_variance` is provided,
         it then decays linearly to zero as variance approaches that threshold.
+        When the cache was constructed with `variance_peak_decay` > 0, the
+        variance used for the gate AND returned here is the element-wise max
+        of the instantaneous estimate and the peak-held variance, so the
+        variance-map diagnostic always shows exactly what the gate sees.
 
         `angular_power` (≥ 0) raises the per-voxel angular-diversity factor
         `(1 − ‖mean_view_dir‖)` to that power before multiplying into the
@@ -672,6 +734,13 @@ class MaskVoxelCache:
                 m2 / (counts - 1.0).clamp_min(1.0),
                 torch.zeros_like(m2),
             )
+        if self.variance_peak_decay > 0.0:
+            # Peak-hold: the gate (and the returned/visualized variance) sees
+            # the worst disagreement this voxel ever showed, not just the
+            # current estimate — immune to the feedback collapse where an
+            # amplified over-edit consolidates and the instantaneous variance
+            # drops below the gate. Nearest-voxel read, like all trust stats.
+            variance = torch.maximum(variance, self.running_var_peak[ix, iy, iz])
 
         # Replace unobserved or out-of-bounds with fallback.
         valid = observed & in_bounds
@@ -830,6 +899,21 @@ class MaskVoxelCache:
         else:
             variance = self.running_m2[valid] / (counts[valid] - 1.0).clamp_min(1.0)
         return float(variance.mean().item())
+
+    @property
+    def mean_observed_variance_peak(self) -> float:
+        """Mean peak-held cross-view variance over voxels with at least two
+        unique views. 0.0 when peak-holding is disabled. Compare against
+        `mean_observed_variance` to see how much disagreement the peak is
+        retaining that the instantaneous estimate has already forgotten.
+        """
+        if self.variance_peak_decay <= 0.0:
+            return 0.0
+        counts = self.unique_view_count.float()
+        valid = counts > 1.0
+        if not valid.any():
+            return 0.0
+        return float(self.running_var_peak[valid].mean().item())
 
     def try_auto_freeze_angular_denominator(
         self,
