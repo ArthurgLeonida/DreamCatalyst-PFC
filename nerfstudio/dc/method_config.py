@@ -77,6 +77,17 @@ DC_CUSTOM_PARAMS = dict(
     external_mask_interp_suppression_ratio=0.0,
     external_mask_negative_variance_power=0.0,
     external_mask_screen_self_boost_lambda=1.0,
+    # LAST-TRY clown experiment (2026-06-10): contested-region suppression.
+    # fused -= warmup_blend * ratio * contested * M, where contested =
+    # valid * (n>=n_min) * min(1, var/max_variance) from the voxel cache.
+    # Unlike the up/down branches (confidence-gated -> abstain on distrusted
+    # voxels), this ACTIVELY damps the 2D mask where views disagree (the
+    # arms), which also strengthens the (1-M)-scaled anchors there (skin
+    # recovery). Max damping at ratio=1.0 is warmup_blend=0.2, i.e. <=20%.
+    # Kill criteria: (a) dc_debug/voxel_cache_contested_map must light up the
+    # arms (if not, mechanism falsified -> stop, set 0.0); (b) if map is
+    # right but arm rate doesn't drop at n=3, one follow-up at 2.0, then stop.
+    external_mask_contested_suppression_ratio=1.0,
 
     # ---------------------------------------------------------------------
     # 2. TAG branch — OFF (eta_tag=1 → identity)

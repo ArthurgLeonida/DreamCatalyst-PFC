@@ -163,6 +163,16 @@ class DCConfig:
     external_mask_screen_self_boost_lambda: float = 1.0
     external_mask_interp_suppression_ratio: float = 0.3
     external_mask_negative_variance_power: float = 0.0
+    # Contested-region suppression: damp the 2D mask where the voxel cache
+    # has enough cross-view evidence AND high cross-view variance (the
+    # "contested" map from the pipeline). Unlike the up/down branches —
+    # which are multiplied by confidence and therefore abstain exactly
+    # where the gate distrusts — this term uses distrust as an ACTIVE
+    # suppression signal: fused -= blend · ratio · contested · M.
+    # Suppressing M both damps the edit force and strengthens the
+    # (1 − M)-scaled preservation anchors, pulling contested regions back
+    # toward the source. 0.0 = off (legacy behavior).
+    external_mask_contested_suppression_ratio: float = 0.0
 
 
 class DC(object):
@@ -382,6 +392,7 @@ class DC(object):
         external_grad_mask=None,
         external_grad_mask_valid=None,
         external_grad_mask_confidence=None,
+        external_grad_mask_contested=None,
         external_mask_blend=0.0,
     ):
         device = self.device
@@ -556,6 +567,24 @@ class DC(object):
                         align_corners=False,
                     )
                 confidence = confidence.clamp(0.0, 1.0)
+            contested = None
+            if external_grad_mask_contested is not None:
+                contested = external_grad_mask_contested
+                if contested.dim() == 2:
+                    contested = contested.unsqueeze(0).unsqueeze(0)
+                elif contested.dim() == 3:
+                    contested = contested.unsqueeze(0)
+                contested = contested.to(
+                    device=eps_raw["tgt"].device, dtype=eps_raw["tgt"].dtype
+                )
+                if contested.shape[-2:] != target_shape:
+                    contested = F.interpolate(
+                        contested,
+                        size=target_shape,
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                contested = contested.clamp(0.0, 1.0)
             blend_tensor = blend if confidence is None else blend * confidence
             if grad_mask is None:
                 grad_mask = ext
@@ -623,7 +652,25 @@ class DC(object):
                         * float(getattr(self.config, "external_mask_interp_suppression_ratio", 0.4))
                         * diff.clamp_max(0.0)
                     )
-                    fused = grad_mask + up + down
+                    # Contested-region suppression. Uses the scalar warmup
+                    # blend (NOT blend_map): blend_map carries confidence,
+                    # which is ~0 exactly where the variance gate distrusts —
+                    # the regions this term must act on. The damp clamp bounds
+                    # this term to at most M; the downstream mask clamp
+                    # guarantees the final [0, 1] range.
+                    contested_ratio = float(
+                        getattr(
+                            self.config,
+                            "external_mask_contested_suppression_ratio",
+                            0.0,
+                        )
+                    )
+                    if contested_ratio > 0.0 and contested is not None:
+                        damp = (blend * contested_ratio * contested).clamp(0.0, 1.0)
+                        down_contested = -damp * grad_mask
+                    else:
+                        down_contested = 0.0
+                    fused = grad_mask + up + down + down_contested
                 elif mode == "screen":
                     contribution = blend_tensor * ext * (1.0 - grad_mask)
 

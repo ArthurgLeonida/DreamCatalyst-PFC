@@ -503,6 +503,7 @@ class DCPipeline(ModifiedVanillaPipeline):
         external_grad_mask = None
         external_grad_mask_valid = None
         external_grad_mask_confidence = None
+        external_grad_mask_contested = None
         external_mask_blend = 0.0
         mask_world_points = None
         mask_world_points_valid = None
@@ -654,6 +655,22 @@ class DCPipeline(ModifiedVanillaPipeline):
                         )
                     voxel_cache_query_count = cache_count.view(1, 1, mask_h, mask_w)
                     voxel_cache_query_variance = cache_variance.view(1, 1, mask_h, mask_w)
+                    # Contested map for the active suppression branch in DC:
+                    # contested = valid · 1[n ≥ n_min] · min(1, σ²/σ²_max).
+                    # Requires enough cross-view evidence (the count gate) so
+                    # that "high variance" means genuine disagreement, not an
+                    # immature estimate. Computed regardless of the DC-side
+                    # ratio so the diagnostic map is always available.
+                    max_var_gate = float(self.config.mask_voxel_cache_max_variance)
+                    if self.config.mask_voxel_cache_confidence_enabled and max_var_gate > 1e-8:
+                        contested = (
+                            cache_valid.float()
+                            * (cache_count.float() >= float(min_observations)).float()
+                            * (cache_variance / max_var_gate).clamp(0.0, 1.0)
+                        )
+                        external_grad_mask_contested = contested.view(
+                            1, 1, mask_h, mask_w
+                        ).to(device=x0.device, dtype=x0.dtype)
                     external_mask_blend = self._voxel_cache_warmup_blend(voxel_cache_edit_step)
 
             if self.use_wandb and step % self.config.log_step == 0:
@@ -692,6 +709,7 @@ class DCPipeline(ModifiedVanillaPipeline):
             external_grad_mask=external_grad_mask,
             external_grad_mask_valid=external_grad_mask_valid,
             external_grad_mask_confidence=external_grad_mask_confidence,
+            external_grad_mask_contested=external_grad_mask_contested,
             external_mask_blend=external_mask_blend,
         )
 
@@ -1005,6 +1023,30 @@ class DCPipeline(ModifiedVanillaPipeline):
                     payload["dc_debug/voxel_cache_variance_map"] = wandb.Image(
                         TF.resize(voxel_var_img, min_size),
                         caption=f"step={step} | {var_kind} / max_variance (bright = views disagree; >= gate is damped)",
+                    )
+                if external_grad_mask_contested is not None:
+                    contested_f = external_grad_mask_contested.detach().float().cpu()
+                    payload["dc_debug/voxel_cache_contested_mean"] = float(
+                        contested_f.mean().item()
+                    )
+                    contested_vis = F.interpolate(
+                        contested_f,
+                        size=(h, w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    contested_img = Image.fromarray(
+                        (contested_vis[0, 0].numpy() * 255).astype(np.uint8)
+                    )
+                    contested_img.save(
+                        self.base_dir / f"logging/{step}_voxel_cache_contested.png"
+                    )
+                    payload["dc_debug/voxel_cache_contested_map"] = wandb.Image(
+                        TF.resize(contested_img, min_size),
+                        caption=(
+                            f"step={step} | contested = valid * (n>=n_min) * min(1, var/max_variance); "
+                            "bright = suppressed when external_mask_contested_suppression_ratio > 0"
+                        ),
                     )
                 if external_grad_mask is not None:
                     trusted = (

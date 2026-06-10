@@ -149,6 +149,9 @@ if enabled:
     neg_var_p = dc.get('external_mask_negative_variance_power', 0.0)
     if neg_var_p > 0.0:
         print(f"   {branch} neg var p:  {neg_var_p}")
+    contested_r = dc.get('external_mask_contested_suppression_ratio', 0.0)
+    if contested_r > 0.0:
+        print(f"   {branch} contested:  {contested_r} (suppress M where var>=gate)")
     print(f"   {branch} update src: {voxel.get('mask_voxel_cache_update_source', 'internal')}")
     ang_p = voxel.get('mask_voxel_cache_angular_power', 0.0)
     if ang_p > 0.0:
