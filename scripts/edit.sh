@@ -128,9 +128,6 @@ if enabled:
             obs = str(voxel["mask_voxel_cache_min_observations"])
         vdecay = voxel.get('mask_voxel_cache_variance_decay', 0.0)
         var_mode = f"EW(a={vdecay})" if vdecay and vdecay > 0.0 else "Welford"
-        vpeak = voxel.get('mask_voxel_cache_variance_peak_decay', 0.0)
-        if vpeak and vpeak > 0.0:
-            var_mode += f"+peak({vpeak})"
         print(
             f"   {branch} trust:      "
             f"obs>={obs}, "
@@ -149,9 +146,6 @@ if enabled:
     neg_var_p = dc.get('external_mask_negative_variance_power', 0.0)
     if neg_var_p > 0.0:
         print(f"   {branch} neg var p:  {neg_var_p}")
-    contested_r = dc.get('external_mask_contested_suppression_ratio', 0.0)
-    if contested_r > 0.0:
-        print(f"   {branch} contested:  {contested_r} (suppress M where var>=gate)")
     print(f"   {branch} update src: {voxel.get('mask_voxel_cache_update_source', 'internal')}")
     ang_p = voxel.get('mask_voxel_cache_angular_power', 0.0)
     if ang_p > 0.0:

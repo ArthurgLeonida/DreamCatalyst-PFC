@@ -2,38 +2,28 @@
 # DC_CUSTOM_PARAMS → DCConfig
 # VOXEL_CACHE_PARAMS → DCPipelineConfig
 
-# Experiment: voxel "view-invariant force" package on top of the standard Part-1 config.
 # DC_CUSTOM_PARAMS = universal 2D config (source-blend + CA mask + adaptive/asymmetric
 # TAG + STG bump + outside/latent anchors) — the Part-1 "standard" config.
-# VOXEL_CACHE_PARAMS = 3D cache ON, lifting raw_self (edit force). Active package:
-#   - raw_self p95-normalized (gradient_mask_raw_norm_quantile=0.95) — kills
-#     single-pixel-max jitter that faked cross-view variance.
-#   - positive-only fusion (external_mask_interp_suppression_ratio=0.0) — cache adds
-#     agreed force, never subtracts. Negative branch is redundant when the over-edit
-#     region is variance-distinguished (clown A/B); p_neg only weakens suppression
-#     (do not use it for over-edits).
-#   - observed-weighted trilinear readback (mask_voxel_cache_trilinear=True) —
-#     converts mask-level consistency into rendered multi-view consistency (the elf
-#     MV_cos gain), no resolution/density penalty.
-#   - decayed/EW cross-view variance (mask_voxel_cache_variance_decay=0.2) — KEPT;
-#     recency-weighting is principled (non-stationary edit) and improved elf. The EW
-#     bias is a uniform rescale, so it preserves the variance separation.
-#   - agreement gate max_variance. TUNE PER SCENE against the variance map
-#     (dc_debug/voxel_cache_variance_map): set it in the gap between the wanted-edit
-#     variance (low) and the over-edit-region variance (high), above the former.
-#   - variance PEAK-HOLD (mask_voxel_cache_variance_peak_decay) — implemented but
-#     OFF (0.0): the warmup transient dominates the run-wide peak and zeroes
-#     confidence body-wide (clown A/B 2026-06-10). Kept in code as documented
-#     mechanism history (VoxelCacheExplained §6c).
-#   mass 0.18/pow1.0 ON, angular power 1.0 relative, warmup 100->1100 universal
-#   (current values are the clown override: 500->1200 gentle/late).
-# Per-scene status: elf FIXED (cache now neutral-to-better + MV_cos up; trilinear is
-# the lever). clown ARM RATE RESTORED TO BASE: the bundle max_blend 0.2 (0.4 doubled
-# the push) + max_variance 0.015 + warmup 500->1200 brings arm failures back to the
-# ~1/3 cache-off base rate (n=3); the variance map confirms the gate separates arms
-# (bright/gated) from head (dark/trusted) — the residual 1/3 is the 2D process, not
-# the cache. Next: confirm cache aliveness (confidence coverage) + MV_cos/EMV vs
-# cache-off, +3 seeds. einstein/stormtrooper/bear pending.
+# VOXEL_CACHE_PARAMS = the Part-2 3D cache, lifting raw_self (edit force) into a voxel
+# grid for cross-view-consistent localization. Active package:
+#   - raw_self p95-normalized (gradient_mask_raw_norm_quantile=0.95) — robust per-frame
+#     scale that avoids single-pixel-max jitter inflating cross-view variance.
+#   - positive-only fusion (external_mask_interp_suppression_ratio=0.0): the cache adds
+#     agreed-upon force, never subtracts.
+#   - observed-weighted trilinear readback (mask_voxel_cache_trilinear=True) — converts
+#     mask-level consistency into rendered multi-view consistency (the elf MV_cos gain).
+#   - decayed/EW cross-view variance (mask_voxel_cache_variance_decay=0.2): recency-
+#     weighted, principled for the non-stationary edit; re-tune max_variance per scene.
+#   - agreement gate max_variance: TUNE PER SCENE against the variance map
+#     (dc_debug/voxel_cache_variance_map), in the gap between the wanted-edit variance
+#     (low) and the over-edit-region variance (high), above the former.
+#   - confidence gate (count + variance + angular diversity + mass), scale-matching,
+#     warmup-ramped blend (max_blend).
+# STG note: the cache config uses stg_scale=3.25 (vs 3.5 for the cache-off Part-1 runs)
+# as a design rebalancing — the cache adds agreement-gated localization support, so the
+# guidance amplifier is reduced slightly to avoid double-amplifying the edit signal.
+# The editability difference is within the run-to-run noise floor; this is a config
+# choice, not a measured win. Set stg_scale=3.5 to reproduce Part-1.
 # Scene is selected via the scripts/edit.sh argument, not here.
 
 DC_CUSTOM_PARAMS = dict(
@@ -57,9 +47,6 @@ DC_CUSTOM_PARAMS = dict(
     gradient_mask_ema_beta_auto=True,
     gradient_mask_ema_beta_camera_factor=2.0,
     gradient_mask_warmup=0,
-    # Robust per-frame scale for the raw_self cache input: divide by p95 instead
-    # of the single-pixel max so one hot pixel can't deflate the whole frame and
-    # inject spurious cross-view variance into the voxel cache. 1.0 = legacy max.
     gradient_mask_raw_norm_quantile=0.95,
 
     cross_attention_mask_enabled=True,
@@ -77,20 +64,9 @@ DC_CUSTOM_PARAMS = dict(
     external_mask_interp_suppression_ratio=0.0,
     external_mask_negative_variance_power=0.0,
     external_mask_screen_self_boost_lambda=1.0,
-    # LAST-TRY clown experiment (2026-06-10): contested-region suppression.
-    # fused -= warmup_blend * ratio * contested * M, where contested =
-    # valid * (n>=n_min) * min(1, var/max_variance) from the voxel cache.
-    # Unlike the up/down branches (confidence-gated -> abstain on distrusted
-    # voxels), this ACTIVELY damps the 2D mask where views disagree (the
-    # arms), which also strengthens the (1-M)-scaled anchors there (skin
-    # recovery). Max damping at ratio=1.0 is warmup_blend=0.2, i.e. <=20%.
-    # Kill criteria: (a) dc_debug/voxel_cache_contested_map must light up the
-    # arms (if not, mechanism falsified -> stop, set 0.0); (b) if map is
-    # right but arm rate doesn't drop at n=3, one follow-up at 2.0, then stop.
-    external_mask_contested_suppression_ratio=1.0,
 
     # ---------------------------------------------------------------------
-    # 2. TAG branch — OFF (eta_tag=1 → identity)
+    # 2. TAG branch — ON (adaptive + asymmetric; eta_tag>1 amplifies tangential)
     # ---------------------------------------------------------------------
     eta_tag=1.2,
     adaptive_tag=True,
@@ -100,7 +76,7 @@ DC_CUSTOM_PARAMS = dict(
     # 3. STG / PAG branch
     # ---------------------------------------------------------------------
     stg_enabled=True,
-    stg_scale=3.5,
+    stg_scale=3.25,  # cache-on (Part 2) rebalancing; use 3.5 for cache-off Part-1 runs
     stg_skip_layers=[2],
     stg_schedule_enabled=True,
     stg_schedule_start_ratio=0, #  0.3 for decay
@@ -137,18 +113,8 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_observation_fraction=0.10,
     mask_voxel_cache_min_observations_floor=5,
     mask_voxel_cache_min_observations_cap=12,      # saturates the auto-rule at N_cam > 120 for cross-scene consistency
-    mask_voxel_cache_max_variance=0.015,           # clown: inside the head↔arm gap read off the variance map (was 0.020; head ≈ dark, arms ≈ bright)
+    mask_voxel_cache_max_variance=0.02,           # tune per scene from the variance map: set in the wanted-edit↔over-edit gap (head ≈ dark, arms ≈ bright)
     mask_voxel_cache_variance_decay=0.2,
-    # Peak-hold of the cross-view variance: the gate sees the WORST
-    # disagreement each voxel ever showed. TESTED ON CLOWN 2026-06-10 (n=3,
-    # vs n=3 latch-off) and RETIRED at 0.0: the peak is dominated by the
-    # immature-edit warmup transient (mean peak ~0.03 >> gate 0.015), which
-    # zeroes confidence body-wide — the cache silently no-ops and runs
-    # revert to the 2D base rate. With the late warmup (500->1200) the
-    # stats accumulate uncontaminated and the plain gate already separates
-    # arms (bright) from head (dark), so the latch solves an already-solved
-    # problem. Do not re-enable without a post-maturity start for the peak.
-    mask_voxel_cache_variance_peak_decay=0.0,
 
     mask_voxel_cache_bbox_source="observed",  # observed | cameras | scene_box
     mask_voxel_cache_bbox_observe_steps=50,
