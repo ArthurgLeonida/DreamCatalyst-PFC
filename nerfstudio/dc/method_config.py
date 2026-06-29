@@ -55,7 +55,7 @@ DC_CUSTOM_PARAMS = dict(
     cross_attention_mask_blur=0.5,
     cross_attention_mask_gamma=1.2,
     cross_attention_mask_weight_schedule_enabled=True,
-    cross_attention_mask_weight_schedule_power=0.75, # Most of the experiments use 0.75
+    cross_attention_mask_weight_schedule_power=0.75, 
 
     latent_mean_anchor_weight=0.005,
 
@@ -79,8 +79,8 @@ DC_CUSTOM_PARAMS = dict(
     stg_scale=3.0,  # cache-on (Part 2) rebalancing; use 3.5 for cache-off Part-1 runs
     stg_skip_layers=[2],
     stg_schedule_enabled=True,
-    stg_schedule_start_ratio=0, #  0.3 for decay
-    stg_schedule_end_ratio=0.8, # 0.8 for decay
+    stg_schedule_start_ratio=0, 
+    stg_schedule_end_ratio=0.8, 
     stg_schedule_mode="bump", # bump | growth | decay
     stg_bump_peak_ratio=0.5,
     stg_edit_strength_adaptive=True,
@@ -101,9 +101,9 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_ema_beta_auto=True,
     mask_voxel_cache_ema_beta_camera_factor=2.0,
 
-    mask_voxel_cache_warmup_start=500, # clown override: gentle/late warmup (universal: 100)
-    mask_voxel_cache_warmup_end=1200, # clown override (universal: 1100)
-    mask_voxel_cache_max_blend=0.2,   # validated package value — 0.4 doubles the cache push and accelerates the arm over-edit feedback loop; keep 0.2 while fighting over-edits
+    mask_voxel_cache_warmup_start=500, 
+    mask_voxel_cache_warmup_end=1200, 
+    mask_voxel_cache_max_blend=0.2,   
     mask_voxel_cache_accumulation_threshold=0.30,
     mask_voxel_cache_update_threshold=0.0,
 
@@ -112,8 +112,8 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_min_observations_auto=True,
     mask_voxel_cache_observation_fraction=0.10,
     mask_voxel_cache_min_observations_floor=5,
-    mask_voxel_cache_min_observations_cap=12,      # saturates the auto-rule at N_cam > 120 for cross-scene consistency
-    mask_voxel_cache_max_variance=0.02,           # tune per scene from the variance map: set in the wanted-edit↔over-edit gap (head ≈ dark, arms ≈ bright)
+    mask_voxel_cache_min_observations_cap=12,      
+    mask_voxel_cache_max_variance=0.02,           
     mask_voxel_cache_variance_decay=0.2,
 
     mask_voxel_cache_bbox_source="observed",  # observed | cameras | scene_box
@@ -122,16 +122,16 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_bbox_inflation=0.2,
 
     mask_voxel_cache_update_source="raw_self", # raw_self | internal | raw_attn 
-    mask_voxel_cache_trilinear=True, # Test with True
+    mask_voxel_cache_trilinear=True,
 
-    mask_voxel_cache_angular_power=1.0,    # was 1.0
+    mask_voxel_cache_angular_power=1.0,    
     mask_voxel_cache_min_angular_factor=0.0,
     mask_voxel_cache_angular_relative=True,
     mask_voxel_cache_angular_freeze_patience=100,
     mask_voxel_cache_angular_freeze_warmup=50,
 
-    mask_voxel_cache_mass_threshold=0.18,   # was 0.15 | 0.18 | 0.22
-    mask_voxel_cache_mass_power=1.0,       # was 1.0 | 1.5 | 2.0
+    mask_voxel_cache_mass_threshold=0.18,   
+    mask_voxel_cache_mass_power=1.0,       
 
     mask_voxel_cache_scale_normalize=True,
     mask_voxel_cache_scale_normalize_quantile=0.95,
