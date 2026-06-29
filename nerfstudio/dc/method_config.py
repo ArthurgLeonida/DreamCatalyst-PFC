@@ -19,11 +19,11 @@
 #     (low) and the over-edit-region variance (high), above the former.
 #   - confidence gate (count + variance + angular diversity + mass), scale-matching,
 #     warmup-ramped blend (max_blend).
-# STG note: the cache config uses stg_scale=3.25 (vs 3.5 for the cache-off Part-1 runs)
+# STG note: the cache config uses stg_scale=3.0 (vs 3.5 for the cache-off Part-1 runs)
 # as a design rebalancing — the cache adds agreement-gated localization support, so the
-# guidance amplifier is reduced slightly to avoid double-amplifying the edit signal.
-# The editability difference is within the run-to-run noise floor; this is a config
-# choice, not a measured win. Set stg_scale=3.5 to reproduce Part-1.
+# guidance amplifier is reduced to avoid double-amplifying the edit signal. The
+# editability difference is within the run-to-run noise floor; this is a config choice,
+# not a measured win. Set stg_scale=3.5 to reproduce Part-1.
 # Scene is selected via the scripts/edit.sh argument, not here.
 
 DC_CUSTOM_PARAMS = dict(
@@ -76,7 +76,7 @@ DC_CUSTOM_PARAMS = dict(
     # 3. STG / PAG branch
     # ---------------------------------------------------------------------
     stg_enabled=True,
-    stg_scale=3.25,  # cache-on (Part 2) rebalancing; use 3.5 for cache-off Part-1 runs
+    stg_scale=3.0,  # cache-on (Part 2) rebalancing; use 3.5 for cache-off Part-1 runs
     stg_skip_layers=[2],
     stg_schedule_enabled=True,
     stg_schedule_start_ratio=0, #  0.3 for decay

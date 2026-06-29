@@ -1,13 +1,44 @@
 # DreamCatalyst-PFC
 
-Text-driven 3D scene editing built on top of **DreamCatalyst** (DDS-based score distillation). This undergraduate thesis project (UFSC, PFC) focuses on **NeRF-based** reconstructions — the 3D Gaussian Splatting path is supported for completeness but is not the primary target.
+> **Extending DreamCatalyst for text-driven 3D editing** — adaptive guidance and spatial localization in neural radiance fields.
 
-> Kim et al. *"DreamCatalyst: Fast and High-Quality 3D Editing via Controlling Editability and Identity Preservation"*. ICLR 2025. [arXiv:2407.11394](https://arxiv.org/abs/2407.11394)
+Text-driven 3D scene editing built on top of **DreamCatalyst** (DDS-based score distillation). This is the undergraduate final project (PFC) of **Arthur Gislon Leonida** at **UFSC**, also presented as the final project for the **Computer Vision** course (Prof. **Aldo von Wangenheim**). The work focuses on **NeRF-based** reconstructions; the 3D Gaussian Splatting path is supported for completeness but is not the primary target.
+
+> Base method — Kim et al. *"DreamCatalyst: Fast and High-Quality 3D Editing via Controlling Editability and Identity Preservation"*. ICLR 2025. [arXiv:2407.11394](https://arxiv.org/abs/2407.11394)
 
 The work is organized as **two independent contributions** sharing one repository:
 
 - **Part 1 — Guidance & localization.** Universal-config improvements to DreamCatalyst's DDS guidance: TAG family, STG with scheduling, self-derived relevance mask, source-blended localization, cross-attention semantic mask, outside-mask background anchor, latent-mean anchor. Evaluated as a single config across multiple scenes.
 - **Part 2 — 3D voxel cache.** An optional non-parametric voxel grid that aggregates per-view diffusion masks across views to enforce 3D consistency. Layered on top of the Part 1 config. See [`docs/VoxelCacheExplained.md`](docs/VoxelCacheExplained.md).
+
+## Results at a glance
+
+Single **universal configuration**, 8 edits across 5 scenes, mean over `n = 3` seeds, NVIDIA H100, `guidance_scale = 7.5`. **Bold** marks the better mean.
+
+**Part 1 — DreamCatalyst → Proposed**
+
+| Metric | DreamCatalyst | Proposed |
+|---|---|---|
+| CLIP-dir ↑ (editability) | 0.151 | 0.152 |
+| CLIP-I ↑ (content) | 0.664 | **0.684** |
+| SSIM ↑ (identity) | 0.825 | **0.854** |
+| LPIPS ↓ (perceptual) | 0.272 | **0.247** |
+| MV-cos ↑ (consistency) | 0.925 | 0.922 |
+
+Headline: **better preservation at matched editability** — SSIM improves on 8/8 edits, LPIPS drops on 7/8 (−9.2% mean), while CLIP-dir stays essentially tied.
+
+**Part 2 — 2D config → + voxel cache**
+
+| Metric | 2D | + Voxel cache |
+|---|---|---|
+| CLIP-dir ↑ | 0.152 | 0.153 |
+| CLIP-I ↑ | 0.684 | 0.685 |
+| SSIM ↑ | 0.854 | 0.854 |
+| LPIPS ↓ | 0.247 | 0.244 |
+| MV-cos ↑ | 0.922 | 0.919 |
+| EditMaskVariance_3D ↓ | 0.0166 | 0.0164 |
+
+The cache is **metric-neutral** in aggregate; its benefit is qualitative — residual edit failures become **coherent across views** (edited in all views or none) rather than flickering per angle.
 
 ## Pipeline
 
@@ -145,10 +176,10 @@ Comparisons across runs must use the **same `downscale`** for reconstruction, ed
 
 ## Datasets
 
-Scenes are sourced from prior 3D-editing work and re-processed locally through `scripts/process_data.sh`:
-
-- **DreamCatalyst** release (which redistributes scenes originally introduced for **Posterior Distillation Sampling**, PDS).
-- **Instruct-NeRF2NeRF** (e.g. the `campsite` / `bear` / outdoor captures).
+| Dataset | Link |
+|---|---|
+| 🗂️ Dataset — Instruct-NeRF2NeRF | [Google Drive](https://drive.google.com/drive/folders/1v4MLNoSwxvSlWb26xvjxeoHpgjhi_s-s) |
+| 🗂️ Dataset — PDS scenes | [OneDrive](https://onedrive.live.com/?id=%2Fpersonal%2F0ce615b143fc4bdc%2FDocuments%2Frelease_data%2FPDS%2Fdata&listurl=%2Fpersonal%2F0ce615b143fc4bdc%2FDocuments) |
 
 Please cite the original sources if you use these scenes.
 
