@@ -79,31 +79,7 @@ class DCConfig:
     stg_schedule_mode: str = "bump"
     stg_bump_peak_ratio: float = 0.5
     stg_edit_strength_adaptive: bool = True
-    # Weak-model perturbation method. "stg" preserves the current behavior
-    # (skip QK attention, V passes through). "pag" replaces self-attention
-    # with the identity over spatial positions, perturbing spatial coherence
-    # instead of cross-attention. PAG amplifies structural-edit signal while
-    # leaving the symmetric-body semantic prior untouched, addressing STG's
-    # ghost-feature artifact on invention scenes (stormtrooper helmet).
-    # Shares stg_scale / stg_skip_layers / stg_schedule_* knobs.
     stg_weak_method: str = "stg"  # stg | pag
-    # How STG and TAG compose when both are active.
-    #   "sequential" (default, current behavior):
-    #       eps_stg = eps_full + s · (eps_full − eps_weak)
-    #       eps_out = TAG(eps_stg)            # TAG sees the STG-amplified signal
-    #     Algebraically: eps_out = eps_full + (η−1)·eps_full_⊥
-    #                            + s·(eps_full − eps_weak)
-    #                            + s·(η−1)·(eps_full − eps_weak)_⊥
-    #     The last term is the *implicit* extra TAG-tangential boost on the
-    #     STG perturbation that compounding produces.
-    #   "parallel":
-    #       eps_out = TAG(eps_full) + s · (eps_full − eps_weak)
-    #     STG and TAG act independently on the raw CFG prediction. STG
-    #     contributes its full direction without TAG's tangential boost.
-    #     Algebraically: eps_out = eps_full + (η−1)·eps_full_⊥
-    #                            + s·(eps_full − eps_weak)
-    #     The difference seq − par = s·(η−1)·(eps_full − eps_weak)_⊥ is
-    #     exactly the compounding term above.
     stg_tag_compose_mode: str = "sequential"
 
     # Self-derived relevance masking
@@ -113,37 +89,13 @@ class DCConfig:
     gradient_mask_ema_beta_camera_factor: float = 2.0
     gradient_mask_gamma: float = 1.2
     gradient_mask_warmup: int = 0
-    # Per-frame normalization divisor for the RAW relevance mask (the
-    # ``self_grad_mask_raw`` / ``raw_self`` variant fed to the voxel cache).
-    #   1.0  = divide by the per-frame max (legacy). A single hot pixel then
-    #          rescales the whole frame, so the same 3D point reads different
-    #          normalized values across views purely because each frame's max
-    #          differs — spurious cross-view variance the cache mistakes for
-    #          real inconsistency.
-    #   q in (0.5, 1.0) = divide by that per-frame quantile (e.g. 0.95 → p95).
-    #          A robust scale: preserves absolute foreground/background
-    #          structure (still a monotone linear rescale, so the §10 contrast
-    #          fix holds) but is insensitive to single-pixel outliers.
-    # Only affects ``self_grad_mask_raw``; the DDS gradient mask keeps its
-    # percentile normalization. Default 1.0 reproduces prior behavior exactly.
     gradient_mask_raw_norm_quantile: float = 1.0
     source_blend_localization_enabled: bool = True
-    # Leaky source-blend gate. 0.0 = original hard gate (edit zeroed where M=0).
-    # A small floor (e.g. 0.1) lets a fraction of the edit drive reach M≈0
-    # regions so novel structure can grow into empty space and bootstrap its
-    # own mask. 1.0 = no localization. See apply_source_blend.
     source_blend_floor: float = 0.0
 
     outside_mask_anchor_weight: float = 0.2
     outside_mask_anchor_edit_strength_adaptive: bool = True
     outside_mask_anchor_edit_strength_power: float = 1.0
-    # Temporal schedule on the outside-mask anchor weight. When enabled, scales
-    # the (already edit-strength-adapted) anchor by a t-dependent factor.
-    # "decay": factor goes 1 → 0 across the noise schedule (high t → low t),
-    #          protecting background strongly during coarse-structure denoising
-    #          and relaxing during refinement.
-    # "growth": reverse (0 → 1). Disabled by default; factor = 1 reproduces
-    # prior behavior.
     outside_mask_anchor_schedule_enabled: bool = False
     outside_mask_anchor_schedule_power: float = 0.5
     outside_mask_anchor_schedule_direction: str = "decay"  # decay | growth
