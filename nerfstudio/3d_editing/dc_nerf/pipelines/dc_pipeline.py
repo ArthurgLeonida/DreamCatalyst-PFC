@@ -69,9 +69,6 @@ class DCPipelineConfig(VanillaPipelineConfig):
     mask_voxel_cache_update_threshold: float = VOXEL_CACHE_PARAMS[
         "mask_voxel_cache_update_threshold"
     ]
-    mask_voxel_cache_update_source: str = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_update_source", "internal"
-    )
     mask_voxel_cache_confidence_enabled: bool = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_confidence_enabled", False
     )
@@ -201,7 +198,6 @@ class DCPipeline(ModifiedVanillaPipeline):
                 if accumulation_t is not None:
                     accumulation_world = accumulation_t.detach().clone()  # [H, W, 1]
 
-        # delete to free up memory
         del camera_outputs
         del current_camera
         clean_gpu()
@@ -430,8 +426,8 @@ class DCPipeline(ModifiedVanillaPipeline):
     def _voxel_cache_warmup_blend(self, edit_step: int) -> float:
         """Linear ramp from 0 → max_blend over [warmup_start, warmup_end].
 
-        Same shape as your existing `gradient_mask_warmup` pattern, just
-        applied to the external-mask blend rather than to the mask itself.
+        Same shape as the `gradient_mask_warmup` ramp, applied to the
+        external-mask blend rather than to the mask itself.
         """
         s = self.config.mask_voxel_cache_warmup_start
         e = self.config.mask_voxel_cache_warmup_end
@@ -695,34 +691,11 @@ class DCPipeline(ModifiedVanillaPipeline):
             and mask_world_points is not None
             and dic.get("internal_grad_mask", None) is not None
         ):
-            update_source = str(self.config.mask_voxel_cache_update_source).lower()
-            if update_source not in {"internal", "raw_self", "raw_attn"}:
-                raise ValueError(
-                    f"Unknown mask_voxel_cache_update_source={update_source!r}; "
-                    "expected 'internal', 'raw_self', or 'raw_attn'."
-                )
-            if update_source == "internal" and not getattr(
-                self, "_warned_internal_update_source", False
-            ):
-                print(
-                    "[voxel-cache] WARNING: mask_voxel_cache_update_source='internal' "
-                    "is deprecated. The CA-mask schedule leaks into cache "
-                    "observations. Prefer 'raw_self' for cleaner cross-view "
-                    "aggregation. (This warning fires once per run.)"
-                )
-                self._warned_internal_update_source = True
-            if update_source == "raw_attn" and dic.get("cross_attention_mask") is not None:
-                cache_mask_input = dic["cross_attention_mask"]
-                if cache_mask_input.shape[-2:] != (mask_h, mask_w):
-                    cache_mask_input = F.interpolate(
-                        cache_mask_input.float(),
-                        size=(mask_h, mask_w),
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-            elif update_source == "raw_self" and dic.get("self_grad_mask_raw") is not None:
-                cache_mask_input = dic["self_grad_mask_raw"]
-            else:
+            # Cache input is the raw self-mask (edit magnitude, per-frame
+            # quantile-normalized in dc.py) — not the percentile-normalized
+            # internal mask, whose CA-mask schedule leaks into observations.
+            cache_mask_input = dic.get("self_grad_mask_raw")
+            if cache_mask_input is None:
                 cache_mask_input = dic["internal_grad_mask"]
             new_mask = cache_mask_input.detach().to(self.device).reshape(-1)
             log_this_step = (
@@ -854,11 +827,6 @@ class DCPipeline(ModifiedVanillaPipeline):
                     )
                     payload["dc_debug/voxel_cache_input_mask_mean"] = float(
                         src_2d.mean().item()
-                    )
-                    payload["dc_debug/voxel_cache_input_mask_source"] = (
-                        2.0 if update_source == "raw_attn"
-                        else 1.0 if update_source == "raw_self"
-                        else 0.0
                     )
                 wandb.log(payload, step=step, commit=False)
         grad = dic["grad"].cpu()

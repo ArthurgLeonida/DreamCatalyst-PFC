@@ -14,6 +14,7 @@ DEFAULT_CROSS_ATTENTION_STOPWORDS = {
 
 
 def normalize_relevance_map(relevance: torch.Tensor) -> torch.Tensor:
+    """Percentile-normalize a relevance map to [0, 1] per sample (p5–p95 window)."""
     flat = relevance.flatten(1)
     p5 = torch.quantile(flat, 0.05, dim=1, keepdim=True).view(-1, 1, 1, 1)
     p95 = torch.quantile(flat, 0.95, dim=1, keepdim=True).view(-1, 1, 1, 1)
@@ -21,6 +22,7 @@ def normalize_relevance_map(relevance: torch.Tensor) -> torch.Tensor:
 
 
 def apply_mask_postprocessing(mask: torch.Tensor, gamma: float, sigma: float) -> torch.Tensor:
+    """Sharpen a mask with a gamma power curve, then soften edges with a Gaussian blur."""
     if gamma != 1.0:
         mask = mask.clamp_min(0.0).pow(gamma)
 
@@ -50,6 +52,7 @@ def derive_cross_attention_keywords(src_prompt: Optional[str], tgt_prompt: str) 
 
 
 def get_phrase_token_ids(tokenizer, phrase: str) -> List[int]:
+    """Tokenize a phrase and return its token ids with special tokens stripped."""
     token_ids = tokenizer(
         phrase,
         add_special_tokens=False,
@@ -70,6 +73,7 @@ def get_phrase_token_ids(tokenizer, phrase: str) -> List[int]:
 
 
 def find_token_positions(full_token_ids: List[int], phrase_token_ids: List[int]) -> List[int]:
+    """Return every position of `phrase_token_ids` as a contiguous subsequence of `full_token_ids`."""
     if not phrase_token_ids or len(phrase_token_ids) > len(full_token_ids):
         return []
 
@@ -86,6 +90,11 @@ def get_cross_attention_token_indices(
     tgt_prompt: str,
     src_prompt: Optional[str] = None,
 ) -> List[int]:
+    """Locate the target prompt's edit-keyword token positions for CA-map capture.
+
+    Falls back to all non-special token positions when no keyword survives
+    stopword/source filtering.
+    """
     full_token_ids = tokenizer(
         tgt_prompt,
         padding="max_length",
@@ -122,6 +131,7 @@ def build_cross_attention_relevance_mask(
     sigma: float,
     target_shape=None,
 ):
+    """Average captured cross-attention maps into a single normalized, postprocessed mask."""
     if not attention_maps:
         return None
 

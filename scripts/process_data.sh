@@ -125,7 +125,7 @@ else
         --data "${DATA_DIR}/images" \
         --output-dir "${OUTPUT_DIR}" \
         --matching-method exhaustive \
-        --no-gpu # Fixed to run on the server, GPU was not working
+        --no-gpu # CPU feature extraction/matching — works on headless servers without GPU-enabled COLMAP
 
 fi
 

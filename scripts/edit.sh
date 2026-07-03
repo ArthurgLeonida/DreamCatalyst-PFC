@@ -146,7 +146,6 @@ if enabled:
     neg_var_p = dc.get('external_mask_negative_variance_power', 0.0)
     if neg_var_p > 0.0:
         print(f"   {branch} neg var p:  {neg_var_p}")
-    print(f"   {branch} update src: {voxel.get('mask_voxel_cache_update_source', 'internal')}")
     ang_p = voxel.get('mask_voxel_cache_angular_power', 0.0)
     if ang_p > 0.0:
         ang_floor = voxel.get('mask_voxel_cache_min_angular_factor', 0.0)

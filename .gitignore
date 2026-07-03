@@ -1,7 +1,6 @@
 # Data
 /data/
 exports/
-dream_catalyst_ns.egg-info/
 
 # Claude & GPT
 .claude/
@@ -29,14 +28,15 @@ eggs/
 
 # Outputs / checkpoints
 outputs/
-exports/
 renders/
 eval_results/
+wandb/
 
 # Other files
 *.pdf
 *.out
-docs/
+docs/*
+!docs/VoxelCacheExplained.md
 scripts/fill_anteprojeto.py
 
 # OS / editor

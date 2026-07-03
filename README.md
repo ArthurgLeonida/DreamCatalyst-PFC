@@ -187,7 +187,7 @@ Please cite the original sources if you use these scenes.
 
 | Component | Version |
 |---|---|
-| Python | 3.9 |
+| Python | 3.10 |
 | PyTorch | 2.1.2+cu118 |
 | CUDA | 11.8 |
 | Nerfstudio | 1.0.2 |

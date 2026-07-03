@@ -32,48 +32,6 @@ def compute_ca_mask_weight(
     return weight * (progress ** exponent)
 
 
-def compute_bg_anchor_schedule_factor(
-    t_normalized: float,
-    schedule_enabled: bool,
-    min_step_ratio: float,
-    max_step_ratio: float,
-    schedule_power: float,
-    direction: str,
-) -> float:
-    """Return a scalar in [0, 1] that scales the outside-mask anchor weight.
-
-    Direction "decay" returns 1.0 early (high t / coarse-structure denoising) and
-    decreases toward 0.0 late (low t / refinement). The intent is to protect the
-    background strongly while structural decisions are being made, then relax
-    the anchor so the edit can refine its own boundary without being pulled back
-    to source.
-
-    Direction "growth" is the reverse (low early, high late) — provided for
-    symmetry / ablation purposes.
-
-    Disabled returns 1.0 (no temporal modulation), preserving prior behavior.
-    """
-    if not schedule_enabled:
-        return 1.0
-
-    min_t = min(max(float(min_step_ratio), 0.0), 1.0)
-    max_t = min(max(float(max_step_ratio), min_t + 1e-8), 1.0)
-    t = min(max(float(t_normalized), min_t), max_t)
-    # progress: 0 early (t == max_t), 1 late (t == min_t)
-    progress = (max_t - t) / max(max_t - min_t, 1e-8)
-    exponent = max(float(schedule_power), 1e-8) * math.e
-
-    direction = str(direction).lower()
-    if direction == "decay":
-        return (1.0 - progress) ** exponent
-    if direction == "growth":
-        return progress ** exponent
-    raise ValueError(
-        f"Unknown outside_mask_anchor_schedule_direction={direction!r}; "
-        f"expected 'decay' or 'growth'."
-    )
-
-
 def apply_tag(noise_pred: torch.Tensor, latents_noisy: torch.Tensor, eta: float) -> torch.Tensor:
     """Apply tangential amplification around the noisy latent direction."""
     if eta == 1.0:
@@ -226,7 +184,6 @@ def compute_preserve_weight(
     outside_mask_anchor_edit_strength_adaptive: bool,
     outside_mask_anchor_edit_strength_power: float = 1.0,
     edit_strength: Optional[float] = None,
-    schedule_factor: float = 1.0,
 ):
     """Compute DreamCatalyst preservation weight plus optional outside-mask anchor.
 
@@ -236,9 +193,6 @@ def compute_preserve_weight(
     with high edit strength get their anchor reduced much more than scenes with
     low edit strength, decoupling per-scene difficulty from the universal config.
     Power 1.0 reproduces the original linear scaling.
-
-    `schedule_factor` ∈ [0, 1] is an optional temporal modulator from
-    `compute_bg_anchor_schedule_factor`; default 1.0 preserves prior behavior.
     """
     preserve_weight = psi
 
@@ -248,7 +202,6 @@ def compute_preserve_weight(
             s = min(max(float(edit_strength), 0.0), 1.0)
             power = max(float(outside_mask_anchor_edit_strength_power), 0.0)
             w_out_effective = w_out_effective * ((1.0 - s) ** power)
-        w_out_effective = w_out_effective * float(schedule_factor)
         preserve_weight = preserve_weight + w_out_effective * (1.0 - grad_mask)
 
     return preserve_weight

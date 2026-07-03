@@ -9,7 +9,6 @@ from PIL import Image
 from typing import List, Dict, Optional
 from dc.attention_utils import (
     run_unet_with_cross_attention_capture,
-    run_unet_with_pag,
     run_unet_with_skipped_attn,
 )
 from dc.dc_unet import CustomUNet2DConditionModel
@@ -18,7 +17,6 @@ from dc.guidance_utils import (
     apply_source_blend,
     apply_stg,
     apply_tag,
-    compute_bg_anchor_schedule_factor,
     compute_ca_mask_weight,
     compute_edit_strength,
     compute_gate_signal,
@@ -79,7 +77,6 @@ class DCConfig:
     stg_schedule_mode: str = "bump"
     stg_bump_peak_ratio: float = 0.5
     stg_edit_strength_adaptive: bool = True
-    stg_weak_method: str = "stg"  # stg | pag
     stg_tag_compose_mode: str = "sequential"
 
     # Self-derived relevance masking
@@ -96,9 +93,6 @@ class DCConfig:
     outside_mask_anchor_weight: float = 0.2
     outside_mask_anchor_edit_strength_adaptive: bool = True
     outside_mask_anchor_edit_strength_power: float = 1.0
-    outside_mask_anchor_schedule_enabled: bool = False
-    outside_mask_anchor_schedule_power: float = 0.5
-    outside_mask_anchor_schedule_direction: str = "decay"  # decay | growth
 
     cross_attention_mask_enabled: bool = True
     cross_attention_mask_layers: List[int] = field(default_factory=lambda: [1, 2])
@@ -186,7 +180,7 @@ class DC(object):
         # own max so values are comparable across the cache's spatial extent.
         B = relevance.shape[0]
         flat_relevance = relevance.view(B, -1)
-        q_norm = float(getattr(self.config, "gradient_mask_raw_norm_quantile", 1.0))
+        q_norm = float(self.config.gradient_mask_raw_norm_quantile)
         if q_norm >= 1.0:
             # Legacy per-frame max: one outlier pixel can rescale the frame.
             per_sample_scale = flat_relevance.amax(dim=1)
@@ -562,9 +556,7 @@ class DC(object):
                         blend_map = torch.full_like(diff, float(blend_tensor))
 
                     up = blend_map * gate * diff.clamp_min(0.0)
-                    neg_var_power = float(
-                        getattr(self.config, "external_mask_negative_variance_power", 0.0)
-                    )
+                    neg_var_power = float(self.config.external_mask_negative_variance_power)
                     if neg_var_power > 0.0 and confidence is not None:
                         neg_extra = confidence.clamp(0.0, 1.0).pow(neg_var_power)
                     else:
@@ -572,7 +564,7 @@ class DC(object):
                     down = (
                         blend_map
                         * neg_extra
-                        * float(getattr(self.config, "external_mask_interp_suppression_ratio", 0.4))
+                        * float(self.config.external_mask_interp_suppression_ratio)
                         * diff.clamp_max(0.0)
                     )
                     fused = grad_mask + up + down
@@ -617,17 +609,7 @@ class DC(object):
             )
 
             if stg_active:
-                weak_method = str(self.config.stg_weak_method).lower()
-                if weak_method == "pag":
-                    weak_runner = run_unet_with_pag
-                elif weak_method == "stg":
-                    weak_runner = run_unet_with_skipped_attn
-                else:
-                    raise ValueError(
-                        f"Unknown stg_weak_method={weak_method!r}; expected "
-                        f"'stg' or 'pag'."
-                    )
-                weak_pred = weak_runner(
+                weak_pred = run_unet_with_skipped_attn(
                     self.unet,
                     self.device,
                     self.config.stg_skip_layers,
@@ -662,15 +644,6 @@ class DC(object):
                 eps["tgt"], eps["src"], grad_mask, floor=self.config.source_blend_floor
             )
 
-        bg_anchor_schedule_factor = compute_bg_anchor_schedule_factor(
-            t_normalized=t_normalized,
-            schedule_enabled=self.config.outside_mask_anchor_schedule_enabled,
-            min_step_ratio=self.config.min_step_ratio,
-            max_step_ratio=self.config.max_step_ratio,
-            schedule_power=self.config.outside_mask_anchor_schedule_power,
-            direction=self.config.outside_mask_anchor_schedule_direction,
-        )
-
         preserve_weight = compute_preserve_weight(
             psi=self.config.psi,
             grad_mask=grad_mask,
@@ -678,7 +651,6 @@ class DC(object):
             outside_mask_anchor_edit_strength_adaptive=self.config.outside_mask_anchor_edit_strength_adaptive,
             outside_mask_anchor_edit_strength_power=self.config.outside_mask_anchor_edit_strength_power,
             edit_strength=current_edit_strength,
-            schedule_factor=bg_anchor_schedule_factor,
         )
 
         w_DDS = self.config.delta + self.config.gamma * (t_normalized ** (1/math.e))

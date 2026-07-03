@@ -24,7 +24,7 @@ DATA_DIR="data/${SCENE}_processed"
 
 # Block editing methods — they need edit.sh / refine.sh
 case "${METHOD}" in
-    dc_splat|dc|dream|dream-catalyst)
+    dc_splat|dc)
         echo "ERROR: '${METHOD}' is an editing method. Use scripts/edit.sh instead."
         exit 1
         ;;

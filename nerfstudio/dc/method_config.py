@@ -1,30 +1,23 @@
-# Central DreamCatalyst method parameters.
-# DC_CUSTOM_PARAMS → DCConfig
-# VOXEL_CACHE_PARAMS → DCPipelineConfig
-
-# DC_CUSTOM_PARAMS = universal 2D config (source-blend + CA mask + adaptive/asymmetric
-# TAG + STG bump + outside/latent anchors) — the Part-1 "standard" config.
-# VOXEL_CACHE_PARAMS = the Part-2 3D cache, lifting raw_self (edit force) into a voxel
-# grid for cross-view-consistent localization. Active package:
-#   - raw_self p95-normalized (gradient_mask_raw_norm_quantile=0.95) — robust per-frame
-#     scale that avoids single-pixel-max jitter inflating cross-view variance.
-#   - positive-only fusion (external_mask_interp_suppression_ratio=0.0): the cache adds
-#     agreed-upon force, never subtracts.
-#   - observed-weighted trilinear readback (mask_voxel_cache_trilinear=True) — converts
-#     mask-level consistency into rendered multi-view consistency (the elf MV_cos gain).
-#   - decayed/EW cross-view variance (mask_voxel_cache_variance_decay=0.2): recency-
-#     weighted, principled for the non-stationary edit; re-tune max_variance per scene.
-#   - agreement gate max_variance: TUNE PER SCENE against the variance map
-#     (dc_debug/voxel_cache_variance_map), in the gap between the wanted-edit variance
-#     (low) and the over-edit-region variance (high), above the former.
-#   - confidence gate (count + variance + angular diversity + mass), scale-matching,
-#     warmup-ramped blend (max_blend).
-# STG note: the cache config uses stg_scale=3.0 (vs 3.5 for the cache-off Part-1 runs)
-# as a design rebalancing — the cache adds agreement-gated localization support, so the
-# guidance amplifier is reduced to avoid double-amplifying the edit signal. The
-# editability difference is within the run-to-run noise floor; this is a config choice,
-# not a measured win. Set stg_scale=3.5 to reproduce Part-1.
-# Scene is selected via the scripts/edit.sh argument, not here.
+# Central DreamCatalyst method parameters — the single source of truth for
+# which knobs are active in a run. Scene selection happens in scripts/edit.sh.
+#
+# DC_CUSTOM_PARAMS → DCConfig. The Part-1 "standard" universal 2D config:
+#   source-blend localization + hybrid self/CA mask + adaptive asymmetric TAG
+#   + STG bump schedule + outside-mask and latent-mean anchors.
+#
+# VOXEL_CACHE_PARAMS → DCPipelineConfig. The Part-2 3D voxel cache: lifts the
+# raw self-mask (per-frame p95-normalized edit magnitude) into a voxel grid for
+# cross-view-consistent localization. Positive-only fusion, observed-weighted
+# trilinear readback, decayed cross-view variance, and a confidence gate
+# (count + variance + angular diversity + mass) with scale matching and a
+# warmup-ramped blend. Full walkthrough: docs/VoxelCacheExplained.md.
+#
+# The agreement gate max_variance is scene-sensitive: tune it against the
+# variance map (dc_debug/voxel_cache_variance_map), above the wanted-edit
+# variance and below the over-edit variance.
+#
+# stg_scale=3.0 is the cache-on (Part-2) rebalancing; set 3.5 to reproduce the
+# cache-off Part-1 results.
 
 DC_CUSTOM_PARAMS = dict(
     # ---------------------------------------------------------------------
@@ -37,9 +30,6 @@ DC_CUSTOM_PARAMS = dict(
     outside_mask_anchor_weight=0.15,
     outside_mask_anchor_edit_strength_adaptive=True,
     outside_mask_anchor_edit_strength_power=1.0,
-    outside_mask_anchor_schedule_enabled=False,
-    outside_mask_anchor_schedule_power=0.75,
-    outside_mask_anchor_schedule_direction="growth",
 
     gradient_mask_blur=0.5,
     gradient_mask_gamma=1.2,
@@ -55,7 +45,7 @@ DC_CUSTOM_PARAMS = dict(
     cross_attention_mask_blur=0.5,
     cross_attention_mask_gamma=1.2,
     cross_attention_mask_weight_schedule_enabled=True,
-    cross_attention_mask_weight_schedule_power=0.75, 
+    cross_attention_mask_weight_schedule_power=0.75,
 
     latent_mean_anchor_weight=0.005,
 
@@ -73,19 +63,18 @@ DC_CUSTOM_PARAMS = dict(
     asymmetric_tag=True,
 
     # ---------------------------------------------------------------------
-    # 3. STG / PAG branch
+    # 3. STG branch
     # ---------------------------------------------------------------------
     stg_enabled=True,
-    stg_scale=3.0,  # cache-on (Part 2) rebalancing; use 3.5 for cache-off Part-1 runs
+    stg_scale=3.0,  # 3.5 reproduces the cache-off Part-1 results
     stg_skip_layers=[2],
     stg_schedule_enabled=True,
-    stg_schedule_start_ratio=0, 
-    stg_schedule_end_ratio=0.8, 
+    stg_schedule_start_ratio=0,
+    stg_schedule_end_ratio=0.8,
     stg_schedule_mode="bump", # bump | growth | decay
     stg_bump_peak_ratio=0.5,
     stg_edit_strength_adaptive=True,
     stg_tag_compose_mode="parallel",
-    stg_weak_method="stg",
 )
 
 
@@ -101,9 +90,9 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_ema_beta_auto=True,
     mask_voxel_cache_ema_beta_camera_factor=2.0,
 
-    mask_voxel_cache_warmup_start=500, 
-    mask_voxel_cache_warmup_end=1200, 
-    mask_voxel_cache_max_blend=0.2,   
+    mask_voxel_cache_warmup_start=500,
+    mask_voxel_cache_warmup_end=1200,
+    mask_voxel_cache_max_blend=0.2,
     mask_voxel_cache_accumulation_threshold=0.30,
     mask_voxel_cache_update_threshold=0.0,
 
@@ -112,8 +101,8 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_min_observations_auto=True,
     mask_voxel_cache_observation_fraction=0.10,
     mask_voxel_cache_min_observations_floor=5,
-    mask_voxel_cache_min_observations_cap=12,      
-    mask_voxel_cache_max_variance=0.02,           
+    mask_voxel_cache_min_observations_cap=12,
+    mask_voxel_cache_max_variance=0.02,
     mask_voxel_cache_variance_decay=0.2,
 
     mask_voxel_cache_bbox_source="observed",  # observed | cameras | scene_box
@@ -121,17 +110,16 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_bbox_observe_quantile=0.05,
     mask_voxel_cache_bbox_inflation=0.2,
 
-    mask_voxel_cache_update_source="raw_self", # raw_self | internal | raw_attn 
     mask_voxel_cache_trilinear=True,
 
-    mask_voxel_cache_angular_power=1.0,    
+    mask_voxel_cache_angular_power=1.0,
     mask_voxel_cache_min_angular_factor=0.0,
     mask_voxel_cache_angular_relative=True,
     mask_voxel_cache_angular_freeze_patience=100,
     mask_voxel_cache_angular_freeze_warmup=50,
 
-    mask_voxel_cache_mass_threshold=0.18,   
-    mask_voxel_cache_mass_power=1.0,       
+    mask_voxel_cache_mass_threshold=0.18,
+    mask_voxel_cache_mass_power=1.0,
 
     mask_voxel_cache_scale_normalize=True,
     mask_voxel_cache_scale_normalize_quantile=0.95,

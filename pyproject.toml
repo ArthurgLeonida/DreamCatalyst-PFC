@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "dream_catalyst_ns"
+name = "dreamcatalyst-pfc"
 version = "0.1.0"
 description = "DreamCatalyst-style 3D scene editing via Nerfstudio (SDS + InstructPix2Pix)"
 readme = "README.md"
@@ -26,9 +26,8 @@ dependencies = [
     "accelerate>=0.25.0,<0.34.0",
 ]
 
-[tool.setuptools.packages.find]
-include = ["dream_catalyst_ns*"]
-
-# ── Register the custom method with Nerfstudio's CLI ──────────────────────────
-[project.entry-points.'nerfstudio.method_configs']
-dream-catalyst = "dream_catalyst_ns.dream_config:DreamCatalyst"
+# Meta-package: carries only the extra pip dependencies above. The editing
+# methods (dc, dc_splat, ...) are registered by the nerfstudio/3d_editing
+# package installed separately (see setup.sh).
+[tool.setuptools]
+packages = []

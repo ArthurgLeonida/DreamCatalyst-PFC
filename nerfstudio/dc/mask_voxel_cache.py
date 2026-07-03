@@ -134,18 +134,12 @@ class MaskVoxelCache:
             if self.num_views is not None
             else None
         )
-        # Geometry-only twin of `view_observed`. The original `view_observed`
-        # only flips when a view's per-voxel mean clears `value_threshold`,
-        # which conflates "this camera geometrically saw the voxel" with
-        # "this camera produced confident mask evidence for the voxel."
-        # The angular-diversity factor wants the former (pure triangulation
-        # coverage), so it consults this tensor instead. Bug diagnosed on
-        # stormtrooper: the helmet's diffusion mask is low early in
-        # training (helmet is a generated feature, not present in source);
-        # cameras observing the helmet failed the value gate and were
-        # excluded from view_dir_sum, making helmet voxels look
-        # geometrically under-triangulated even though the orbit observes
-        # them well.
+        # Geometry-only twin of `view_observed`: flips on every in-bounds
+        # observation, while `view_observed` requires the per-voxel mean to
+        # clear `value_threshold`. Separates "camera saw the voxel" from
+        # "camera produced mask evidence" (on stormtrooper, helmet voxels
+        # looked under-triangulated early in training because the generated
+        # helmet had no mask evidence yet). Diagnostic-only — see `query()`.
         self.view_observed_geom = (
             torch.zeros(
                 (n_voxels, self.num_views),
@@ -182,10 +176,9 @@ class MaskVoxelCache:
         # circular-statistics resultant-length measure (Fisher, 1953, "Dispersion
         # on a sphere"). We use 1 − resultant_length as the per-voxel angular
         # coverage factor in `query`, which down-weights confidence on voxels
-        # observed only from a narrow cone of viewpoints — the failure mode
-        # diagnosed empirically on elf (65 cameras, but voxels overwhelmingly
-        # observed from clustered directions; cross-view variance ≈ 0.005 with
-        # near-saturated confidence but minimal real correspondence info).
+        # observed only from a narrow cone of viewpoints (the elf failure
+        # mode: many cameras, but clustered — low variance with no real
+        # correspondence information).
         self.view_dir_sum = torch.zeros(
             (V, V, V, 3),
             device=self.device,
@@ -343,21 +336,14 @@ class MaskVoxelCache:
             mask_values: [N] mask values in [0, 1].
             in_bounds: [N] optional bool mask; if provided, points marked
                 False are skipped.
-            value_threshold: optional confidence gate, applied to the
-                per-voxel mean of mask values from this view (not to
-                raw pixel values). Voxels whose averaged evidence falls
-                below the threshold are skipped — neither the EMA grid
-                nor the Welford cross-view statistics are updated from
-                this view. Prevents stale low priors from accumulating
-                in voxels where the model hasn't yet started editing
-                (e.g. stormtrooper helmet voxels during iters 0–1400,
-                where the per-view mask is low because the model is
-                busy on the body) and prevents those early under-
-                edited samples from inflating the running variance.
-                Gating the per-voxel mean (rather than raw pixels)
-                ensures that a voxel only contributes a variance sample
-                when this view's evidence for that voxel is itself
-                confident. Set 0.0 to disable.
+            value_threshold: optional confidence gate on the per-voxel
+                mean of mask values from this view (not raw pixels).
+                Voxels whose averaged evidence falls below it are skipped
+                entirely — neither the EMA grid nor the cross-view
+                statistics update. Prevents not-yet-edited regions (e.g.
+                stormtrooper helmet voxels early in training) from
+                accumulating stale low priors and inflating the running
+                variance. Set 0.0 to disable.
             view_id: optional integer camera index. When provided and
                 the cache was constructed with `num_views`, the Welford
                 cross-view statistics increment only the first time
@@ -457,15 +443,9 @@ class MaskVoxelCache:
                     flat_geom_count_diag = self.geom_view_count.view(-1)
                     flat_geom_count_diag[geom_idx_diag] += 1
 
-        # Confidence gate: only learn from per-voxel evidence above the
-        # threshold. The gate is on the per-voxel mean (the actual sample
-        # this view contributes to the cache and to the cross-view
-        # statistics) rather than on raw pixel values — pixel-level gating
-        # would still let a voxel with mostly-low evidence contribute a
-        # poisoned sample after the per-pixel filter. Gating the per-voxel
-        # mean prevents early-iteration under-edited views (e.g. helmet
-        # voxels during iters 0–1400 where the model hasn't started
-        # editing yet) from inflating the running variance.
+        # Confidence gate on the per-voxel mean — the actual sample this
+        # view contributes — rather than on raw pixels, which would still
+        # let a mostly-low-evidence voxel contribute a poisoned sample.
         if value_threshold > 0.0:
             confident_voxels = per_voxel_mean >= float(value_threshold)
             touched = touched & confident_voxels
@@ -548,13 +528,11 @@ class MaskVoxelCache:
 
         # Angular-diversity update: accumulate this view's per-voxel mean
         # direction into the running view-direction sum. Same gating as
-        # the Welford stats above (new evidence-gated view only). The
+        # the Welford stats above (new evidence-gated view only) — the
         # angular factor in `query` divides ‖view_dir_sum‖ by the
-        # evidence-gated `unique_view_count`, so they must be updated
-        # on the same population. Reverting to evidence-gating after the
-        # geometry-only variant proved load-bearing in the wrong direction
-        # (cf. stormtrooper hand artifacts when the gate stopped
-        # implicitly damping low-edit-activity voxels).
+        # evidence-gated `unique_view_count`, so both must be updated on
+        # the same population (a geometry-only variant caused stormtrooper
+        # hand artifacts; see the note in `query`).
         if per_voxel_view_dir is not None and stats_idx.numel() > 0:
             flat_view_dir_sum = self.view_dir_sum.view(-1, 3)
             flat_view_dir_sum[stats_idx] = (
@@ -624,17 +602,12 @@ class MaskVoxelCache:
         With `mass_power = 0` or `mass_threshold = 0` the gate is off.
 
         `angular_relative` (default False) switches the factor from absolute
-        to scene-relative. With it enabled, each voxel's factor is divided
-        by the scene-wide mean angular factor (over all observed voxels with
-        ≥ 2 unique views), then clamped to [0, 1]. This is what makes the
-        gate work consistently across capture geometries: a captured-on-a-
-        horizontal-arc scene (clown) has an absolute mean factor of ~0.05
-        and a forward-facing capture (elf) has ~0.01; without normalization
-        both look "almost zero" and the gate collapses the cache on both.
-        With normalization, each voxel is judged against its own scene's
-        typical diversity — voxels above the scene mean keep most of their
-        confidence, voxels below get damped, regardless of the absolute
-        scale set by the capture rig.
+        to scene-relative: each voxel's factor is divided by the scene-wide
+        mean angular factor, then clamped to [0, 1]. This makes the gate
+        work across capture geometries — a horizontal-arc capture (clown,
+        mean ~0.05) and a forward-facing capture (elf, ~0.01) both look
+        "almost zero" in absolute terms, collapsing the gate; normalized,
+        each voxel is judged against its own scene's typical diversity.
 
         `trilinear` (default False) reads the stored mean value via
         observed-weighted trilinear interpolation over the 8 surrounding voxel
@@ -690,40 +663,24 @@ class MaskVoxelCache:
         # information from triangulation. (1 − resultant) is the diversity.
         if float(angular_power) > 0.0:
             dir_sum = self.view_dir_sum[ix, iy, iz]  # [N, 3]
-            # Use the evidence-gated unique view count as the denominator.
-            # Conceptually the angular factor should be a pure geometric
-            # quantity ("how spread out are the cameras that observed
-            # this voxel?"), but empirically using the geometry-only
-            # count produces worse results — it damps confidence on
-            # voxels with no edit activity (e.g. stormtrooper hand,
-            # crotch) so they receive the full cache contribution, which
-            # produces visible artifacts. The evidence-gated count
-            # accidentally couples "is this voxel actually being edited"
-            # into the gate, which turns out to be load-bearing. See the
-            # explicit `mass_threshold`/`mass_power` mass gate below for
-            # the clean version of this coupling.
+            # Denominator is the evidence-gated unique view count, not the
+            # geometry-only count: the pure-geometric variant let voxels
+            # with no edit activity (stormtrooper hand, crotch) receive the
+            # full cache contribution, producing artifacts. The evidence
+            # gating couples "is this voxel being edited" into the factor;
+            # the mass gate below is the explicit version of that coupling.
             safe_counts = counts.clamp_min(1.0)
             resultant_len = (dir_sum.norm(dim=-1) / safe_counts).clamp(0.0, 1.0)
             angular_factor = (1.0 - resultant_len).clamp(0.0, 1.0)
 
-            # Scene-relative normalization. Cameras for a given dataset live
-            # on a roughly-fixed-shape rig (e.g. a horizontal orbit), so the
-            # absolute angular factor saturates near a scene-specific
-            # ceiling. Dividing by that ceiling (the scene mean over
-            # trusted-population voxels) gives a factor that is comparable
-            # across scenes: ratio > 1 means "better triangulated than
-            # average for this scene"; ratio < 1 means "worse." Without this,
-            # a clown voxel with factor 0.06 looks identically untrustworthy
-            # to an elf voxel with factor 0.01, even though clown's voxel is
-            # at the high end of its scene's distribution.
-            #
-            # The mean is restricted to voxels at or above `min_observations`
-            # — the same population the confidence gate trusts. If the mean
-            # included all 2-view voxels, edge voxels with only 2 nearly-
-            # parallel observations would dominate it and collapse the
-            # denominator to ~0, defeating the normalization. Restricting to
-            # the trusted population gives a stable denominator that reflects
-            # actual triangulation quality in well-observed regions.
+            # Scene-relative normalization: divide by the scene mean over
+            # trusted-population voxels, so the factor reads "better/worse
+            # triangulated than average for this scene." Without it, a clown
+            # voxel at 0.06 looks as untrustworthy as an elf voxel at 0.01
+            # even when it sits at the top of its scene's distribution. The
+            # mean is restricted to voxels with ≥ `min_observations` views —
+            # including all 2-view voxels would let nearly-parallel edge
+            # observations collapse the denominator toward 0.
             if angular_relative:
                 if self._frozen_angular_denominator is not None:
                     scene_mean = float(self._frozen_angular_denominator)
@@ -741,18 +698,12 @@ class MaskVoxelCache:
         else:
             angular_confidence = torch.ones_like(values)
 
-        # Mass gate (C_mass): damp confidence on voxels with low cached
-        # mean value. Conceptually distinct from variance (which measures
-        # cross-view agreement) and angular factor (which measures
-        # triangulation quality): mass measures "is the model committing
-        # edit signal to this voxel at all." Voxels with low cached
-        # mass are regions the diffusion model isn't actively editing,
-        # so the cache's contribution there should be muted to avoid
-        # geometric artifacts on extremity regions (e.g. stormtrooper
-        # hand, crotch) and high-frequency detail (e.g. elf eyes) that
-        # get blurred when the cache averages contributions across views.
-        # Formula: C_mass = min(1, m(q) / threshold)^power. With
-        # threshold=0 or power=0 the gate is disabled.
+        # Mass gate C_mass = min(1, m(q)/threshold)^power: damp confidence
+        # where the cached mean is low. Distinct from variance (cross-view
+        # agreement) and the angular factor (triangulation): mass measures
+        # "is the model committing edit signal here at all." Muting the
+        # cache in low-mass regions avoids artifacts on extremities
+        # (stormtrooper hand) and blurred high-frequency detail (elf eyes).
         if float(mass_power) > 0.0 and float(mass_threshold) > 1e-6:
             mass_ratio = (values / float(mass_threshold)).clamp(0.0, 1.0)
             mass_confidence = mass_ratio.pow(float(mass_power))
@@ -847,13 +798,9 @@ class MaskVoxelCache:
         Returns the frozen value if a freeze fired on this call, else None.
 
         The patience-on-no-improvement heuristic catches the scene-specific
-        peak of the trusted curve regardless of when it occurs:
-            - On scenes where the peak is early (clown: ~edit-step 100),
-              the freeze fires around edit-step 100 + patience.
-            - On scenes with a later peak (elf, if any), it shifts
-              accordingly.
-        This sidesteps the hardcoded freeze-step problem where a single
-        step value over- or under-shoots the peak across different rigs.
+        peak wherever it occurs (clown peaks ~edit-step 100; other rigs
+        later), sidestepping a hardcoded freeze step that would over- or
+        under-shoot across capture geometries.
 
         Args:
             edit_step: current edit-relative iteration (not global step).
