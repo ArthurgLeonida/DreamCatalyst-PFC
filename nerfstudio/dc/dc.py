@@ -15,7 +15,6 @@ from dc.dc_unet import CustomUNet2DConditionModel
 from dc.guidance_utils import (
     apply_latent_mean_anchor,
     apply_source_blend,
-    apply_stg,
     apply_tag,
     compute_ca_mask_weight,
     compute_edit_strength,
@@ -71,13 +70,9 @@ class DCConfig:
     stg_enabled: bool = True
     stg_scale: float = 2.0
     stg_skip_layers: List[int] = field(default_factory=lambda: [2])
-    stg_schedule_enabled: bool = True
     stg_schedule_start_ratio: float = 0.4
     stg_schedule_end_ratio: float = 0.7
-    stg_schedule_mode: str = "bump"
     stg_bump_peak_ratio: float = 0.5
-    stg_edit_strength_adaptive: bool = True
-    stg_tag_compose_mode: str = "sequential"
 
     # Self-derived relevance masking
     gradient_mask_blur: float = 0.5
@@ -85,14 +80,11 @@ class DCConfig:
     gradient_mask_ema_beta_auto: bool = True
     gradient_mask_ema_beta_camera_factor: float = 2.0
     gradient_mask_gamma: float = 1.2
-    gradient_mask_warmup: int = 0
-    gradient_mask_raw_norm_quantile: float = 1.0
+    gradient_mask_raw_norm_quantile: float = 0.95
     source_blend_localization_enabled: bool = True
-    source_blend_floor: float = 0.0
 
     outside_mask_anchor_weight: float = 0.2
     outside_mask_anchor_edit_strength_adaptive: bool = True
-    outside_mask_anchor_edit_strength_power: float = 1.0
 
     cross_attention_mask_enabled: bool = True
     cross_attention_mask_layers: List[int] = field(default_factory=lambda: [1, 2])
@@ -103,12 +95,6 @@ class DCConfig:
     cross_attention_mask_weight_schedule_power: float = 0.5
 
     latent_mean_anchor_weight: float = 0.005
-
-    external_mask_fusion: str = "bidirectional"  # bidirectional | screen
-    external_mask_screen_attn_gate_strength: float = 1.0
-    external_mask_screen_self_boost_lambda: float = 1.0
-    external_mask_interp_suppression_ratio: float = 0.3
-    external_mask_negative_variance_power: float = 0.0
 
 
 class DC(object):
@@ -165,8 +151,8 @@ class DC(object):
         4. optionally sharpened and blurred,
         5. detached before use so it does not backprop through the mask.
 
-        Also returns a raw, max-normalized variant of the relevance map (no
-        percentile pass, no EMA, no post-processing). The percentile pass
+        Also returns a raw, quantile-normalized variant of the relevance map
+        (no percentile pass, no EMA, no post-processing). The percentile pass
         is the right choice for the DDS gradient mask — it keeps the spatial
         rank ordering and is invariant to noise-level scale — but it
         compresses absolute confidence toward the median, which makes
@@ -180,17 +166,12 @@ class DC(object):
         # own max so values are comparable across the cache's spatial extent.
         B = relevance.shape[0]
         flat_relevance = relevance.view(B, -1)
-        q_norm = float(self.config.gradient_mask_raw_norm_quantile)
-        if q_norm >= 1.0:
-            # Legacy per-frame max: one outlier pixel can rescale the frame.
-            per_sample_scale = flat_relevance.amax(dim=1)
-        else:
-            # Robust per-frame scale: divide by the q-quantile so a single hot
-            # pixel can no longer deflate the whole frame's mask (a major source
-            # of spurious cross-view variance once these masks are aggregated
-            # into the 3D voxel cache). Pixels above the quantile saturate to 1.
-            q_norm = min(max(q_norm, 0.5), 0.999)
-            per_sample_scale = torch.quantile(flat_relevance, q_norm, dim=1)
+        # Robust per-frame scale: divide by the q-quantile (q=0.95) so a single
+        # hot pixel cannot deflate the whole frame's mask (a major source of
+        # spurious cross-view variance once these masks are aggregated into the
+        # 3D voxel cache). Pixels above the quantile saturate to 1.
+        q_norm = min(max(float(self.config.gradient_mask_raw_norm_quantile), 0.5), 0.999)
+        per_sample_scale = torch.quantile(flat_relevance, q_norm, dim=1)
         per_sample_scale = per_sample_scale.clamp_min(1e-8).view(B, 1, 1, 1)
         raw_mask = (relevance / per_sample_scale).clamp(0.0, 1.0).detach()
 
@@ -204,13 +185,8 @@ class DC(object):
             ema_mask = beta * prev_mask + (1.0 - beta) * normalized.detach()
         self.gradient_mask_ema[current_spot] = ema_mask
 
-        if self.iteration < self.config.gradient_mask_warmup:
-            mask = torch.ones_like(normalized)
-        else:
-            mask = ema_mask
-
         mask = apply_mask_postprocessing(
-            mask,
+            ema_mask,
             gamma=self.config.gradient_mask_gamma,
             sigma=self.config.gradient_mask_blur,
         )
@@ -281,19 +257,16 @@ class DC(object):
                 self.tgt_text_feature = self.encode_text(tgt_prompt)
 
     def _get_current_stg_scale(self, current_edit_strength=None, iteration=None) -> float:
-        """Return scheduled STG scale, optionally attenuated by current edit strength."""
+        """Return the bump-scheduled STG scale attenuated by current edit strength."""
         if iteration is None:
             iteration = self.iteration
         return compute_stg_scale(
             base_scale=self.config.stg_scale,
             iteration=iteration,
             max_iteration=self.max_iteration,
-            schedule_enabled=self.config.stg_schedule_enabled,
-            mode=self.config.stg_schedule_mode,
             start_ratio=self.config.stg_schedule_start_ratio,
             end_ratio=self.config.stg_schedule_end_ratio,
             bump_peak_ratio=self.config.stg_bump_peak_ratio,
-            edit_strength_adaptive=self.config.stg_edit_strength_adaptive,
             current_edit_strength=current_edit_strength,
         )
 
@@ -506,82 +479,40 @@ class DC(object):
             if grad_mask is None:
                 grad_mask = ext
             else:
-                mode = str(self.config.external_mask_fusion).lower()
-                
-                # Check and compute gating signal once, before branching on fusion mode
-                gate_signal = None
-                if mode in ["bidirectional", "screen"]:
-                    if target_cross_attention_mask is None and self_grad_mask is None:
-                        if mode == "bidirectional":
-                            raise ValueError(
-                                "external_mask_fusion='bidirectional' requires at least one of "
-                                "target_cross_attention_mask or self_grad_mask to be available for "
-                                "gate computation. Enable cross_attention_mask or self-derived mask."
-                            )
-                    else:
-                        target_shape = grad_mask.shape[-2:]
+                # Positive-only fusion: the cache adds agreed-upon edit force
+                # where the 3D consensus exceeds the 2D mask; it never
+                # subtracts. The addition is modulated by the warmup blend and
+                # the per-pixel cache confidence (both folded into
+                # blend_tensor) and by the semantic gate max(M_attn, M_self),
+                # so the cache cannot push edits into regions the 2D masks do
+                # not recognize.
+                target_shape = grad_mask.shape[-2:]
 
-                        def _to_target(m):
-                            if m is None:
-                                return None
-                            if m.shape[-2:] != target_shape:
-                                m = F.interpolate(
-                                    m,
-                                    size=target_shape,
-                                    mode="bilinear",
-                                    align_corners=False,
-                                )
-                            return m.to(device=grad_mask.device, dtype=grad_mask.dtype).clamp(0.0, 1.0)
-
-                        target_ca = _to_target(target_cross_attention_mask)
-                        sm = _to_target(self_grad_mask)
-
-                        gate_signal = compute_gate_signal(
-                            target_ca=target_ca,
-                            sm=sm,
-                            self_boost_lambda=self.config.external_mask_screen_self_boost_lambda,
+                def _to_target(m):
+                    if m is None:
+                        return None
+                    if m.shape[-2:] != target_shape:
+                        m = F.interpolate(
+                            m,
+                            size=target_shape,
+                            mode="bilinear",
+                            align_corners=False,
                         )
+                    return m.to(device=grad_mask.device, dtype=grad_mask.dtype).clamp(0.0, 1.0)
 
-                if mode == "bidirectional":
-                    diff = ext - grad_mask
-                    gate = 1.0
+                gate_signal = compute_gate_signal(
+                    target_ca=_to_target(target_cross_attention_mask),
+                    sm=_to_target(self_grad_mask),
+                )
+                gate = gate_signal if gate_signal is not None else 1.0
 
-                    if gate_signal is not None:
-                        strength = min(max(float(self.config.external_mask_screen_attn_gate_strength), 0.0), 1.0)
-                        gate = (1.0 - strength) + strength * gate_signal
-
-                    if torch.is_tensor(blend_tensor):
-                        blend_map = blend_tensor
-                    else:
-                        blend_map = torch.full_like(diff, float(blend_tensor))
-
-                    up = blend_map * gate * diff.clamp_min(0.0)
-                    neg_var_power = float(self.config.external_mask_negative_variance_power)
-                    if neg_var_power > 0.0 and confidence is not None:
-                        neg_extra = confidence.clamp(0.0, 1.0).pow(neg_var_power)
-                    else:
-                        neg_extra = 1.0
-                    down = (
-                        blend_map
-                        * neg_extra
-                        * float(self.config.external_mask_interp_suppression_ratio)
-                        * diff.clamp_max(0.0)
-                    )
-                    fused = grad_mask + up + down
-                elif mode == "screen":
-                    contribution = blend_tensor * ext * (1.0 - grad_mask)
-
-                    if gate_signal is not None:
-                        strength = float(self.config.external_mask_screen_attn_gate_strength)
-                        strength = min(max(strength, 0.0), 1.0)
-                        gate = (1.0 - strength) + strength * gate_signal
-                        contribution = contribution * gate
-                    fused = grad_mask + contribution
+                if torch.is_tensor(blend_tensor):
+                    blend_map = blend_tensor
                 else:
-                    raise ValueError(
-                        f"Unknown external_mask_fusion={mode!r}; expected "
-                        f"'bidirectional' or 'screen'."
-                    )
+                    blend_map = torch.full_like(grad_mask, float(blend_tensor))
+
+                diff = ext - grad_mask
+                fused = grad_mask + blend_map * gate * diff.clamp_min(0.0)
                 grad_mask = torch.where(valid, fused, grad_mask) if valid is not None else fused
             grad_mask = grad_mask.clamp(0.0, 1.0)
 
@@ -592,12 +523,6 @@ class DC(object):
         )
 
         # Phase 2: apply guidance novelties from cached eps_raw after the clean current mask exists.
-        compose_mode = str(self.config.stg_tag_compose_mode).lower()
-        if compose_mode not in ("sequential", "parallel"):
-            raise ValueError(
-                f"Unknown stg_tag_compose_mode={compose_mode!r}; expected "
-                f"'sequential' or 'parallel'."
-            )
         for name in ["tgt", "src"]:
             eps_full = eps_raw[name]
             latents_noisy = noisy_latents[name]
@@ -620,16 +545,12 @@ class DC(object):
                 weak_text, weak_image, weak_uncond = weak_pred.chunk(3)
                 noise_pred_weak = weak_uncond + self.config.guidance_scale * (weak_text - weak_image) + \
                     self.config.image_guidance_scale * (weak_image - weak_uncond)
-                if compose_mode == "sequential":
-                    # eps_out = TAG(eps_full + s·(eps_full − eps_weak))
-                    noise_pred = apply_stg(eps_full, noise_pred_weak, current_stg_scale)
-                    noise_pred = apply_tag(noise_pred, latents_noisy, eta_current)
-                else:  # "parallel"
-                    # eps_out = TAG(eps_full) + s·(eps_full − eps_weak)
-                    # TAG and STG act independently on the raw CFG prediction.
-                    tag_out = apply_tag(eps_full, latents_noisy, eta_current)
-                    stg_perturbation = current_stg_scale * (eps_full - noise_pred_weak)
-                    noise_pred = tag_out + stg_perturbation
+                # eps_out = TAG(eps_full) + s·(eps_full − eps_weak)
+                # TAG and STG act independently on the raw CFG prediction
+                # ("parallel" composition).
+                tag_out = apply_tag(eps_full, latents_noisy, eta_current)
+                stg_perturbation = current_stg_scale * (eps_full - noise_pred_weak)
+                noise_pred = tag_out + stg_perturbation
             else:
                 # STG inactive on this branch — TAG only.
                 noise_pred = apply_tag(eps_full, latents_noisy, eta_current)
@@ -640,16 +561,13 @@ class DC(object):
 
         eps_tgt_for_grad = eps["tgt"]
         if self.config.source_blend_localization_enabled and grad_mask is not None:
-            eps_tgt_for_grad = apply_source_blend(
-                eps["tgt"], eps["src"], grad_mask, floor=self.config.source_blend_floor
-            )
+            eps_tgt_for_grad = apply_source_blend(eps["tgt"], eps["src"], grad_mask)
 
         preserve_weight = compute_preserve_weight(
             psi=self.config.psi,
             grad_mask=grad_mask,
             outside_mask_anchor_weight=self.config.outside_mask_anchor_weight,
             outside_mask_anchor_edit_strength_adaptive=self.config.outside_mask_anchor_edit_strength_adaptive,
-            outside_mask_anchor_edit_strength_power=self.config.outside_mask_anchor_edit_strength_power,
             edit_strength=current_edit_strength,
         )
 

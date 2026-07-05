@@ -38,6 +38,7 @@ wandb/
 docs/*
 !docs/VoxelCacheExplained.md
 scripts/fill_anteprojeto.py
+method_explanation.md
 
 # OS / editor
 .DS_Store

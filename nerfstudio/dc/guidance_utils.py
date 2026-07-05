@@ -43,38 +43,18 @@ def apply_tag(noise_pred: torch.Tensor, latents_noisy: torch.Tensor, eta: float)
     return noise_parallel + eta * noise_tangential
 
 
-def apply_stg(noise_pred: torch.Tensor, noise_pred_weak: torch.Tensor, scale: float) -> torch.Tensor:
-    """Apply STG extrapolation from weak-model prediction to full prediction."""
-    if scale <= 0:
-        return noise_pred
-    return noise_pred + scale * (noise_pred - noise_pred_weak)
-
-
 def apply_source_blend(
     eps_tgt: torch.Tensor,
     eps_src: torch.Tensor,
     mask: torch.Tensor,
-    floor: float = 0.0,
 ) -> torch.Tensor:
     """Localize DDS by falling back to the source branch outside the mask.
 
-    With ``floor=0`` (default) this reproduces the original hard gate
-    ``eps_src + M·(eps_tgt − eps_src)``: the edit is exactly zero where M=0.
-
-    A positive ``floor ∈ (0, 1]`` softens the gate to a leaky one,
-    ``M' = floor + (1 − floor)·M``, so a fraction ``floor`` of the full edit
-    drive reaches M≈0 regions. This breaks the chicken-and-egg lock where the
-    edit can only grow where the relevance mask is already nonzero (the mask is
-    built from ‖eps_tgt − eps_src‖, which is ~0 in regions the edit has not yet
-    reached): the leaked drive lets a novel structure begin growing into empty
-    space and bootstrap its own mask. ``floor=1`` disables localization entirely
-    (edit applied everywhere, equivalent to source_blend off).
+    Hard gate ``eps_src + M·(eps_tgt − eps_src)``: inside the mask the target
+    prediction wins, outside it the source prediction wins, so the DDS delta
+    is exactly zero where M = 0.
     """
-    if floor <= 0.0:
-        return eps_src + mask * (eps_tgt - eps_src)
-    floor = min(float(floor), 1.0)
-    effective_mask = floor + (1.0 - floor) * mask
-    return eps_src + effective_mask * (eps_tgt - eps_src)
+    return eps_src + mask * (eps_tgt - eps_src)
 
 
 def compute_stg_scale(
@@ -82,60 +62,41 @@ def compute_stg_scale(
     base_scale: float,
     iteration: int,
     max_iteration: int,
-    schedule_enabled: bool,
-    mode: str,
     start_ratio: float,
     end_ratio: float,
     bump_peak_ratio: float,
-    edit_strength_adaptive: bool,
     current_edit_strength: Optional[float],
 ) -> float:
-    """Return scheduled STG scale, optionally attenuated by current-step edit strength.
+    """Return the bump-scheduled STG scale, attenuated by current edit strength.
+
+    The scale follows a triangular bump over training progress: zero outside
+    [start_ratio, end_ratio], rising linearly to `base_scale` at the peak and
+    falling back to zero before the end (the final stretch of training runs
+    without STG so views can converge coherently).
 
     `current_edit_strength` is the ratio `||eps_tgt − eps_src|| / (||eps_tgt|| + ||eps_src||)`
-    in [0, 1] — high for creative/structural edits, low for identity-preserving edits.
-    When enabled, `scale *= (1 − edit_strength)` so bold edits attenuate STG more.
+    in [0, 1] — high for creative/structural edits, low for identity-preserving
+    edits. The scale is multiplied by `(1 − edit_strength)` so bold edits
+    attenuate STG more.
     """
-    if not schedule_enabled:
-        scale = float(base_scale)
+    max_iteration = max(int(max_iteration), 1)
+    progress = min(max(iteration / max_iteration, 0.0), 1.0)
+    start_ratio = float(start_ratio)
+    end_ratio = float(end_ratio)
+
+    if progress <= start_ratio or progress >= end_ratio or end_ratio <= start_ratio:
+        scale = 0.0
     else:
-        max_iteration = max(int(max_iteration), 1)
-        progress = min(max(iteration / max_iteration, 0.0), 1.0)
-        start_ratio = float(start_ratio)
-        end_ratio = float(end_ratio)
-        mode = str(mode).lower()
-
-        if mode == "growth":
-            if progress <= start_ratio:
-                scale = 0.0
-            elif progress >= end_ratio or end_ratio <= start_ratio:
-                scale = float(base_scale)
-            else:
-                scale = float(base_scale) * (progress - start_ratio) / (end_ratio - start_ratio)
-        elif mode == "bump":
-            if progress <= start_ratio or progress >= end_ratio or end_ratio <= start_ratio:
-                scale = 0.0
-            else:
-                peak_ratio = min(max(float(bump_peak_ratio), 0.0), 1.0)
-                peak_time = start_ratio + peak_ratio * (end_ratio - start_ratio)
-                if progress <= peak_time:
-                    span = max(peak_time - start_ratio, 1e-8)
-                    scale = float(base_scale) * (progress - start_ratio) / span
-                else:
-                    span = max(end_ratio - peak_time, 1e-8)
-                    scale = float(base_scale) * (end_ratio - progress) / span
+        peak_ratio = min(max(float(bump_peak_ratio), 0.0), 1.0)
+        peak_time = start_ratio + peak_ratio * (end_ratio - start_ratio)
+        if progress <= peak_time:
+            span = max(peak_time - start_ratio, 1e-8)
+            scale = float(base_scale) * (progress - start_ratio) / span
         else:
-            if end_ratio <= start_ratio:
-                scale = float(base_scale) if progress < end_ratio else 0.0
-            elif progress <= start_ratio:
-                scale = float(base_scale)
-            elif progress >= end_ratio:
-                scale = 0.0
-            else:
-                decay_progress = (progress - start_ratio) / (end_ratio - start_ratio)
-                scale = float(base_scale) * (1.0 - decay_progress)
+            span = max(end_ratio - peak_time, 1e-8)
+            scale = float(base_scale) * (end_ratio - progress) / span
 
-    if edit_strength_adaptive and current_edit_strength is not None:
+    if current_edit_strength is not None:
         s = min(max(float(current_edit_strength), 0.0), 1.0)
         scale = scale * (1.0 - s)
 
@@ -182,17 +143,15 @@ def compute_preserve_weight(
     grad_mask: Optional[torch.Tensor],
     outside_mask_anchor_weight: float,
     outside_mask_anchor_edit_strength_adaptive: bool,
-    outside_mask_anchor_edit_strength_power: float = 1.0,
     edit_strength: Optional[float] = None,
 ):
     """Compute DreamCatalyst preservation weight plus optional outside-mask anchor.
 
     `edit_strength` ∈ [0, 1] is the precomputed scalar from `compute_edit_strength`.
-    When the adaptive flag is on, the anchor weight is attenuated by
-    `(1 − edit_strength)^power`. Higher power → more aggressive scaling: scenes
-    with high edit strength get their anchor reduced much more than scenes with
-    low edit strength, decoupling per-scene difficulty from the universal config.
-    Power 1.0 reproduces the original linear scaling.
+    When the adaptive flag is on, the anchor weight is attenuated linearly by
+    `(1 − edit_strength)`: structural edits (high s) loosen the background
+    anchor so it does not block the edit; identity edits keep it at full
+    strength — no per-scene tuning.
     """
     preserve_weight = psi
 
@@ -200,8 +159,7 @@ def compute_preserve_weight(
         w_out_effective = outside_mask_anchor_weight
         if outside_mask_anchor_edit_strength_adaptive and edit_strength is not None:
             s = min(max(float(edit_strength), 0.0), 1.0)
-            power = max(float(outside_mask_anchor_edit_strength_power), 0.0)
-            w_out_effective = w_out_effective * ((1.0 - s) ** power)
+            w_out_effective = w_out_effective * (1.0 - s)
         preserve_weight = preserve_weight + w_out_effective * (1.0 - grad_mask)
 
     return preserve_weight
@@ -224,10 +182,8 @@ def apply_latent_mean_anchor(
 def compute_gate_signal(
     target_ca: Optional[torch.Tensor],
     sm: Optional[torch.Tensor],
-    self_boost_lambda: float,
 ) -> Optional[torch.Tensor]:
+    """Semantic gate for the cache fusion: pixel-wise max of the CA and self masks."""
     if sm is not None and target_ca is not None:
-        lam = max(float(self_boost_lambda), 0.0)
-        gate_signal = target_ca + lam * (sm - target_ca).clamp_min(0.0)
-        return gate_signal.clamp(0.0, 1.0)
+        return torch.maximum(target_ca, sm).clamp(0.0, 1.0)
     return target_ca if target_ca is not None else sm

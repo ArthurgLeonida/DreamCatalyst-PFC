@@ -40,23 +40,10 @@ class DCPipelineConfig(VanillaPipelineConfig):
     log_step: int = 10
 
     mask_voxel_cache_enabled: bool = VOXEL_CACHE_PARAMS["mask_voxel_cache_enabled"]
-    mask_voxel_cache_measure_only: bool = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_measure_only", False
-    )
-    mask_voxel_cache_scale_normalize: bool = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_scale_normalize", False
-    )
     mask_voxel_cache_scale_normalize_quantile: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_scale_normalize_quantile", 0.95
     )
-    mask_voxel_cache_trilinear: bool = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_trilinear", False
-    )
     mask_voxel_cache_resolution: int = VOXEL_CACHE_PARAMS["mask_voxel_cache_resolution"]
-    mask_voxel_cache_ema_beta: float = VOXEL_CACHE_PARAMS["mask_voxel_cache_ema_beta"]
-    mask_voxel_cache_ema_beta_auto: bool = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_ema_beta_auto", False
-    )
     mask_voxel_cache_ema_beta_camera_factor: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_ema_beta_camera_factor", 2.0
     )
@@ -66,18 +53,6 @@ class DCPipelineConfig(VanillaPipelineConfig):
     mask_voxel_cache_accumulation_threshold: float = VOXEL_CACHE_PARAMS[
         "mask_voxel_cache_accumulation_threshold"
     ]
-    mask_voxel_cache_update_threshold: float = VOXEL_CACHE_PARAMS[
-        "mask_voxel_cache_update_threshold"
-    ]
-    mask_voxel_cache_confidence_enabled: bool = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_confidence_enabled", False
-    )
-    mask_voxel_cache_min_observations: int = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_min_observations", 1
-    )
-    mask_voxel_cache_min_observations_auto: bool = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_min_observations_auto", False
-    )
     mask_voxel_cache_observation_fraction: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_observation_fraction", 0.05
     )
@@ -96,9 +71,6 @@ class DCPipelineConfig(VanillaPipelineConfig):
     mask_voxel_cache_angular_power: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_angular_power", 0.0
     )
-    mask_voxel_cache_angular_relative: bool = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_angular_relative", False
-    )
     mask_voxel_cache_mass_threshold: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_mass_threshold", 0.0
     )
@@ -111,10 +83,6 @@ class DCPipelineConfig(VanillaPipelineConfig):
     mask_voxel_cache_angular_freeze_warmup: int = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_angular_freeze_warmup", 50
     )
-    mask_voxel_cache_min_angular_factor: float = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_min_angular_factor", 0.0
-    )
-    mask_voxel_cache_bbox_source: str = VOXEL_CACHE_PARAMS["mask_voxel_cache_bbox_source"]
     mask_voxel_cache_bbox_observe_steps: int = VOXEL_CACHE_PARAMS[
         "mask_voxel_cache_bbox_observe_steps"
     ]
@@ -205,17 +173,8 @@ class DCPipeline(ModifiedVanillaPipeline):
         return rendered_image, current_spot, depth_world, accumulation_world
 
     def _voxel_cache_active(self) -> bool:
-        """Whether the voxel cache should be built and updated this run.
-
-        True when the cache is enabled (it influences the gradient) OR when
-        `mask_voxel_cache_measure_only` is set (passive cache-off control: the
-        cache accumulates cross-view statistics but never blends into the
-        gradient). Gates depth capture, lazy build, and the update path, while
-        the query/blend stays gated on `mask_voxel_cache_enabled` alone.
-        """
-        return bool(self.config.mask_voxel_cache_enabled) or bool(
-            getattr(self.config, "mask_voxel_cache_measure_only", False)
-        )
+        """Whether the voxel cache is built, queried and updated this run."""
+        return bool(self.config.mask_voxel_cache_enabled)
 
     def _scale_normalize_cache_mask(self, ext, valid):
         """Contrast-stretch the queried voxel-cache mask to [0,1] over its
@@ -223,13 +182,12 @@ class DCPipeline(ModifiedVanillaPipeline):
 
         The cache value is a multi-view MEAN (compressed toward mid-range, with
         a 0.5 fallback for under-observed voxels), while the 2D hybrid mask is a
-        sharp [0,1] indicator. DC's bidirectional fusion differences the two
-        (``ext - grad_mask``); because the compressed cache sits below the 2D
-        peaks across the whole edit region, the subtractive ("negative
-        correction") term fires on the genuine edit, not just background — a
-        scale artifact, not real 3D disagreement. Rescaling the cache's active
-        range (its ``[1-q, q]`` percentiles over observed voxels) to [0,1] makes
-        the comparison like-for-like, so the down-term only cleans background.
+        sharp [0,1] indicator. DC's positive-only fusion differences the two
+        (``max(ext - grad_mask, 0)``); because the compressed cache sits below
+        the 2D peaks across the edit region, the support term would barely fire
+        where it should — a scale artifact, not real 3D disagreement. Rescaling
+        the cache's active range (its ``[1-q, q]`` percentiles over observed
+        voxels) to [0,1] makes the comparison like-for-like.
 
         Selection uses the observed/in-bounds mask (not confidence) so the low
         end of the range captures background voxels; invalid/fallback pixels
@@ -242,75 +200,34 @@ class DCPipeline(ModifiedVanillaPipeline):
         if int(sel.sum().item()) < 16:
             return ext  # too few observed voxels to estimate a stable range
         vals = ext.reshape(-1)[sel].float()
-        q = float(getattr(self.config, "mask_voxel_cache_scale_normalize_quantile", 0.95))
-        q = min(max(q, 0.5), 0.999)
+        q = min(max(float(self.config.mask_voxel_cache_scale_normalize_quantile), 0.5), 0.999)
         lo = torch.quantile(vals, 1.0 - q).to(ext.dtype)
         hi = torch.quantile(vals, q).to(ext.dtype)
         span = (hi - lo).clamp_min(1e-4)
         return ((ext - lo) / span).clamp(0.0, 1.0)
 
     def _ensure_voxel_cache(self):
-        """Lazy-initialize the voxel cache.
+        """Lazy-initialize the voxel cache from the observed bounding box.
 
-        Two bbox sources are supported, selected by
-        `config.mask_voxel_cache_bbox_source`:
-
-        - "cameras" (default, robust):
-            Derive from the AABB of camera positions
-            (`cameras.camera_to_worlds[..., :3, 3]`), inflated by
-            `bbox_inflation`. By construction, rays generated from these
-            cameras are in the same coordinate frame, so backprojected
-            world points cannot fall outside the bbox due to a frame
-            mismatch.
-
-        - "scene_box":
-            Use `dataparser_outputs.scene_box.aabb`. Fast but assumes the
-            dataparser keeps scene_box in the same frame as the cameras —
-            which several Nerfstudio dataparsers do not (some normalize
-            cameras to a unit cube while leaving `scene_box.aabb` in raw
-            world units, or vice versa). When this assumption fails, most
-            backprojected points fall outside the bbox and the cache
-            populates extremely sparsely (the symptom on the prior run:
-            occupancy ~1.2%, valid_ratio ~0.5%).
-
-        The chosen bbox is printed once at init so you can eyeball it
-        against the camera positions and any depth statistics in WandB.
+        The bbox comes from the backprojected world points accumulated by
+        `_observe_points` during the first `bbox_observe_steps` iterations
+        (quantile-clipped against far-depth outliers, then inflated). By
+        construction it contains exactly the surface points the cache will
+        index — camera-position AABBs or dataparser scene boxes can sit in a
+        different frame and leave most backprojected points out of bounds.
+        The chosen bbox is printed once at init so it can be eyeballed
+        against the camera positions and depth statistics in WandB.
         """
         if self.mask_voxel_cache is not None:
             return
         if not self._voxel_cache_active():
             return
+        if self._observed_pts_min is None or self._observed_pts_max is None:
+            return
 
-        source = str(self.config.mask_voxel_cache_bbox_source).lower()
         inflation = float(self.config.mask_voxel_cache_bbox_inflation)
-        cameras = self.datamanager.train_dataparser_outputs.cameras
-
-        if source == "observed":
-            if self._observed_pts_min is None or self._observed_pts_max is None:
-                return
-            bbox_min = self._observed_pts_min.clone()
-            bbox_max = self._observed_pts_max.clone()
-        elif source == "cameras":
-            # Camera-position AABB. cameras.camera_to_worlds is [..., 3, 4];
-            # the last column is the translation (= camera origin in world).
-            # NOTE: empirically wrong for object-centric capture — left here
-            # only as an explicit opt-in for debugging.
-            c2w = cameras.camera_to_worlds.to(self.device)
-            if c2w.dim() == 2:
-                c2w = c2w.unsqueeze(0)
-            cam_pos = c2w[..., :3, 3].reshape(-1, 3).float()
-            bbox_min = cam_pos.min(dim=0).values
-            bbox_max = cam_pos.max(dim=0).values
-        elif source == "scene_box":
-            scene_box = self.datamanager.train_dataparser_outputs.scene_box
-            aabb = scene_box.aabb.to(self.device).float()
-            bbox_min = aabb[0]
-            bbox_max = aabb[1]
-        else:
-            raise ValueError(
-                f"Unknown mask_voxel_cache_bbox_source={source!r}; "
-                f"expected 'observed', 'cameras', or 'scene_box'."
-            )
+        bbox_min = self._observed_pts_min.clone()
+        bbox_max = self._observed_pts_max.clone()
 
         center = 0.5 * (bbox_min + bbox_max)
         half_extent = 0.5 * (bbox_max - bbox_min) * (1.0 + inflation)
@@ -321,7 +238,7 @@ class DCPipeline(ModifiedVanillaPipeline):
         self.mask_voxel_cache_effective_ema_beta = ema_beta
 
         print(
-            f"[voxel cache] source={source}, inflation={inflation:.2f}, "
+            f"[voxel cache] observed bbox, inflation={inflation:.2f}, "
             f"resolution={self.config.mask_voxel_cache_resolution}, "
             f"ema_beta={ema_beta:.6f}"
         )
@@ -335,18 +252,13 @@ class DCPipeline(ModifiedVanillaPipeline):
             bbox_max=bbox_max,
             resolution=self.config.mask_voxel_cache_resolution,
             ema_beta=ema_beta,
-            num_views=n_views if self.config.mask_voxel_cache_confidence_enabled else None,
-            variance_decay=float(
-                getattr(self.config, "mask_voxel_cache_variance_decay", 0.0)
-            ),
+            num_views=n_views,
+            variance_decay=float(self.config.mask_voxel_cache_variance_decay),
             device=self.device,
         )
 
     def _effective_voxel_cache_ema_beta(self) -> float:
-        """Return the manual or camera-count-aware voxel-cache EMA beta."""
-        if not self.config.mask_voxel_cache_ema_beta_auto:
-            return min(max(float(self.config.mask_voxel_cache_ema_beta), 0.0), 0.9999)
-
+        """Camera-count-aware voxel-cache EMA beta: 1 − 1/(factor · N_cam)."""
         n_cameras = max(
             1,
             len(self.datamanager.train_dataparser_outputs.image_filenames),
@@ -356,10 +268,7 @@ class DCPipeline(ModifiedVanillaPipeline):
         return min(max(beta, 0.0), 0.9999)
 
     def _effective_voxel_cache_min_observations(self) -> int:
-        """Return the manual or camera-count-aware voxel trust threshold."""
-        if not self.config.mask_voxel_cache_min_observations_auto:
-            return max(int(self.config.mask_voxel_cache_min_observations), 1)
-
+        """Camera-count-aware trust threshold: clamp(ceil(fraction · N_cam), floor, cap)."""
         n_cameras = max(
             1,
             len(self.datamanager.train_dataparser_outputs.image_filenames),
@@ -373,9 +282,9 @@ class DCPipeline(ModifiedVanillaPipeline):
     def _observe_points(self, points_world: torch.Tensor, valid: torch.Tensor) -> None:
         """Accumulate robust per-axis bounds of valid backprojected world points.
 
-        Called during the bbox-observation window (when bbox_source="observed"
-        and the cache hasn't been built yet). Once enough iterations have been
-        observed, `_ensure_voxel_cache()` will pick up these accumulated bounds.
+        Called during the bbox-observation window (while the cache hasn't been
+        built yet). Once enough iterations have been observed,
+        `_ensure_voxel_cache()` picks up these accumulated bounds.
 
         Per-iteration robustification:
           - With `bbox_observe_quantile = 0` we take the literal per-axis
@@ -426,8 +335,8 @@ class DCPipeline(ModifiedVanillaPipeline):
     def _voxel_cache_warmup_blend(self, edit_step: int) -> float:
         """Linear ramp from 0 → max_blend over [warmup_start, warmup_end].
 
-        Same shape as the `gradient_mask_warmup` ramp, applied to the
-        external-mask blend rather than to the mask itself.
+        The cache starts empty, so its influence on the final mask ramps in
+        only after it has accumulated multi-view evidence.
         """
         s = self.config.mask_voxel_cache_warmup_start
         e = self.config.mask_voxel_cache_warmup_end
@@ -505,11 +414,6 @@ class DCPipeline(ModifiedVanillaPipeline):
             and depth_world is not None
         ):
             voxel_cache_edit_step = self._voxel_cache_edit_step(step)
-            # For non-observed sources, build the cache eagerly (existing flow).
-            # For "observed" source, defer building until enough world-point
-            # samples are accumulated below.
-            if str(self.config.mask_voxel_cache_bbox_source).lower() != "observed":
-                self._ensure_voxel_cache()
             mask_h, mask_w = x0.shape[-2:]
             H_cam, W_cam = int(depth_world.shape[0]), int(depth_world.shape[1])
 
@@ -567,10 +471,7 @@ class DCPipeline(ModifiedVanillaPipeline):
                 & (d > 0.0)
             ).reshape(-1)
 
-            if (
-                str(self.config.mask_voxel_cache_bbox_source).lower() == "observed"
-                and self.mask_voxel_cache is None
-            ):
+            if self.mask_voxel_cache is None:
                 self._observe_points(mask_world_points, mask_world_points_valid)
                 if (
                     self._observed_pts_count
@@ -588,63 +489,40 @@ class DCPipeline(ModifiedVanillaPipeline):
                     )
 
             if self.mask_voxel_cache is not None:
-                min_observations = (
-                    self._effective_voxel_cache_min_observations()
-                    if self.config.mask_voxel_cache_confidence_enabled
-                    else 1
-                )
+                min_observations = self._effective_voxel_cache_min_observations()
                 self.mask_voxel_cache_effective_min_observations = min_observations
-                if self.config.mask_voxel_cache_enabled:
-                    (
-                        queried,
-                        cache_valid,
-                        cache_confidence,
-                        cache_count,
-                        cache_variance,
-                    ) = self.mask_voxel_cache.query(
-                        mask_world_points,
-                        in_bounds=mask_world_points_valid,
-                        return_valid=True,
-                        return_stats=True,
-                        min_observations=min_observations,
-                        max_variance=(
-                            self.config.mask_voxel_cache_max_variance
-                            if self.config.mask_voxel_cache_confidence_enabled
-                            else None
-                        ),
-                        angular_power=float(self.config.mask_voxel_cache_angular_power),
-                        min_angular_factor=float(
-                            self.config.mask_voxel_cache_min_angular_factor
-                        ),
-                        angular_relative=bool(
-                            self.config.mask_voxel_cache_angular_relative
-                        ),
-                        mass_threshold=float(
-                            self.config.mask_voxel_cache_mass_threshold
-                        ),
-                        mass_power=float(
-                            self.config.mask_voxel_cache_mass_power
-                        ),
-                        trilinear=bool(
-                            getattr(self.config, "mask_voxel_cache_trilinear", False)
-                        ),
-                    )
-                    external_grad_mask = queried.view(1, 1, mask_h, mask_w).to(
-                        device=x0.device, dtype=x0.dtype
-                    )
-                    external_grad_mask_valid = cache_valid.view(1, 1, mask_h, mask_w).to(
-                        device=x0.device
-                    )
-                    external_grad_mask_confidence = cache_confidence.view(1, 1, mask_h, mask_w).to(
-                        device=x0.device, dtype=x0.dtype
-                    )
-                    if getattr(self.config, "mask_voxel_cache_scale_normalize", False):
-                        external_grad_mask = self._scale_normalize_cache_mask(
-                            external_grad_mask, external_grad_mask_valid
-                        )
-                    voxel_cache_query_count = cache_count.view(1, 1, mask_h, mask_w)
-                    voxel_cache_query_variance = cache_variance.view(1, 1, mask_h, mask_w)
-                    external_mask_blend = self._voxel_cache_warmup_blend(voxel_cache_edit_step)
+                (
+                    queried,
+                    cache_valid,
+                    cache_confidence,
+                    cache_count,
+                    cache_variance,
+                ) = self.mask_voxel_cache.query(
+                    mask_world_points,
+                    in_bounds=mask_world_points_valid,
+                    return_valid=True,
+                    return_stats=True,
+                    min_observations=min_observations,
+                    max_variance=self.config.mask_voxel_cache_max_variance,
+                    angular_power=float(self.config.mask_voxel_cache_angular_power),
+                    mass_threshold=float(self.config.mask_voxel_cache_mass_threshold),
+                    mass_power=float(self.config.mask_voxel_cache_mass_power),
+                )
+                external_grad_mask = queried.view(1, 1, mask_h, mask_w).to(
+                    device=x0.device, dtype=x0.dtype
+                )
+                external_grad_mask_valid = cache_valid.view(1, 1, mask_h, mask_w).to(
+                    device=x0.device
+                )
+                external_grad_mask_confidence = cache_confidence.view(1, 1, mask_h, mask_w).to(
+                    device=x0.device, dtype=x0.dtype
+                )
+                external_grad_mask = self._scale_normalize_cache_mask(
+                    external_grad_mask, external_grad_mask_valid
+                )
+                voxel_cache_query_count = cache_count.view(1, 1, mask_h, mask_w)
+                voxel_cache_query_variance = cache_variance.view(1, 1, mask_h, mask_w)
+                external_mask_blend = self._voxel_cache_warmup_blend(voxel_cache_edit_step)
 
             if self.use_wandb and step % self.config.log_step == 0:
                 import wandb
@@ -705,15 +583,11 @@ class DCPipeline(ModifiedVanillaPipeline):
                 mask_world_points,
                 new_mask,
                 in_bounds=mask_world_points_valid,
-                value_threshold=self.config.mask_voxel_cache_update_threshold,
                 view_id=current_view_id,
                 return_per_voxel_mean=log_this_step,
                 ray_directions=mask_ray_directions,
             )
-            if (
-                self.config.mask_voxel_cache_angular_relative
-                and not self.mask_voxel_cache.angular_denominator_is_frozen
-            ):
+            if not self.mask_voxel_cache.angular_denominator_is_frozen:
                 edit_step_for_freeze = (
                     voxel_cache_edit_step
                     if voxel_cache_edit_step is not None
@@ -754,14 +628,6 @@ class DCPipeline(ModifiedVanillaPipeline):
                 payload = {
                     "dc_debug/voxel_cache_occupancy": float(self.mask_voxel_cache.occupancy),
                     "dc_debug/voxel_cache_blend": float(external_mask_blend),
-                    "dc_debug/voxel_cache_measure_only": (
-                        1.0
-                        if (
-                            getattr(self.config, "mask_voxel_cache_measure_only", False)
-                            and not self.config.mask_voxel_cache_enabled
-                        )
-                        else 0.0
-                    ),
                     "dc_debug/voxel_cache_valid_ratio": valid_ratio,
                     "dc_debug/voxel_cache_edit_step": float(voxel_cache_edit_step or 0),
                     "dc_debug/voxel_cache_ema_beta": float(
@@ -811,15 +677,9 @@ class DCPipeline(ModifiedVanillaPipeline):
                     payload["dc_debug/voxel_cache_update_hist"] = wandb.Histogram(
                         snap.numpy(), num_bins=50
                     )
-                    threshold = float(
-                        self.config.mask_voxel_cache_update_threshold
-                    )
-                    payload["dc_debug/voxel_cache_update_mean_pre_gate"] = float(
+                    payload["dc_debug/voxel_cache_update_mean"] = float(
                         snap.mean().item()
                     )
-                    payload["dc_debug/voxel_cache_update_above_threshold_frac"] = float(
-                        (snap >= threshold).float().mean().item()
-                    ) if threshold > 0.0 else 1.0
                 src_2d = new_mask.detach().float().cpu()
                 if src_2d.numel() > 0:
                     payload["dc_debug/voxel_cache_input_mask_hist"] = wandb.Histogram(

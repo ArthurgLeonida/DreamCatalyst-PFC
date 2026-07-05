@@ -104,63 +104,43 @@ if enabled:
     last = "\u2514\u2500"
     arrow = "\u2192"
     print(f"   {branch} res:        {voxel['mask_voxel_cache_resolution']}")
-    if voxel.get("mask_voxel_cache_ema_beta_auto", False):
-        factor = voxel.get("mask_voxel_cache_ema_beta_camera_factor", 2.0)
-        print(f"   {branch} ema:        auto 1-1/({factor}*Ncam)")
-    else:
-        print(f"   {branch} ema:        {voxel['mask_voxel_cache_ema_beta']}")
+    factor = voxel.get("mask_voxel_cache_ema_beta_camera_factor", 2.0)
+    print(f"   {branch} ema:        auto 1-1/({factor}*Ncam)")
     print(
-        f"   {branch} bbox src:   "
-        f"{voxel['mask_voxel_cache_bbox_source']} "
+        f"   {branch} bbox:       observed "
         f"(q={voxel['mask_voxel_cache_bbox_observe_quantile']}, "
         f"infl={voxel['mask_voxel_cache_bbox_inflation']})"
     )
     print(f"   {branch} acc thr:    {voxel['mask_voxel_cache_accumulation_threshold']}")
-    print(f"   {branch} upd thr:    {voxel['mask_voxel_cache_update_threshold']}")
-    if voxel.get("mask_voxel_cache_confidence_enabled", False):
-        if voxel.get("mask_voxel_cache_min_observations_auto", False):
-            obs = (
-                f"ceil(Ncam*{voxel['mask_voxel_cache_observation_fraction']}) "
-                f"[{voxel['mask_voxel_cache_min_observations_floor']},"
-                f"{voxel['mask_voxel_cache_min_observations_cap']}]"
-            )
-        else:
-            obs = str(voxel["mask_voxel_cache_min_observations"])
-        vdecay = voxel.get('mask_voxel_cache_variance_decay', 0.0)
-        var_mode = f"EW(a={vdecay})" if vdecay and vdecay > 0.0 else "Welford"
-        print(
-            f"   {branch} trust:      "
-            f"obs>={obs}, "
-            f"var<={voxel['mask_voxel_cache_max_variance']} [{var_mode}]"
-        )
-    else:
-        print(f"   {branch} trust:      off")
+    obs = (
+        f"ceil(Ncam*{voxel['mask_voxel_cache_observation_fraction']}) "
+        f"[{voxel['mask_voxel_cache_min_observations_floor']},"
+        f"{voxel['mask_voxel_cache_min_observations_cap']}]"
+    )
+    vdecay = voxel.get('mask_voxel_cache_variance_decay', 0.0)
+    var_mode = f"EW(a={vdecay})" if vdecay and vdecay > 0.0 else "Welford"
+    print(
+        f"   {branch} trust:      "
+        f"obs>={obs}, "
+        f"var<={voxel['mask_voxel_cache_max_variance']} [{var_mode}]"
+    )
     print(
         f"   {branch} blend:      "
         f"{voxel['mask_voxel_cache_max_blend']} "
         f"(warmup {voxel['mask_voxel_cache_warmup_start']}{arrow}"
         f"{voxel['mask_voxel_cache_warmup_end']})"
     )
-    print(f"   {branch} fusion:     {dc['external_mask_fusion']}")
-    print(f"   {branch} gate str:   {dc['external_mask_screen_attn_gate_strength']}")
-    neg_var_p = dc.get('external_mask_negative_variance_power', 0.0)
-    if neg_var_p > 0.0:
-        print(f"   {branch} neg var p:  {neg_var_p}")
     ang_p = voxel.get('mask_voxel_cache_angular_power', 0.0)
     if ang_p > 0.0:
-        ang_floor = voxel.get('mask_voxel_cache_min_angular_factor', 0.0)
-        ang_rel = voxel.get('mask_voxel_cache_angular_relative', False)
-        rel_str = "relative" if ang_rel else "absolute"
-        print(f"   {branch} ang gate:   power={ang_p} floor={ang_floor} ({rel_str})")
+        print(f"   {branch} ang gate:   power={ang_p} (relative)")
     else:
         print(f"   {branch} ang gate:   off")
     mass_p = voxel.get('mask_voxel_cache_mass_power', 0.0)
     mass_t = voxel.get('mask_voxel_cache_mass_threshold', 0.0)
     if mass_p > 0.0 and mass_t > 0.0:
-        print(f"   {branch} mass gate:  power={mass_p} threshold={mass_t}")
+        print(f"   {last} mass gate:  power={mass_p} threshold={mass_t}")
     else:
-        print(f"   {branch} mass gate:  off")
-    print(f"   {last} stg+tag:    {dc.get('stg_tag_compose_mode', 'sequential')}")
+        print(f"   {last} mass gate:  off")
 PY
 }
 

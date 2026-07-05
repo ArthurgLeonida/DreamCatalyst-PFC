@@ -134,12 +134,11 @@ class MaskVoxelCache:
             if self.num_views is not None
             else None
         )
-        # Geometry-only twin of `view_observed`: flips on every in-bounds
-        # observation, while `view_observed` requires the per-voxel mean to
-        # clear `value_threshold`. Separates "camera saw the voxel" from
-        # "camera produced mask evidence" (on stormtrooper, helmet voxels
-        # looked under-triangulated early in training because the generated
-        # helmet had no mask evidence yet). Diagnostic-only — see `query()`.
+        # Geometry twin of `view_observed`, kept for diagnostics only (never
+        # used in gate math). The split dates from a since-removed update
+        # evidence gate that made "camera saw the voxel" differ from "camera
+        # produced mask evidence" (diagnosed on stormtrooper helmet voxels
+        # early in training).
         self.view_observed_geom = (
             torch.zeros(
                 (n_voxels, self.num_views),
@@ -315,7 +314,6 @@ class MaskVoxelCache:
         points_world: torch.Tensor,
         mask_values: torch.Tensor,
         in_bounds: Optional[torch.Tensor] = None,
-        value_threshold: float = 0.0,
         view_id: Optional[int] = None,
         return_per_voxel_mean: bool = False,
         ray_directions: Optional[torch.Tensor] = None,
@@ -336,14 +334,6 @@ class MaskVoxelCache:
             mask_values: [N] mask values in [0, 1].
             in_bounds: [N] optional bool mask; if provided, points marked
                 False are skipped.
-            value_threshold: optional confidence gate on the per-voxel
-                mean of mask values from this view (not raw pixels).
-                Voxels whose averaged evidence falls below it are skipped
-                entirely — neither the EMA grid nor the cross-view
-                statistics update. Prevents not-yet-edited regions (e.g.
-                stormtrooper helmet voxels early in training) from
-                accumulating stale low priors and inflating the running
-                variance. Set 0.0 to disable.
             view_id: optional integer camera index. When provided and
                 the cache was constructed with `num_views`, the Welford
                 cross-view statistics increment only the first time
@@ -351,12 +341,8 @@ class MaskVoxelCache:
                 visits to the same training view from inflating the
                 effective sample size and deflating variance.
             return_per_voxel_mean: if True, returns the per-voxel mean
-                values (one scalar per touched voxel) BEFORE the
-                value_threshold gate filters them out. Intended for
-                histogram diagnostics — lets the caller see the full
-                distribution of evidence this view contributed,
-                including the values the threshold rejected. Returns
-                None otherwise.
+                values (one scalar per touched voxel) for histogram
+                diagnostics. Returns None otherwise.
         """
         points_world = points_world.reshape(-1, 3).to(self.device)
         mask_values = mask_values.reshape(-1).to(self.device).float().clamp(0.0, 1.0)
@@ -412,22 +398,18 @@ class MaskVoxelCache:
             return empty_return
         per_voxel_mean = torch.zeros_like(sums)
         per_voxel_mean[touched] = sums[touched] / counts[touched]
-        # Pre-gate snapshot for diagnostics: per-voxel mean values from this
-        # view BEFORE the value_threshold gate filters them out.
-        pre_gate_snapshot = (
+        # Snapshot for diagnostics: per-voxel mean values from this view.
+        mean_snapshot = (
             per_voxel_mean[touched].detach().clone()
             if return_per_voxel_mean
             else None
         )
 
-        # Diagnostic-only geometry counters. These count every in-bounds
-        # observation regardless of value_threshold and are NOT used by
-        # the gate math (kept on the instance for analysis: comparing
-        # geom_view_count vs unique_view_count exposes how much the
-        # value gate is restricting the trusted population per scene).
-        # The `view_dir_sum` accumulation happens later, in the
-        # evidence-gated block — see the empirical note in `query()`
-        # about why content-coupling the angular factor is load-bearing.
+        # Diagnostic-only geometry counters, NOT used by the gate math (kept
+        # on the instance for analysis/logging). The `view_dir_sum`
+        # accumulation happens later, in the evidence block — see the note in
+        # `query()` about why coupling the angular factor to the evidence
+        # population is load-bearing.
         if (
             per_voxel_view_dir is not None
             and self.view_observed_geom is not None
@@ -442,15 +424,6 @@ class MaskVoxelCache:
                     self.view_observed_geom[geom_idx_diag, vid_geom] = True
                     flat_geom_count_diag = self.geom_view_count.view(-1)
                     flat_geom_count_diag[geom_idx_diag] += 1
-
-        # Confidence gate on the per-voxel mean — the actual sample this
-        # view contributes — rather than on raw pixels, which would still
-        # let a mostly-low-evidence voxel contribute a poisoned sample.
-        if value_threshold > 0.0:
-            confident_voxels = per_voxel_mean >= float(value_threshold)
-            touched = touched & confident_voxels
-            if not touched.any():
-                return pre_gate_snapshot if return_per_voxel_mean else None
 
         # EMA blend into existing grid for already-observed voxels;
         # direct copy for first-time-observed voxels.
@@ -552,7 +525,7 @@ class MaskVoxelCache:
             flat_grid[first_time] = per_voxel_mean[first_time]
             flat_observed[first_time] = True
 
-        return pre_gate_snapshot if return_per_voxel_mean else None
+        return mean_snapshot if return_per_voxel_mean else None
 
     # -----------------------------------------------------------------
     # Query — read voxels back at backprojected 3D positions
@@ -567,13 +540,18 @@ class MaskVoxelCache:
         min_observations: int = 1,
         max_variance: Optional[float] = None,
         angular_power: float = 0.0,
-        min_angular_factor: float = 0.0,
-        angular_relative: bool = False,
         mass_threshold: float = 0.0,
         mass_power: float = 0.0,
-        trilinear: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """Look up mask values at world-space positions.
+
+        The stored mean is read via observed-weighted trilinear interpolation
+        over the 8 surrounding voxel centers: this smooths the value the cache
+        feeds back (removing blocky discretization artifacts where one voxel
+        straddles two surfaces) without raising the grid resolution. The trust
+        signals (counts, variance, angular factor, observed/valid, mass) are
+        read at the nearest voxel, so gating semantics are unaffected by the
+        interpolation.
 
         Returns `fallback_value` for voxels never observed. Out-of-bounds
         points (if `in_bounds` is provided) are also returned as fallback.
@@ -586,12 +564,14 @@ class MaskVoxelCache:
 
         `angular_power` (≥ 0) raises the per-voxel angular-diversity factor
         `(1 − ‖mean_view_dir‖)` to that power before multiplying into the
-        confidence. 0.0 disables the angular gate. 1.0 multiplies linearly.
-        Larger values make the gate steeper (only voxels observed from very
-        widely-separated viewpoints stay confident). `min_angular_factor`
-        sets a floor so the gate never collapses confidence to zero on
-        single-observation voxels (where the resultant length is 1 by
-        construction and the factor would otherwise be 0).
+        confidence; 0.0 disables the angular gate. The factor is
+        scene-relative: each voxel's value is divided by the scene-wide mean
+        angular factor (frozen at its peak, see
+        `try_auto_freeze_angular_denominator`) and clamped to [0, 1], so the
+        gate works across capture geometries — a horizontal-arc capture
+        (clown, mean ~0.05) and a forward-facing capture (elf, ~0.01) both
+        look "almost zero" in absolute terms; normalized, each voxel is judged
+        against its own scene's typical diversity.
 
         `mass_threshold` and `mass_power` control the mass gate
         `C_mass = min(1, m(q) / mass_threshold)^mass_power`. Voxels whose
@@ -600,25 +580,6 @@ class MaskVoxelCache:
         and letting the cache contribute there produces visible
         artifacts on extremity regions and blurs high-frequency detail.
         With `mass_power = 0` or `mass_threshold = 0` the gate is off.
-
-        `angular_relative` (default False) switches the factor from absolute
-        to scene-relative: each voxel's factor is divided by the scene-wide
-        mean angular factor, then clamped to [0, 1]. This makes the gate
-        work across capture geometries — a horizontal-arc capture (clown,
-        mean ~0.05) and a forward-facing capture (elf, ~0.01) both look
-        "almost zero" in absolute terms, collapsing the gate; normalized,
-        each voxel is judged against its own scene's typical diversity.
-
-        `trilinear` (default False) reads the stored mean value via
-        observed-weighted trilinear interpolation over the 8 surrounding voxel
-        centers instead of nearest-voxel lookup. This smooths the value the
-        cache feeds back — reducing blocky discretization artifacts where one
-        voxel straddles two surfaces (which otherwise look like cross-view
-        disagreement) — without raising the grid resolution, so per-voxel
-        observation density (and thus the variance/angular statistics) is
-        unchanged. The trust signals (counts, variance, angular factor,
-        observed/valid, mass) are still read at the nearest voxel, so gating
-        semantics are identical; only the interpolated magnitude differs.
         """
         original_shape = points_world.shape[:-1]
         flat_points = points_world.reshape(-1, 3).to(self.device)
@@ -629,10 +590,9 @@ class MaskVoxelCache:
             in_bounds = in_bounds.reshape(-1).to(self.device) & default_in_bounds
 
         ix, iy, iz = idx[:, 0], idx[:, 1], idx[:, 2]
-        if trilinear:
-            values = self._trilinear_observed_read(flat_points)
-        else:
-            values = self.grid[ix, iy, iz]
+        # Observed-weighted trilinear read of the mean value; the trust
+        # statistics below are read at the nearest voxel.
+        values = self._trilinear_observed_read(flat_points)
         observed = self.observed[ix, iy, iz]
         counts = self.unique_view_count[ix, iy, iz].float()
         m2 = self.running_m2[ix, iy, iz]
@@ -681,19 +641,15 @@ class MaskVoxelCache:
             # mean is restricted to voxels with ≥ `min_observations` views —
             # including all 2-view voxels would let nearly-parallel edge
             # observations collapse the denominator toward 0.
-            if angular_relative:
-                if self._frozen_angular_denominator is not None:
-                    scene_mean = float(self._frozen_angular_denominator)
-                else:
-                    scene_mean = float(
-                        self.mean_angular_factor_at(min_views=min_observations)
-                    )
-                if scene_mean > 1e-6:
-                    angular_factor = (angular_factor / scene_mean).clamp(0.0, 1.0)
+            if self._frozen_angular_denominator is not None:
+                scene_mean = float(self._frozen_angular_denominator)
+            else:
+                scene_mean = float(
+                    self.mean_angular_factor_at(min_views=min_observations)
+                )
+            if scene_mean > 1e-6:
+                angular_factor = (angular_factor / scene_mean).clamp(0.0, 1.0)
 
-            if float(min_angular_factor) > 0.0:
-                floor = float(min_angular_factor)
-                angular_factor = angular_factor.clamp_min(floor)
             angular_confidence = angular_factor.pow(float(angular_power))
         else:
             angular_confidence = torch.ones_like(values)
@@ -745,9 +701,9 @@ class MaskVoxelCache:
 
     @property
     def mean_observation_count(self) -> float:
-        """Mean number of evidence-gated unique view observations over
-        observed voxels. Counts only views whose per-voxel mean cleared
-        `value_threshold`. Use this for diagnostics on the variance gate.
+        """Mean number of unique view observations over observed voxels.
+        Counts each view once per voxel. Use this for diagnostics on the
+        variance gate.
         """
         observed = self.observed
         if not observed.any():
@@ -758,10 +714,7 @@ class MaskVoxelCache:
     def mean_geom_observation_count(self) -> float:
         """Mean number of geometric (in-bounds) view observations over
         observed voxels. Counts every view whose ray intersected the
-        voxel, regardless of mask value. Use this for diagnostics on
-        the angular-diversity gate, and to compare against
-        `mean_observation_count` to see how much the value-threshold
-        filter is restricting the angular factor's view set.
+        voxel. Diagnostic companion to `mean_observation_count`.
         """
         observed = self.observed
         if not observed.any():
