@@ -151,9 +151,9 @@ The main DDS orchestration lives in `nerfstudio/dc/dc.py`; reusable novelty math
 | Novelty | Config | Description |
 |---|---|---|
 | **STG** | `stg_enabled`, `stg_scale`, `stg_skip_layers` | Runs a weak UNet pass via `STGIdentityValueAttnProcessor` on selected up-blocks and amplifies `eps = eps_full + s · (eps_full − eps_weak)`. Based on STG (Hyung et al., CVPR 2025). Target-branch only. |
-| **STG schedule** | `stg_schedule_enabled`, `stg_schedule_mode`, `stg_schedule_{start,end}_ratio`, `stg_bump_peak_ratio` | Three shapes: `"decay"` (STG early, off late — strongest on monotonic edits where every step pushes the same direction), `"growth"` (STG off early, on late), `"bump"` (triangle: STG peaks mid-phase and returns to 0 before the end). |
-| **Edit-strength-adaptive STG** | `stg_edit_strength_adaptive` | Multiplies the scheduled STG scale by `(1 − s)`, where `s` is the same per-step edit strength used by the anchor. Identity edits keep STG near full strength; structural edits fade STG automatically. |
-| **STG/TAG composition** | `stg_tag_compose_mode` | `"parallel"` applies TAG and STG additively to the raw CFG prediction (no cross-amplification); `"sequential"` nests them (TAG amplifies STG's perturbation). |
+| **STG bump schedule** | `stg_schedule_{start,end}_ratio`, `stg_bump_peak_ratio` | Triangle over training progress: zero before `start`, linear rise to `stg_scale` at the peak, linear fall to zero at `end`. The last stretch of training runs without STG so views can converge coherently. (Decay/growth shapes and an unscheduled mode were explored and removed; the bump is hardcoded.) |
+| **Edit-strength-adaptive STG** | *(always on)* | Multiplies the scheduled STG scale by `(1 − s)`, where `s` is the same per-step edit strength used by the anchor. Identity edits keep STG near full strength; structural edits fade STG automatically. |
+| **STG/TAG composition** | *(hardcoded: parallel)* | TAG and STG are applied independently to the raw CFG prediction and summed — no cross-amplification. (A sequential variant, TAG amplifying STG's perturbation, was explored and removed.) |
 
 ### 3D voxel cache — Part 2 (multi-view consistency)
 

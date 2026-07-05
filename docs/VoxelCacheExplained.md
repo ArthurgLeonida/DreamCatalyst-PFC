@@ -14,15 +14,15 @@ The intended reader is someone who knows the basics of NeRF and DDS
 1. [The starting point: why per-view masks aren't enough](#1-the-starting-point)
 2. [The basic voxel grid](#2-the-basic-voxel-grid)
 3. [Depth backprojection](#3-depth-backprojection)
-3b. [Reading the grid back: nearest vs. trilinear](#3b-reading-the-grid-back) — knob `mask_voxel_cache_trilinear`
+3b. [Reading the grid back: nearest vs. trilinear](#3b-reading-the-grid-back) — trilinear, always on (hardcoded 2026-07-05)
 4. [EMA aggregation across views](#4-ema-aggregation-across-views)
 5. [Bidirectional fusion with the 2D mask](#5-bidirectional-fusion-with-the-2d-mask)
 5b. [Variance-gated negative branch](#5b-variance-gated-negative-branch)
-5c. [Scale-matching the cache value before fusion](#5c-scale-matching) — knobs `mask_voxel_cache_scale_normalize`, `_scale_normalize_quantile`
-5d. [Contested-region suppression (active distrust)](#5d-contested-region-suppression-active-distrust) — knob `external_mask_contested_suppression_ratio`
+5c. [Scale-matching the cache value before fusion](#5c-scale-matching) — always on; knob `mask_voxel_cache_scale_normalize_quantile`
+5d. [Contested-region suppression (active distrust)](#5d-contested-region-suppression-active-distrust) — retired 2026-06-15 (negative result)
 6. [Welford statistics: cross-view variance per voxel](#6-welford-statistics)
 6b. [Decayed (exponentially-weighted) variance](#6b-decayed-exponentially-weighted-variance) — knob `mask_voxel_cache_variance_decay`
-6c. [Peak-held variance (anti-collapse latch)](#6c-peak-held-variance-anti-collapse-latch) — knob `mask_voxel_cache_variance_peak_decay`
+6c. [Peak-held variance (anti-collapse latch)](#6c-peak-held-variance-anti-collapse-latch) — retired 2026-06-15 (negative result)
 7. [Confidence-gated fusion](#7-confidence-gated-fusion)
 8. [Per-voxel-count gating (vs. unique-view-count)](#8-per-voxel-count-gating)
 9. [Asymmetric fusion (positive vs. negative correction)](#9-asymmetric-fusion)
@@ -197,7 +197,7 @@ the cache will need to index.
 
 ## 3b. Reading the grid back
 
-> **Knob: `mask_voxel_cache_trilinear`** (`False` = nearest voxel, default; `True` = observed-weighted trilinear).
+> Observed-weighted trilinear read — **always on** (the `mask_voxel_cache_trilinear` knob was removed 2026-07-05 once trilinear became the adopted design; nearest-voxel was the baseline it replaced, kept below for the comparison).
 
 ### Problem
 
@@ -259,8 +259,8 @@ Empirically (elf), trilinear was the variant that turned the cache's mask-level
 consistency into *rendered* multi-view consistency: `MultiView_pairwise_cos_sim`
 rose from 0.928 (cache-off) to 0.933, while the nearest-voxel package left it at
 ~0.924. The cost was a small editability dip (`CLIP_direction` ≈ 0.127 → 0.127,
-within noise). So it's the right default when the goal is 3D consistency; toggle
-it off to recover maximum edit strength.
+within noise). That result is why trilinear became the adopted design and the
+nearest-voxel path was removed from the code.
 
 ---
 
@@ -367,19 +367,19 @@ and update the 2D mask by
 M_final = M_2D + α · [ G · max(ΔM, 0) + λ_↓ · min(ΔM, 0) ]
 ```
 
-Where (each symbol with the knob that tunes it):
+Where:
 
-- `ΔM = M_3D − M_2D`, and **`M_3D`** is the cache value read at this pixel —
-  nearest-voxel or trilinear, set by **`mask_voxel_cache_trilinear`** (§3b).
+- `ΔM = M_3D − M_2D`, and **`M_3D`** is the cache value read at this pixel by
+  observed-weighted trilinear interpolation (hardcoded; §3b).
 - `α ∈ [0, 1]` is the cache's pull strength (the "blend factor"). Its ceiling is
   **`mask_voxel_cache_max_blend`** and it ramps from 0 to that ceiling across
   **`mask_voxel_cache_warmup_start` → `_warmup_end`** (§14-adjacent).
-- `G` is a semantic gate (cross-attention mask / self-mask) on the *positive*
-  branch, scaled by **`external_mask_screen_attn_gate_strength`** (and
-  **`external_mask_screen_self_boost_lambda`** for the self-boost source).
-- `λ_↓` is the suppression ratio on the *negative* branch — knob
-  **`external_mask_interp_suppression_ratio`** (set to `0.0` to disable
-  subtraction entirely; "positive-only" fusion).
+- `G` is the semantic gate on the *positive* branch, hardcoded to
+  `max(M_attn, M_self)` (the CA mask and self-mask, whichever is stronger).
+- `λ_↓` is the suppression ratio on the *negative* branch. **The negative
+  branch has been removed from the code** (λ_↓ was 0.0 in every adopted
+  config — "positive-only" fusion); it is kept in this document as design
+  history (§5b explains why subtraction was rejected).
 
 **Why bidirectional?** Two kinds of disagreement matter:
 
@@ -422,6 +422,12 @@ The cache pulled the 2D mask down from `0.6` to `0.55`. Modest cleanup.
 
 ## 5b. Variance-gated negative branch
 
+> **Removed from code 2026-07-05.** The negative branch (`λ_↓`) and its
+> variance-gated variant (`p_neg`) were `0.0`/off in every adopted
+> configuration, so both were deleted when the fusion was hardcoded to
+> positive-only. This section is kept as the design analysis that led to
+> that decision.
+
 ### Problem
 
 The bidirectional fusion treats the positive and negative branches
@@ -438,8 +444,8 @@ signal is more visually destructive than adding it:
   cache's averaged-across-views value is moderate while the per-view
   2D mask peaks much higher.
 
-Compared empirically on stormtrooper: with bidirectional fusion the
-armor segments degrade visibly. With screen-only fusion (`λ_↓ = 0`,
+Compared empirically on stormtrooper: with the subtractive branch active
+the armor segments degrade visibly. With positive-only fusion (`λ_↓ = 0`,
 no negative branch), the armor is preserved but multi-view inconsistency
 on the clown returns (the negative branch was cleaning up per-view mask
 noise that produces inconsistency).
@@ -511,7 +517,7 @@ detail).
 
 ## 5c. Scale-matching
 
-> **Knobs: `mask_voxel_cache_scale_normalize`** (`True`/`False`) and **`mask_voxel_cache_scale_normalize_quantile`** (`q`, default `0.95`).
+> **Knob: `mask_voxel_cache_scale_normalize_quantile`** (`q`, default `0.95`). The scale-matching itself is always on (the on/off flag was removed once every adopted config had it enabled).
 
 ### Problem
 
@@ -541,7 +547,6 @@ hi = quantile(M_3D[observed], q)
 M_3D' = clamp( (M_3D − lo) / (hi − lo), 0, 1 )
 ```
 
-- **`mask_voxel_cache_scale_normalize`** turns this on/off.
 - **`mask_voxel_cache_scale_normalize_quantile`** is `q` (default `0.95`): the
   upper percentile mapped to 1 (and `1−q = 0.05` mapped to 0). Larger `q` → less
   aggressive stretch (only the extreme tail saturates); smaller `q` (e.g. 0.85)
@@ -567,7 +572,7 @@ purely as a units mismatch, leaving it to clean up only true background
 false-positives.
 
 > **Interaction with trilinear (§3b):** scale-matching reads percentiles over the
-> queried values, so it runs on whatever §3b produced (nearest or trilinear).
+> queried values, so it runs on what the trilinear read produced.
 > The two compose; trilinear smooths the value, scale-matching re-ranges it.
 
 ### 5d. Contested-region suppression (active distrust)
@@ -896,17 +901,19 @@ silenced for high variance.
 
 The Welford statistics treat per-view *per-voxel* samples. But we
 defined the EMA as updating from the within-batch *per-voxel mean* of
-pixels in that view. We also have a `update_threshold`: if a voxel's
-per-view mean is below `T` (e.g. 0.2), we skip the update entirely —
-we don't want early under-edited samples to poison either the EMA or
-the variance.
+pixels in that view. An update value gate (`update_threshold`) also
+existed here: if a voxel's per-view mean fell below `T`, the update was
+skipped entirely, so early under-edited samples could not poison the EMA
+or the variance. **The gate has been removed from the code** — it was
+`0.0` (off) in every adopted config, because the warmup ramp (§14)
+already keeps immature evidence from mattering. Two design notes from
+its lifetime remain useful:
 
-**Important correction**: the threshold gate is on the per-voxel mean,
-not the raw pixel values. Filtering pixels first would still let a
-voxel with mostly-low evidence contribute a sample after the filter
-(since a few high-value pixels survive). Gating the per-voxel mean
-ensures a voxel only writes to the cache when *this view's evidence
-for that voxel* is itself confident.
+- the gate operated on the per-voxel mean, not raw pixel values —
+  filtering pixels first would still let a voxel with mostly-low
+  evidence contribute a sample (a few high-value pixels survive);
+- the count gate below (`n_min`) is what actually carries the
+  "not enough evidence yet" protection today.
 
 ### Numerical example
 
@@ -1488,29 +1495,26 @@ sometimes to 20% (when `Ā = 0.08`) and sometimes to 100% (when
 
 ## 15. Summary
 
-The final fusion equation, with all pieces:
+The final fusion equation, with all pieces (as implemented — positive-only;
+the historical negative term `C̃^p_neg · λ_↓ · min(ΔM, 0)` is analyzed in §5b):
 
 ```
-M_final = M_2D + α(t) · C̃(q) · [
-            G · max(ΔM, 0)
-          + C̃(q)^p_neg · λ_↓ · min(ΔM, 0)
-        ]
+M_final = M_2D + α(t) · C̃(q) · G · max(ΔM, 0)
 
 where:
     ΔM    = M_3D − M_2D
-    M_3D  = readback of grid at p_pixel        (nearest OR trilinear; §3b)
+    M_3D  = readback of grid at p_pixel        (observed-weighted trilinear; §3b)
             then scale-matched to [0,1]         (§5c)
     p_pixel = ray_origin + depth · ray_direction
     α(t)  = warmup ramp from 0 to max_blend
     C̃(q) = 1[n(q) ≥ n_min]
-            · max(0, 1 − σ²(q)/σ²_max)           (σ²: Welford OR EW, §6/§6b;
-                                                  peak-held max(σ²_now, peak) when §6c is on)
+            · max(0, 1 − σ²(q)/σ²_max)           (σ²: Welford OR EW, §6/§6b)
             · min(1, (1 − R(q))^p / Ā_frozen)
             · min(1, m(q) / m_threshold)^p_m
     Ā_frozen = peak of mean_angular_factor_trusted over training,
                auto-frozen when no improvement seen for `patience` steps
-    G     = semantic gate (CA mask or self_boost)
-    λ_↓   = suppression ratio for negative corrections
+    G     = semantic gate, max(M_attn, M_self)
+    (the negative branch and its λ_↓ were removed from code; §5/§5b history)
 ```
 
 ### Knob → symbol map (what you're actually tuning)
@@ -1522,39 +1526,49 @@ explained. This is the table to keep open while sweeping.
 |---|---|---|---|
 | `mask_voxel_cache_max_blend` | ceiling of `α(t)` | stronger cache pull overall | 5, 14 |
 | `mask_voxel_cache_warmup_start` / `_end` | ramp window of `α(t)` | later/slower phase-in | 5 |
-| `mask_voxel_cache_trilinear` | how `M_3D` is read | smoother (less blocky) cache value, no density cost | 3b |
-| `mask_voxel_cache_scale_normalize` | enable `M_3D` re-ranging | stops down-branch firing on the edit | 5c |
-| `mask_voxel_cache_scale_normalize_quantile` | `q` in the stretch | larger `q` = gentler stretch | 5c |
-| `external_mask_screen_attn_gate_strength` | `G` strength (positive branch) | cache support more gated by semantics | 5, 9 |
-| `external_mask_screen_self_boost_lambda` | `G` source mix | weights self-mask in the gate | 5 |
-| `external_mask_interp_suppression_ratio` | `λ_↓` (negative branch) | more subtraction; `0.0` = positive-only | 5, 5b |
-| `external_mask_negative_variance_power` | `p_neg` | negative branch needs higher agreement to fire | 5b |
-| `external_mask_contested_suppression_ratio` | *(removed from code 2026-06-15)* active-distrust damp; never beat the base rate | — | 5d |
+| `mask_voxel_cache_scale_normalize_quantile` | `q` in the (always-on) `M_3D` re-ranging stretch | larger `q` = gentler stretch | 5c |
 | `mask_voxel_cache_max_variance` | `σ²_max` (variance gate) | looser gate, more voxels pass | 7 |
-| `mask_voxel_cache_variance_decay` | `σ²` estimator (`α` EW weight) | forgets stale edit-drift; flattens variance climb | 6b |
-| `mask_voxel_cache_variance_peak_decay` | *(removed from code 2026-06-15)* peak-held variance gate; warmup transient dominated it | — | 6c |
-| `mask_voxel_cache_min_observations` (+ `_auto`, `_observation_fraction`, `_floor`, `_cap`) | `n_min` (count gate) | needs more views before a voxel counts | 7, 8 |
+| `mask_voxel_cache_variance_decay` | `σ²` estimator (`α` EW weight; `0.0` = Welford) | forgets stale edit-drift; flattens variance climb | 6b |
+| `mask_voxel_cache_observation_fraction` / `_floor` / `_cap` | `n_min` (count gate, always camera-count-auto) | needs more views before a voxel counts | 7, 8 |
 | `mask_voxel_cache_angular_power` | `p` (angular factor exponent) | steeper down-weight of narrow-cone voxels | 11 |
-| `mask_voxel_cache_angular_relative` | enable `/Ā` normalization | judge each voxel vs scene-typical diversity | 12 |
 | `mask_voxel_cache_angular_freeze_patience` / `_warmup` | when `Ā_frozen` locks | later freeze captures a later peak | 14 |
-| `mask_voxel_cache_min_angular_factor` | floor on the angular factor | keeps single-view voxels from hard-zeroing | 11 |
 | `mask_voxel_cache_mass_threshold` | `m_threshold` (mass gate) | higher = damp more low-edit-signal voxels | 11c |
 | `mask_voxel_cache_mass_power` | `p_m` (mass gate steepness) | steeper damping ramp | 11c |
-| `mask_voxel_cache_ema_beta` (+ `_auto`, `_camera_factor`) | EMA β for `grid[q]` | slower value updates / longer memory | 4 |
-| `mask_voxel_cache_update_threshold` | update value gate | skips low-evidence per-view samples | 8 |
+| `mask_voxel_cache_ema_beta_camera_factor` | `c` in the (always-auto) EMA β = 1 − 1/(c·N_cam) | slower value updates / longer memory | 4 |
 | `mask_voxel_cache_accumulation_threshold` | render-acc gate for backprojection | ignores low-opacity (sky/empty) rays | 3 |
 | `mask_voxel_cache_resolution` | grid `V` | finer grid (but fewer views/voxel) | 2 |
 | `gradient_mask_raw_norm_quantile` *(in `DCConfig`)* | per-frame scale of `raw_self` (the cache input) | robust divisor; less spurious variance | 10b |
 
+Hardcoded design decisions (formerly knobs; removed 2026-07-05 once every
+adopted config used a single value):
+
+- **trilinear read** always on (`mask_voxel_cache_trilinear`, §3b);
+- **scale-matching** always on (`mask_voxel_cache_scale_normalize`, §5c);
+- semantic gate fixed at `G = max(M_attn, M_self)`
+  (`external_mask_screen_attn_gate_strength`, `_self_boost_lambda`, §5/§9);
+- **negative branch deleted** — fusion is positive-only
+  (`external_mask_interp_suppression_ratio`, `external_mask_negative_variance_power`, §5/§5b);
+- angular factor always **scene-relative**, no floor
+  (`mask_voxel_cache_angular_relative`, `_min_angular_factor`, §11/§12);
+- count gate always camera-count-auto (`mask_voxel_cache_min_observations`, `_auto`, §7);
+- EMA β always camera-count-auto (`mask_voxel_cache_ema_beta`, `_auto`, §4);
+- **update value gate deleted** (`mask_voxel_cache_update_threshold`, §8);
+- bbox always from observed points (`mask_voxel_cache_bbox_source`, §3);
+- passive measure-only mode removed (`mask_voxel_cache_measure_only`).
+
+Removed earlier as negative results (2026-06-15): `external_mask_contested_suppression_ratio`
+(active-distrust damp; never beat the base rate, §5d) and
+`mask_voxel_cache_variance_peak_decay` (peak-held variance gate; warmup
+transient dominated it, §6c).
+
 And the per-voxel state:
 
 ```
-grid[q]               # EMA mean (running average) — knob: ema_beta
+grid[q]               # EMA mean (running average) — β auto: 1 − 1/(c·N_cam)
 observed[q]           # bool: first-observation flag
 unique_view_count[q]  # n(q): number of distinct views
 running_mean[q]       # μ (Welford or EW mean)
 running_m2[q]         # Welford: M2 → σ² = M2/(n−1);  EW: holds σ² directly (§6b)
-running_var_peak[q]   # peak-held σ² — knob: variance_peak_decay (§6c)
 view_observed[q, v]   # bool: which views have observed each voxel
 view_dir_sum[q]       # Σ d̂_v for angular factor R(q)
 ```
@@ -1604,7 +1618,8 @@ resolution/density penalty; and a decayed (exponentially-weighted) variance
 drifts over training. The clown arm over-edit then exposed the decay's blind
 spot — a consolidating over-edit makes late views agree, collapsing the
 recency-biased variance below any gate value — and the peak-held variance
-(`§6c`) latched the early disagreement so the gate stays shut.
+(`§6c`) was built to latch the early disagreement so the gate stays shut
+(later retired: the warmup transient dominated the run-wide peak).
 
 Each step traces to a specific empirical failure: a wandb panel that
 showed unexpected behavior, a CLIP_direction number that regressed, a
@@ -1632,14 +1647,14 @@ Live status as of 2026-06-15 (matches `method_config.py`):
 | Fusion machinery (bidirectional up/down branches) | 5, 9 | up only — down branch **off** via `interp_suppression_ratio=0` | core machinery; **positive-only** active |
 | Variance-gated negative branch (`p_neg`) | 5b | **off** (`p_neg = 0`) | weakens suppression — don't use for over-edits |
 | Contested-region suppression (`external_mask_contested_suppression_ratio`) | 5d | **removed from code 2026-06-15** | no effect at safe gain (2/5 fails ≈ base rate), harmful at 2.0 (self-extinction rebound); never beat the base rate |
-| Scale-matching cache value (`scale_normalize`, `_quantile`) | 5c | on (`q = 0.95`) | core; stops down-branch firing on the edit |
+| Scale-matching cache value (`_scale_normalize_quantile`) | 5c | **always on** (`q = 0.95`, hardcoded 2026-07-05) | core; makes `M_3D` comparable to the sharp 2D mask |
 | Cross-view variance — Welford **or EW/decayed** | 6, 6b | **EW on** (`variance_decay = 0.2`) | core; recency-weighted, kept (helped elf) |
 | Peak-held variance latch (`variance_peak_decay`) | 6c | **removed from code 2026-06-15** | tested on clown: warmup transient dominates the peak → confidence zeroed body-wide (cache no-ops); the late-warmup config already protects the stats |
 | Confidence gate (count + variance) | 7 | on (`max_variance = 0.015` clown override, **tune per scene**) | core |
-| Per-voxel-mean update gate (`update_threshold`) | 8 | **off** (`0.0`) | optional |
+| Per-voxel-mean update gate (`update_threshold`) | 8 | **removed from code 2026-07-05** (was `0.0`/off in every adopted config) | — |
 | Raw-self input source | 10 | on | core |
 | Robust per-frame scale (`gradient_mask_raw_norm_quantile`) | 10b | on (`0.95`) | core; reduces spurious variance |
-| Trilinear cache read (`mask_voxel_cache_trilinear`) | 3b | **on** (`True`) | core; delivers the rendered MV-consistency gain (small editability cost) |
+| Trilinear cache read | 3b | **always on** (hardcoded 2026-07-05) | core; delivers the rendered MV-consistency gain (small editability cost) |
 | Angular-diversity factor | 11 | on (`p = 1`) | core |
 | Geometry-vs-evidence decoupling (§11b state) | 11b | **diagnostic only** | counters kept; gate uses evidence-gated count |
 | Mass gate (`C_mass`) | 11c | **on** (`m_thr = 0.18`, `p_m = 1.0`) | core; damps low-edit-force voxels |
@@ -1647,20 +1662,21 @@ Live status as of 2026-06-15 (matches `method_config.py`):
 | Trusted-population denominator | 13 | on | core |
 | Auto-freeze at the peak | 14 | on (`patience = 100`) | core |
 
-The "core" mechanisms compose into the current config. Currently **off**: the
-negative fusion branch (`interp_suppression_ratio=0`, redundant when the over-edit
-region is variance-distinguished — see clown), its variance-gated variant `p_neg`
-(5b, only weakens suppression), and the `update_threshold` gate (8). §11b is kept
-as a diagnostic only. These remain in the code, fully documented, so they can be
-re-enabled if a new scene type surfaces a failure mode they address.
+The "core" mechanisms compose into the current config. **Removed from the code
+(2026-07-05)** after being off in every adopted config: the negative fusion
+branch and its variance-gated variant `p_neg` (5/5b — redundant when the
+over-edit region is variance-distinguished, see clown) and the
+`update_threshold` gate (8). They remain documented here as design history.
+§11b is kept in the code as a diagnostic only.
 
 > `max_variance` is **scene-tuned**, not a fixed default: read it off
 > `dc_debug/voxel_cache_variance_map` and set it in the gap between the wanted
 > edit (low variance) and the over-edit region (high variance), staying above the
 > former. With `variance_decay` on, read it in the decayed scale (the map already is).
-> With `variance_peak_decay` on (§6c) the map is **peak-held**: it no longer
-> collapses when an over-edit consolidates, so it can be read late in a run too —
-> the old "read it early / only on a good run" caveat applies only to `ρ = 0`.
+> Read it around mid-run on a healthy run: once an over-edit *consolidates*
+> (all views agreeing on the wrong edit), its variance collapses and the map
+> can no longer separate it. (The retired §6c peak-hold latch was an attempt
+> to lift exactly this caveat.)
 
 ### How to read this when re-orienting
 
@@ -1668,7 +1684,7 @@ If you come back to this document after a break and want to understand
 "what is actually running when I launch the default config":
 
 1. Read §2-4 (grid + depth + EMA) — these are always on. **§3b** = how the
-   value is read back (trilinear, on in the consistency config).
+   value is read back (observed-weighted trilinear, always on).
 2. Read §5 + §5c + §9 (bidirectional fusion + scale-matching + asymmetric
    gating) — the fusion math and how `M_3D` is prepped before differencing.
 3. Read §6 + §6b + §6c + §7 (Welford / decayed variance + peak-hold latch +
