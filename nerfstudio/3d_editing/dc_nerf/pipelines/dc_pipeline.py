@@ -68,14 +68,8 @@ class DCPipelineConfig(VanillaPipelineConfig):
     mask_voxel_cache_variance_decay: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_variance_decay", 0.0
     )
-    mask_voxel_cache_angular_power: float = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_angular_power", 0.0
-    )
     mask_voxel_cache_mass_threshold: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_mass_threshold", 0.0
-    )
-    mask_voxel_cache_mass_power: float = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_mass_power", 0.0
     )
     mask_voxel_cache_angular_freeze_patience: int = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_angular_freeze_patience", 100
@@ -504,9 +498,7 @@ class DCPipeline(ModifiedVanillaPipeline):
                     return_stats=True,
                     min_observations=min_observations,
                     max_variance=self.config.mask_voxel_cache_max_variance,
-                    angular_power=float(self.config.mask_voxel_cache_angular_power),
                     mass_threshold=float(self.config.mask_voxel_cache_mass_threshold),
-                    mass_power=float(self.config.mask_voxel_cache_mass_power),
                 )
                 external_grad_mask = queried.view(1, 1, mask_h, mask_w).to(
                     device=x0.device, dtype=x0.dtype

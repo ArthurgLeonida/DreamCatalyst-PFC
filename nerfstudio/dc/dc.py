@@ -88,11 +88,9 @@ class DCConfig:
 
     cross_attention_mask_enabled: bool = True
     cross_attention_mask_layers: List[int] = field(default_factory=lambda: [1, 2])
-    cross_attention_mask_weight: float = 0.7
     cross_attention_mask_blur: float = 0.5
     cross_attention_mask_gamma: float = 1.2
-    cross_attention_mask_weight_schedule_enabled: bool = False
-    cross_attention_mask_weight_schedule_power: float = 0.5
+    cross_attention_mask_weight_schedule_power: float = 0.75
 
     latent_mean_anchor_weight: float = 0.005
 
@@ -393,9 +391,7 @@ class DC(object):
         iteration_for_stg = self.iteration
         self.iteration += 1
         current_cross_attention_mask_weight = compute_ca_mask_weight(
-            self.config.cross_attention_mask_weight,
             t_normalized,
-            self.config.cross_attention_mask_weight_schedule_enabled,
             self.config.min_step_ratio,
             self.config.max_step_ratio,
             self.config.cross_attention_mask_weight_schedule_power,

@@ -1125,10 +1125,10 @@ R(q) = ||S(q)|| / n(q)  ∈ [0, 1]
 The diversity factor is
 
 ```
-A(q) = (1 − R(q))^p
+A(q) = 1 − R(q)
 ```
 
-with `p ≥ 0` (default 1.0). It gets multiplied into the confidence:
+It gets multiplied into the confidence:
 
 ```
 C̃(q) = C(q) · A(q)
@@ -1146,7 +1146,7 @@ d̂_4 = (0, 0.02, −0.9998)     (also nearly the same direction)
 ```
 
 Sum: `S ≈ (0.05, 0.03, −3.996)`. `||S|| ≈ 3.996`. `R = 3.996 / 4 = 0.999`.
-`A = (1 − 0.999)^1 = 0.001`.
+`A = 1 − 0.999 = 0.001`.
 
 This voxel was observed from a tight cone of viewpoints. The diversity
 factor crushes its confidence to near zero — the gate identified it as
@@ -1258,18 +1258,17 @@ committed here" — low values mean the model has consistently said
 "don't edit," high values mean "edit strongly." The gate is
 
 ```
-C_mass(q) = min(1, m(q) / m_threshold)^p_m
+C_mass(q) = min(1, m(q) / m_threshold)
 ```
 
-with `m_threshold` controlling where damping starts and `p_m` shaping
-how steep the ramp is. `p_m = 0` disables the gate. The final
-confidence becomes
+with `m_threshold` controlling where damping starts (`m_threshold = 0`
+disables the gate). The final confidence becomes
 
 ```
 C̃(q) = 1[n(q) ≥ n_min]
        · max(0, 1 − σ²(q) / σ²_max)
-       · min(1, (1 − R(q))^p / Ā)
-       · min(1, m(q) / m_threshold)^p_m
+       · min(1, (1 − R(q)) / Ā)
+       · min(1, m(q) / m_threshold)
 ```
 
 ### Why this is cleaner than the implicit coupling
@@ -1282,20 +1281,16 @@ C̃(q) = 1[n(q) ≥ n_min]
 - The gate is interpretable: "voxels with cached value below 0.3 are
   treated as background and the cache doesn't contribute there." That's
   a sentence a reader can verify.
-- It composes cleanly with the bidirectional fusion's positive/negative
-  asymmetry. The mass gate damps both branches, but the negative branch
-  (cleanup) is already weak on low-mass voxels because `ΔM = M_3D − M_2D`
-  is small there. So the mass gate mostly affects the positive branch,
-  which is the right behavior.
+- It composes cleanly with the positive-only fusion: damping the
+  confidence on low-mass voxels directly mutes the cache's added support
+  exactly where the model isn't committing edit signal.
 
 ### Numerical example
 
-Voxel `q1`: stormtrooper torso, cached mean `m(q) = 0.7`, `m_threshold = 0.3`,
-`p_m = 1.0`.
+Voxel `q1`: stormtrooper torso, cached mean `m(q) = 0.7`, `m_threshold = 0.3`.
 
 ```
-mass_ratio = min(1, 0.7/0.3) = 1.0
-C_mass = 1.0^1 = 1.0
+C_mass = min(1, 0.7/0.3) = 1.0
 ```
 
 Full contribution preserved.
@@ -1303,8 +1298,7 @@ Full contribution preserved.
 Voxel `q2`: stormtrooper hand, cached mean `m(q) = 0.15`.
 
 ```
-mass_ratio = min(1, 0.15/0.3) = 0.5
-C_mass = 0.5^1 = 0.5
+C_mass = min(1, 0.15/0.3) = 0.5
 ```
 
 Half-damped — the cache contributes to the hand, but at reduced
@@ -1313,14 +1307,14 @@ strength.
 Voxel `q3`: background near subject, cached mean `m(q) = 0.05`.
 
 ```
-mass_ratio = min(1, 0.05/0.3) = 0.167
-C_mass = 0.167^1 = 0.167
+C_mass = min(1, 0.05/0.3) = 0.167
 ```
 
 Strongly damped. The cache is mostly silent on this voxel.
 
-With `p_m = 2.0`, the ramp is steeper: `C_mass(q3) = 0.167^2 = 0.028` —
-the background is almost completely silenced.
+(A steepening exponent on this ramp was explored — e.g. squaring would
+take `q3` to 0.028 — but the linear ramp was adopted and the exponent
+removed from the code.)
 
 ---
 
@@ -1328,7 +1322,7 @@ the background is almost completely silenced.
 
 ### Problem
 
-The absolute `A(q) = (1 − R(q))^p` is bounded by the capture geometry,
+The absolute `A(q) = 1 − R(q)` is bounded by the capture geometry,
 not by [0, 1] in a scene-comparable way. Two examples:
 
 - **Clown** (365 cameras orbiting horizontally at roughly waist level):
@@ -1339,7 +1333,7 @@ not by [0, 1] in a scene-comparable way. Two examples:
 - **Forward-facing capture**: cameras all look in roughly the same
   direction. `R ≈ 0.99`. `A = 0.01`.
 
-If we apply `A = (1 − R)^1` directly, the gate collapses confidence on
+If we apply `A = 1 − R` directly, the gate collapses confidence on
 *every* voxel in both scenes, even the well-triangulated ones. The gate
 becomes a no-op damping multiplier.
 
@@ -1509,8 +1503,8 @@ where:
     α(t)  = warmup ramp from 0 to max_blend
     C̃(q) = 1[n(q) ≥ n_min]
             · max(0, 1 − σ²(q)/σ²_max)           (σ²: Welford OR EW, §6/§6b)
-            · min(1, (1 − R(q))^p / Ā_frozen)
-            · min(1, m(q) / m_threshold)^p_m
+            · min(1, (1 − R(q)) / Ā_frozen)
+            · min(1, m(q) / m_threshold)
     Ā_frozen = peak of mean_angular_factor_trusted over training,
                auto-frozen when no improvement seen for `patience` steps
     G     = semantic gate, max(M_attn, M_self)
@@ -1530,10 +1524,8 @@ explained. This is the table to keep open while sweeping.
 | `mask_voxel_cache_max_variance` | `σ²_max` (variance gate) | looser gate, more voxels pass | 7 |
 | `mask_voxel_cache_variance_decay` | `σ²` estimator (`α` EW weight; `0.0` = Welford) | forgets stale edit-drift; flattens variance climb | 6b |
 | `mask_voxel_cache_observation_fraction` / `_floor` / `_cap` | `n_min` (count gate, always camera-count-auto) | needs more views before a voxel counts | 7, 8 |
-| `mask_voxel_cache_angular_power` | `p` (angular factor exponent) | steeper down-weight of narrow-cone voxels | 11 |
 | `mask_voxel_cache_angular_freeze_patience` / `_warmup` | when `Ā_frozen` locks | later freeze captures a later peak | 14 |
 | `mask_voxel_cache_mass_threshold` | `m_threshold` (mass gate) | higher = damp more low-edit-signal voxels | 11c |
-| `mask_voxel_cache_mass_power` | `p_m` (mass gate steepness) | steeper damping ramp | 11c |
 | `mask_voxel_cache_ema_beta_camera_factor` | `c` in the (always-auto) EMA β = 1 − 1/(c·N_cam) | slower value updates / longer memory | 4 |
 | `mask_voxel_cache_accumulation_threshold` | render-acc gate for backprojection | ignores low-opacity (sky/empty) rays | 3 |
 | `mask_voxel_cache_resolution` | grid `V` | finer grid (but fewer views/voxel) | 2 |
@@ -1554,7 +1546,10 @@ adopted config used a single value):
 - EMA β always camera-count-auto (`mask_voxel_cache_ema_beta`, `_auto`, §4);
 - **update value gate deleted** (`mask_voxel_cache_update_threshold`, §8);
 - bbox always from observed points (`mask_voxel_cache_bbox_source`, §3);
-- passive measure-only mode removed (`mask_voxel_cache_measure_only`).
+- passive measure-only mode removed (`mask_voxel_cache_measure_only`);
+- angular and mass gates fixed **linear** — the steepness exponents
+  (`mask_voxel_cache_angular_power`, `mask_voxel_cache_mass_power`) were
+  `1.0` in every adopted config and were removed (§11, §11c).
 
 Removed earlier as negative results (2026-06-15): `external_mask_contested_suppression_ratio`
 (active-distrust damp; never beat the base rate, §5d) and
@@ -1657,7 +1652,7 @@ Live status as of 2026-06-15 (matches `method_config.py`):
 | Trilinear cache read | 3b | **always on** (hardcoded 2026-07-05) | core; delivers the rendered MV-consistency gain (small editability cost) |
 | Angular-diversity factor | 11 | on (`p = 1`) | core |
 | Geometry-vs-evidence decoupling (§11b state) | 11b | **diagnostic only** | counters kept; gate uses evidence-gated count |
-| Mass gate (`C_mass`) | 11c | **on** (`m_thr = 0.18`, `p_m = 1.0`) | core; damps low-edit-force voxels |
+| Mass gate (`C_mass`) | 11c | **on** (`m_thr = 0.18`, linear) | core; damps low-edit-force voxels |
 | Scene-relative normalization | 12 | on | core |
 | Trusted-population denominator | 13 | on | core |
 | Auto-freeze at the peak | 14 | on (`patience = 100`) | core |

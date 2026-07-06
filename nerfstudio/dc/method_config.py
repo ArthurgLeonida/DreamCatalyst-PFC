@@ -29,8 +29,7 @@
 #      source_blend_localization_enabled=False,
 #      outside_mask_anchor_weight=0.0,
 #      outside_mask_anchor_edit_strength_adaptive=False,
-#      cross_attention_mask_enabled=False, cross_attention_mask_weight=0.0,
-#      cross_attention_mask_weight_schedule_enabled=False,
+#      cross_attention_mask_enabled=False,
 #      latent_mean_anchor_weight=0.0,
 #      eta_tag=1.0, adaptive_tag=False, asymmetric_tag=False,
 #      stg_enabled=False, stg_scale=0.0,
@@ -58,10 +57,8 @@ DC_CUSTOM_PARAMS = dict(
 
     cross_attention_mask_enabled=True,
     cross_attention_mask_layers=[1, 2],
-    cross_attention_mask_weight=1.0,
     cross_attention_mask_blur=0.5,
     cross_attention_mask_gamma=1.2,
-    cross_attention_mask_weight_schedule_enabled=True,
     cross_attention_mask_weight_schedule_power=0.75,
 
     latent_mean_anchor_weight=0.005,
@@ -109,12 +106,10 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_bbox_observe_quantile=0.05,
     mask_voxel_cache_bbox_inflation=0.2,
 
-    mask_voxel_cache_angular_power=1.0,
     mask_voxel_cache_angular_freeze_patience=100,
     mask_voxel_cache_angular_freeze_warmup=50,
 
     mask_voxel_cache_mass_threshold=0.18,
-    mask_voxel_cache_mass_power=1.0,
 
     mask_voxel_cache_scale_normalize_quantile=0.95,
 )

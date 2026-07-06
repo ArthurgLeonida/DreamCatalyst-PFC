@@ -539,9 +539,7 @@ class MaskVoxelCache:
         return_stats: bool = False,
         min_observations: int = 1,
         max_variance: Optional[float] = None,
-        angular_power: float = 0.0,
         mass_threshold: float = 0.0,
-        mass_power: float = 0.0,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """Look up mask values at world-space positions.
 
@@ -562,24 +560,23 @@ class MaskVoxelCache:
         voxel has at least `min_observations`; if `max_variance` is provided,
         it then decays linearly to zero as variance approaches that threshold.
 
-        `angular_power` (≥ 0) raises the per-voxel angular-diversity factor
-        `(1 − ‖mean_view_dir‖)` to that power before multiplying into the
-        confidence; 0.0 disables the angular gate. The factor is
-        scene-relative: each voxel's value is divided by the scene-wide mean
-        angular factor (frozen at its peak, see
-        `try_auto_freeze_angular_denominator`) and clamped to [0, 1], so the
-        gate works across capture geometries — a horizontal-arc capture
-        (clown, mean ~0.05) and a forward-facing capture (elf, ~0.01) both
-        look "almost zero" in absolute terms; normalized, each voxel is judged
-        against its own scene's typical diversity.
+        The angular-diversity factor `1 − ‖mean_view_dir‖` multiplies into the
+        confidence directly (linearly). It is scene-relative: each voxel's
+        value is divided by the scene-wide mean angular factor (frozen at its
+        peak, see `try_auto_freeze_angular_denominator`) and clamped to
+        [0, 1], so the gate works across capture geometries — a
+        horizontal-arc capture (clown, mean ~0.05) and a forward-facing
+        capture (elf, ~0.01) both look "almost zero" in absolute terms;
+        normalized, each voxel is judged against its own scene's typical
+        diversity.
 
-        `mass_threshold` and `mass_power` control the mass gate
-        `C_mass = min(1, m(q) / mass_threshold)^mass_power`. Voxels whose
-        cached mean value is below `mass_threshold` get damped — they
-        represent regions the diffusion model isn't actively editing,
-        and letting the cache contribute there produces visible
-        artifacts on extremity regions and blurs high-frequency detail.
-        With `mass_power = 0` or `mass_threshold = 0` the gate is off.
+        `mass_threshold` controls the mass gate
+        `C_mass = min(1, m(q) / mass_threshold)`. Voxels whose cached mean
+        value is below `mass_threshold` get damped — they represent regions
+        the diffusion model isn't actively editing, and letting the cache
+        contribute there produces visible artifacts on extremity regions and
+        blurs high-frequency detail. With `mass_threshold = 0` the gate is
+        off.
         """
         original_shape = points_world.shape[:-1]
         flat_points = points_world.reshape(-1, 3).to(self.device)
@@ -621,48 +618,44 @@ class MaskVoxelCache:
         # no real correspondence evidence and should be down-trusted.
         # 0 means "observations spread uniformly on the sphere" — maximal
         # information from triangulation. (1 − resultant) is the diversity.
-        if float(angular_power) > 0.0:
-            dir_sum = self.view_dir_sum[ix, iy, iz]  # [N, 3]
-            # Denominator is the evidence-gated unique view count, not the
-            # geometry-only count: the pure-geometric variant let voxels
-            # with no edit activity (stormtrooper hand, crotch) receive the
-            # full cache contribution, producing artifacts. The evidence
-            # gating couples "is this voxel being edited" into the factor;
-            # the mass gate below is the explicit version of that coupling.
-            safe_counts = counts.clamp_min(1.0)
-            resultant_len = (dir_sum.norm(dim=-1) / safe_counts).clamp(0.0, 1.0)
-            angular_factor = (1.0 - resultant_len).clamp(0.0, 1.0)
+        dir_sum = self.view_dir_sum[ix, iy, iz]  # [N, 3]
+        # Denominator is the evidence-gated unique view count, not the
+        # geometry-only count: the pure-geometric variant let voxels
+        # with no edit activity (stormtrooper hand, crotch) receive the
+        # full cache contribution, producing artifacts. The evidence
+        # gating couples "is this voxel being edited" into the factor;
+        # the mass gate below is the explicit version of that coupling.
+        safe_counts = counts.clamp_min(1.0)
+        resultant_len = (dir_sum.norm(dim=-1) / safe_counts).clamp(0.0, 1.0)
+        angular_factor = (1.0 - resultant_len).clamp(0.0, 1.0)
 
-            # Scene-relative normalization: divide by the scene mean over
-            # trusted-population voxels, so the factor reads "better/worse
-            # triangulated than average for this scene." Without it, a clown
-            # voxel at 0.06 looks as untrustworthy as an elf voxel at 0.01
-            # even when it sits at the top of its scene's distribution. The
-            # mean is restricted to voxels with ≥ `min_observations` views —
-            # including all 2-view voxels would let nearly-parallel edge
-            # observations collapse the denominator toward 0.
-            if self._frozen_angular_denominator is not None:
-                scene_mean = float(self._frozen_angular_denominator)
-            else:
-                scene_mean = float(
-                    self.mean_angular_factor_at(min_views=min_observations)
-                )
-            if scene_mean > 1e-6:
-                angular_factor = (angular_factor / scene_mean).clamp(0.0, 1.0)
-
-            angular_confidence = angular_factor.pow(float(angular_power))
+        # Scene-relative normalization: divide by the scene mean over
+        # trusted-population voxels, so the factor reads "better/worse
+        # triangulated than average for this scene." Without it, a clown
+        # voxel at 0.06 looks as untrustworthy as an elf voxel at 0.01
+        # even when it sits at the top of its scene's distribution. The
+        # mean is restricted to voxels with ≥ `min_observations` views —
+        # including all 2-view voxels would let nearly-parallel edge
+        # observations collapse the denominator toward 0.
+        if self._frozen_angular_denominator is not None:
+            scene_mean = float(self._frozen_angular_denominator)
         else:
-            angular_confidence = torch.ones_like(values)
+            scene_mean = float(
+                self.mean_angular_factor_at(min_views=min_observations)
+            )
+        if scene_mean > 1e-6:
+            angular_factor = (angular_factor / scene_mean).clamp(0.0, 1.0)
 
-        # Mass gate C_mass = min(1, m(q)/threshold)^power: damp confidence
+        angular_confidence = angular_factor
+
+        # Mass gate C_mass = min(1, m(q)/threshold): damp confidence
         # where the cached mean is low. Distinct from variance (cross-view
         # agreement) and the angular factor (triangulation): mass measures
         # "is the model committing edit signal here at all." Muting the
         # cache in low-mass regions avoids artifacts on extremities
         # (stormtrooper hand) and blurred high-frequency detail (elf eyes).
-        if float(mass_power) > 0.0 and float(mass_threshold) > 1e-6:
-            mass_ratio = (values / float(mass_threshold)).clamp(0.0, 1.0)
-            mass_confidence = mass_ratio.pow(float(mass_power))
+        if float(mass_threshold) > 1e-6:
+            mass_confidence = (values / float(mass_threshold)).clamp(0.0, 1.0)
         else:
             mass_confidence = torch.ones_like(values)
 

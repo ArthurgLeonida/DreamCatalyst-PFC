@@ -87,17 +87,12 @@ if ca_enabled:
     branch = "\u251c\u2500"
     last = "\u2514\u2500"
     arrow = "\u2192"
-    sched = 1 if dc.get("cross_attention_mask_weight_schedule_enabled") else 0
-    print(f"   {branch} weight:     {dc['cross_attention_mask_weight']}")
     print(f"   {branch} gamma:      {dc['cross_attention_mask_gamma']}")
-    if sched:
-        print(
-            f"   {last} schedule:   "
-            f"reverse_tag 0{arrow}{dc['cross_attention_mask_weight']} "
-            f"(power={dc['cross_attention_mask_weight_schedule_power']})"
-        )
-    else:
-        print(f"   {last} schedule:   off")
+    print(
+        f"   {last} schedule:   "
+        f"reverse_tag 0{arrow}1 "
+        f"(power={dc['cross_attention_mask_weight_schedule_power']})"
+    )
 print(f" Voxel 3D:  {enabled}")
 if enabled:
     branch = "\u251c\u2500"
@@ -130,15 +125,10 @@ if enabled:
         f"(warmup {voxel['mask_voxel_cache_warmup_start']}{arrow}"
         f"{voxel['mask_voxel_cache_warmup_end']})"
     )
-    ang_p = voxel.get('mask_voxel_cache_angular_power', 0.0)
-    if ang_p > 0.0:
-        print(f"   {branch} ang gate:   power={ang_p} (relative)")
-    else:
-        print(f"   {branch} ang gate:   off")
-    mass_p = voxel.get('mask_voxel_cache_mass_power', 0.0)
+    print(f"   {branch} ang gate:   on (linear, scene-relative)")
     mass_t = voxel.get('mask_voxel_cache_mass_threshold', 0.0)
-    if mass_p > 0.0 and mass_t > 0.0:
-        print(f"   {last} mass gate:  power={mass_p} threshold={mass_t}")
+    if mass_t > 0.0:
+        print(f"   {last} mass gate:  threshold={mass_t}")
     else:
         print(f"   {last} mass gate:  off")
 PY
