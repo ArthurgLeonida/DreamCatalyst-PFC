@@ -1650,7 +1650,7 @@ Live status as of 2026-06-15 (matches `method_config.py`):
 | Raw-self input source | 10 | on | core |
 | Robust per-frame scale (`gradient_mask_raw_norm_quantile`) | 10b | on (`0.95`) | core; reduces spurious variance |
 | Trilinear cache read | 3b | **always on** (hardcoded 2026-07-05) | core; delivers the rendered MV-consistency gain (small editability cost) |
-| Angular-diversity factor | 11 | on (`p = 1`) | core |
+| Angular-diversity factor | 11 | **always on** (linear, scene-relative) | core |
 | Geometry-vs-evidence decoupling (§11b state) | 11b | **diagnostic only** | counters kept; gate uses evidence-gated count |
 | Mass gate (`C_mass`) | 11c | **on** (`m_thr = 0.18`, linear) | core; damps low-edit-force voxels |
 | Scene-relative normalization | 12 | on | core |
