@@ -220,18 +220,20 @@ Please cite the original sources if you use these scenes.
   url       = {https://arxiv.org/abs/2311.13831},
 }
 
-@article{cho2024tag,
-  title     = {Tangential Amplified Guidance for Score Distillation Sampling},
-  author    = {Juhyung Cho and Jaehyeok Shim and Seungryong Kim},
-  journal   = {arXiv preprint arXiv:2510.04533},
-  year      = {2024},
+@inproceedings{cho2026tag,
+  title     = {TAG: Tangential Amplifying Guidance for Hallucination-Resistant Sampling},
+  author    = {Hyunmin Cho and Donghoon Ahn and Susung Hong and Jee Eun Kim and Seungryong Kim and Kyong Hwan Jin},
+  booktitle = {ICML},
+  year      = {2026},
+  url       = {https://arxiv.org/abs/2510.04533},
 }
 
 @inproceedings{hyung2025stg,
   title     = {Spatiotemporal Skip Guidance for Enhanced Video Diffusion Sampling},
-  author    = {Minyoung Hyung and Jaegul Choo},
+  author    = {Junha Hyung and Kinam Kim and Susung Hong and Min-Jung Kim and Jaegul Choo},
   booktitle = {CVPR},
   year      = {2025},
+  url       = {https://arxiv.org/abs/2411.18664},
 }
 
 @inproceedings{yu2020pcgrad,

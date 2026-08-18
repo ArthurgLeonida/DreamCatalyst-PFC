@@ -145,6 +145,16 @@ p = (0.0, 1.5, 2.0) + 2.1 · (0.1, −0.3, −0.95) = (0.21, 0.87, 0.005)
 
 That pixel's mask value is written into the voxel containing `(0.21, 0.87, 0.005)`.
 
+### Practical detail: valid rays
+
+Not every ray hits a surface. Before a ray is backprojected, it must pass a
+validity check: its rendered accumulation (opacity) must exceed
+`mask_voxel_cache_accumulation_threshold`, and its depth must be finite and
+positive. This drops sky and empty-space rays, which have no surface point to
+index. The same validity mask gates the bbox observation below, the cache
+`query` (`in_bounds`), and the cache `update` (`in_bounds`) — so a ray that
+doesn't clear the opacity gate contributes nothing anywhere.
+
 ### Practical detail: the bbox source
 
 Backprojection needs a bbox that **contains the actual surface points** the
@@ -195,11 +205,13 @@ result and pull edge values toward "uncertain"; weighting by observation keeps
 unobserved corners from bleeding in.
 
 This smooths the readback **without** changing grid resolution, so observation
-density — and the variance/angular statistics — is untouched. **Only the
-returned value is interpolated**; every trust signal (`unique_view_count`,
-variance, angular factor, `observed`/valid, mass) is still read at the nearest
-voxel, so the gates behave identically. Trilinear changes *what magnitude* the
-cache feeds back, not *whether* it's trusted.
+density — and the variance/angular statistics — is untouched. **Only the returned
+mean value is interpolated.** The count (`unique_view_count`), variance, angular
+factor, and `observed`/valid signals are all read at the nearest voxel, so those
+gates behave identically to a nearest read. The one exception is the mass gate
+(§14), which is derived from the returned value itself and therefore tracks the
+trilinear read. Trilinear changes *what magnitude* the cache feeds back (and how
+the mass gate reads it), not whether the count/variance/angular gates trust it.
 
 ### Numerical example
 
@@ -451,9 +463,9 @@ Voxel `q`, three consistent views:
 - View 2 (0.7): `δ=−0.1, n=2, μ=0.75, δ′=−0.05, M2=0.005, σ²=0.005`.
 - View 3 (0.9): `δ=0.15, n=3, μ=0.80, δ′=0.10, M2=0.020, σ²=0.010`.
 
-Mean 0.80, variance 0.010 (std ≈ 0.10 between views). A contested voxel (view 1
-= 0.2, view 2 = 0.9) gives `μ = 0.55, M2 = 0.245, σ² = 0.245` — same observation
-count, far higher variance.
+Mean 0.80, variance 0.010 (std ≈ 0.10 between views). Contrast a contested voxel
+whose two views split hard (0.2 then 0.9): after just those two views it reads
+`μ = 0.55, M2 = 0.245, σ² = 0.245` — far higher variance from far less agreement.
 
 ### Decayed (exponentially-weighted) variance
 
@@ -764,8 +776,9 @@ count), but that conflates two things we'd rather tune separately.
 ### Solution
 
 An explicit per-voxel mass gate. The cache stores a mean mask value `m(q)` at
-each voxel — itself a measure of "how much edit signal has been committed here."
-The gate is
+each voxel — read back with the same observed-weighted trilinear interpolation as
+the fused value (§4) — itself a measure of "how much edit signal has been
+committed here." The gate is
 
 ```
 C_mass(q) = min(1, m(q) / m_threshold)
@@ -825,7 +838,7 @@ open while sweeping.
 | Knob | Symbol / role | Effect of increasing it | § |
 |---|---|---|---|
 | `mask_voxel_cache_resolution` | grid `V` | finer grid (but fewer views/voxel) | 2 |
-| `mask_voxel_cache_accumulation_threshold` | render-acc gate for backprojection | ignores low-opacity (sky/empty) rays | 3 |
+| `mask_voxel_cache_accumulation_threshold` | render-acc gate for ray validity (backprojection, observe, query, update) | ignores low-opacity (sky/empty) rays | 3 |
 | `mask_voxel_cache_bbox_observe_steps` / `_bbox_observe_quantile` / `_bbox_inflation` | observed-bbox construction | later build / tighter clip / larger box | 3 |
 | `mask_voxel_cache_ema_beta_camera_factor` | `c` in EMA `β = 1 − 1/(c·N_cam)` | slower value updates / longer memory | 5 |
 | `mask_voxel_cache_max_blend` | ceiling of `α(t)` | stronger cache pull overall | 6 |
@@ -866,8 +879,10 @@ trusted population. The confidence gate uses the evidence-gated
 
 ## 16. What's load-bearing
 
-Every mechanism below is active in the default (Part-2) configuration; this table
-is the quick status map.
+The whole mechanism is gated by `mask_voxel_cache_enabled`: `True` in the Part-2
+config below, `False` for the Part-1 "cache off" and dc-baseline configs (when
+off, the grid is never built, queried, or updated). Every mechanism in the table
+is active whenever the cache is enabled; this is the quick status map.
 
 | Mechanism | § | Notes |
 |---|---|---|
