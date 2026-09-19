@@ -12,9 +12,14 @@
 # (count + variance + angular diversity + mass) with scale matching and a
 # warmup-ramped blend. Full walkthrough: docs/VoxelCacheExplained.md.
 #
-# The agreement gate max_variance is scene-sensitive: tune it against the
-# variance map (dc_debug/voxel_cache_variance_map), above the wanted-edit
-# variance and below the over-edit variance.
+# The agreement gate max_variance is held at ONE GLOBAL VALUE (0.02) for every
+# scene and every edit: all 24 Part-2 runs in VoxelSTG3_Experiments.csv carry
+# the identical MB02_maxVar02 suffix. Nothing here is tuned per scene.
+# It is nevertheless the most scene-sensitive quantity in the method (the gap
+# between wanted-edit and over-edit variance is narrow), so holding it fixed is
+# a stated limitation, not a tuning step. If you do need to change it, read it
+# off the variance map (dc_debug/voxel_cache_variance_map): above the
+# wanted-edit variance and below the over-edit variance.
 #
 # ---------------------------------------------------------------------------
 # The three evaluated configurations
@@ -101,6 +106,11 @@ VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_min_observations_cap=12,
     mask_voxel_cache_max_variance=0.02,
     mask_voxel_cache_variance_decay=0.2,
+    # Agreement gate reads cross-view variance at the nearest voxel (False,
+    # all reported results) or with an eligibility-weighted trilinear read (True).
+    # Same scale either way (a weighted average of the same grid), but True
+    # opens the gate ~half a voxel past each agreed/contested boundary.
+    mask_voxel_cache_cv_trilinear=False,
 
     mask_voxel_cache_bbox_observe_steps=50,
     mask_voxel_cache_bbox_observe_quantile=0.05,

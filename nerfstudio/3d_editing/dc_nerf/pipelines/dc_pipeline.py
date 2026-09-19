@@ -68,6 +68,9 @@ class DCPipelineConfig(VanillaPipelineConfig):
     mask_voxel_cache_variance_decay: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_variance_decay", 0.0
     )
+    mask_voxel_cache_cv_trilinear: bool = VOXEL_CACHE_PARAMS.get(
+        "mask_voxel_cache_cv_trilinear", False
+    )
     mask_voxel_cache_mass_threshold: float = VOXEL_CACHE_PARAMS.get(
         "mask_voxel_cache_mass_threshold", 0.0
     )
@@ -248,6 +251,7 @@ class DCPipeline(ModifiedVanillaPipeline):
             ema_beta=ema_beta,
             num_views=n_views,
             variance_decay=float(self.config.mask_voxel_cache_variance_decay),
+            cv_trilinear=bool(self.config.mask_voxel_cache_cv_trilinear),
             device=self.device,
         )
 

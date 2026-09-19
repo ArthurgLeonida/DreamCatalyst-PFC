@@ -52,6 +52,7 @@ class MaskVoxelCache:
         fallback_value: float = 0.5,
         num_views: Optional[int] = None,
         variance_decay: float = 0.0,
+        cv_trilinear: bool = False,
         device: Optional[torch.device] = None,
     ) -> None:
         """
@@ -81,6 +82,21 @@ class MaskVoxelCache:
                 Note: the EW estimator is biased low by ≈ (1 − value), so its
                 absolute scale differs from the cumulative one — re-read
                 `query_variance_mean` and re-tune `max_variance` after enabling.
+            cv_trilinear: False (default) = the agreement gate reads the
+                cross-view variance at the nearest voxel, which is what all
+                reported results use. True = read it with the eligibility-
+                weighted trilinear estimator of `_trilinear_variance_read`,
+                matching the interpolation already applied to the mean value
+                so the confidence field stops being piecewise-constant at grid
+                resolution. The scene-wide mean is preserved (the read is a
+                weighted average of the same grid), so `query_variance_mean`
+                and `max_variance` stay on the same scale. What changes is
+                local: a contested voxel adjacent to an agreed one is pulled
+                toward it, so the gate opens up to roughly half a voxel past
+                each boundary. `max_variance` is one global value shared by
+                every scene and edit, so re-check it against the scene most
+                prone to over-editing (clown, arms) before trusting a run:
+                any change there changes every other scene too.
             device: torch device. Defaults to current CUDA device.
         """
         self.device = device if device is not None else torch.device(
@@ -94,6 +110,10 @@ class MaskVoxelCache:
         # 0.0 = cumulative Welford variance; (0,1) = exponentially-weighted
         # variance with this as the new-sample weight. See __init__ docstring.
         self.variance_decay = min(max(float(variance_decay), 0.0), 0.999)
+        # False = agreement gate reads variance at the nearest voxel (all
+        # reported results); True = eligibility-weighted trilinear read.
+        # See __init__ docstring.
+        self.cv_trilinear = bool(cv_trilinear)
         self.num_views = int(num_views) if num_views is not None and int(num_views) > 0 else None
 
         V = self.resolution
@@ -274,6 +294,100 @@ class MaskVoxelCache:
             num / den.clamp_min(1e-6),
             torch.full_like(num, self.fallback_value),
         )
+
+    def _trilinear_variance_read(
+        self, flat_points: torch.Tensor, nearest_variance: torch.Tensor
+    ) -> torch.Tensor:
+        """Smoothed trilinear read of the cross-view variance (``cv_trilinear``).
+
+        The mean value is already read over the 8 surrounding voxel centers,
+        so a query point near a voxel face receives a value blended from both
+        sides while the agreement gate judges it by whichever center happens
+        to be nearest. That makes the confidence field piecewise-constant at
+        grid resolution, and since confidence multiplies the fusion strength,
+        those steps reach the gradient. This read removes that asymmetry.
+
+        It differs from `_trilinear_observed_read` in two ways that matter for
+        a *trust* signal rather than a value:
+
+        1. **A corner only contributes if it has at least two unique views.**
+           A voxel with `count <= 1` stores variance 0 because its dispersion
+           is *undefined*, not because its views agree. Averaging that 0 into
+           a neighbour would lower the neighbour's variance and so raise its
+           confidence, which is backwards: single-view voxels carry no
+           cross-view evidence at all. Weighting by `observed` alone (what the
+           value read does) would introduce exactly that bias.
+
+        2. **Only the within-voxel term is used, deliberately.** A textbook
+           pooled variance would add the between-corner spread of the means,
+           `sum_i w_i * (mu_i - mu_bar)^2`. That is correct when the corners
+           are sub-samples of one population, but here they are eight
+           *different spatial locations*, so the between term measures the
+           spatial gradient of the mask field rather than cross-view
+           disagreement, and it is not on the scale `max_variance` is
+           calibrated against. The magnitudes are not close: mask means live
+           in [0, 1] while cross-view variance runs 0.005-0.03, so two
+           neighbours at mu = 0.85 and 0.35 contribute a between term of
+           0.0625, over 3x the global `max_variance` of 0.02. Including it
+           would clamp confidence to zero at every mask boundary, which is
+           where the cache is most needed. Within-only keeps the estimate on
+           the scale the threshold already uses.
+
+        Points with no eligible corner fall back to `nearest_variance`, so the
+        gate never becomes *more* permissive than the nearest-voxel default
+        just because the neighbourhood is poorly observed.
+
+        Args:
+            flat_points: [N, 3] world-space points.
+            nearest_variance: [N] nearest-voxel variance, used as fallback.
+
+        Returns:
+            [N] smoothed cross-view variance.
+        """
+        V = self.resolution
+        normalized = (flat_points - self.bbox_min) / (
+            self.bbox_max - self.bbox_min
+        ).clamp_min(1e-8)
+
+        c = (normalized * V - 0.5).clamp(0.0, float(V - 1))
+        i0 = c.floor().long().clamp_(0, V - 1)      # [N, 3]
+        i1 = (i0 + 1).clamp_(0, V - 1)              # [N, 3]
+        frac = (c - i0.float()).clamp(0.0, 1.0)     # [N, 3]
+
+        n_pts = flat_points.shape[0]
+        den = torch.zeros(n_pts, device=self.device, dtype=torch.float32)
+        within = torch.zeros_like(den)
+
+        for cx in (0, 1):
+            wx = frac[:, 0] if cx else (1.0 - frac[:, 0])
+            gx = i1[:, 0] if cx else i0[:, 0]
+            for cy in (0, 1):
+                wy = frac[:, 1] if cy else (1.0 - frac[:, 1])
+                gy = i1[:, 1] if cy else i0[:, 1]
+                for cz in (0, 1):
+                    wz = frac[:, 2] if cz else (1.0 - frac[:, 2])
+                    gz = i1[:, 2] if cz else i0[:, 2]
+                    w = wx * wy * wz                 # [N] trilinear weight
+
+                    counts_c = self.unique_view_count[gx, gy, gz].float()
+                    m2_c = self.running_m2[gx, gy, gz]
+                    # Same estimator query() uses, so the smoothed value stays
+                    # on the scale max_variance is tuned against.
+                    if self.variance_decay > 0.0:
+                        var_c = m2_c
+                    else:
+                        var_c = m2_c / (counts_c - 1.0).clamp_min(1.0)
+                    # Eligibility: observed AND cross-view variance defined.
+                    elig = (
+                        self.observed[gx, gy, gz] & (counts_c > 1.0)
+                    ).float()
+
+                    w_eff = w * elig
+                    den = den + w_eff
+                    within = within + w_eff * var_c
+
+        smoothed = within / den.clamp_min(1e-6)
+        return torch.where(den > 1e-6, smoothed, nearest_variance)
 
     # -----------------------------------------------------------------
     # Depth-backprojection helper
@@ -549,7 +663,10 @@ class MaskVoxelCache:
         straddles two surfaces) without raising the grid resolution. The trust
         signals (counts, variance, angular factor, observed/valid, mass) are
         read at the nearest voxel, so gating semantics are unaffected by the
-        interpolation.
+        interpolation. The one exception is `cv_trilinear=True`, which reads
+        the cross-view variance with the eligibility-weighted trilinear estimator of
+        `_trilinear_variance_read` so that the agreement gate is continuous
+        across voxel boundaries like the value it gates.
 
         Returns `fallback_value` for voxels never observed. Out-of-bounds
         points (if `in_bounds` is provided) are also returned as fallback.
@@ -602,6 +719,10 @@ class MaskVoxelCache:
                 m2 / (counts - 1.0).clamp_min(1.0),
                 torch.zeros_like(m2),
             )
+        if self.cv_trilinear:
+            # Match the interpolation already applied to the mean value, so a
+            # point blended from 8 voxels is not gated by just one of them.
+            variance = self._trilinear_variance_read(flat_points, variance)
 
         # Replace unobserved or out-of-bounds with fallback.
         valid = observed & in_bounds

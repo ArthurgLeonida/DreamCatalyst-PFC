@@ -114,6 +114,8 @@ if enabled:
     )
     vdecay = voxel.get('mask_voxel_cache_variance_decay', 0.0)
     var_mode = f"EW(a={vdecay})" if vdecay and vdecay > 0.0 else "Welford"
+    cv_read = "trilin" if voxel.get('mask_voxel_cache_cv_trilinear') else "nearest"
+    var_mode = f"{var_mode}, cv={cv_read}"
     print(
         f"   {branch} trust:      "
         f"obs>={obs}, "

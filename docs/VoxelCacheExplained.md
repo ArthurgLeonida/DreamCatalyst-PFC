@@ -892,19 +892,62 @@ is active whenever the cache is enabled; this is the quick status map.
 | Positive-only fusion with the 2D mask | 6 | core; cache adds edit force, never subtracts |
 | Scale-matching the cache value | 7 | core; makes `M_3D` comparable to the sharp 2D mask |
 | Cross-view variance (Welford **or** EW/decayed) | 8 | EW on (`variance_decay = 0.2`); recency-weighted |
-| Confidence gate (count + variance) | 9 | core; `max_variance` is **scene-tuned** |
+| Confidence gate (count + variance) | 9 | core; `max_variance` is one **global** 0.02 |
+| Variance readback (nearest **or** trilinear) | 9 | `cv_trilinear = False` (nearest) in all reported results |
 | Raw-self input + robust per-frame scale | 10 | core; reduces spurious variance |
 | Angular-diversity factor (linear, scene-relative) | 11–12 | core |
 | Auto-freeze of the angular denominator | 13 | core; keeps the gate consistent across training |
 | Mass gate (`C_mass`, linear) | 14 | core; damps low-edit-force voxels |
 
-> **`max_variance` is scene-tuned, not a fixed default.** Read it off
-> `dc_debug/voxel_cache_variance_map` and set it in the gap between the wanted
-> edit (low variance) and the over-edit region (high variance), staying above the
-> former. With `variance_decay` on, read it in the decayed scale (the map already
-> is). Read it mid-run on a healthy run: once an over-edit *consolidates* (all
-> views agreeing on the wrong edit), its variance collapses and the map can no
-> longer separate it.
+> **`max_variance` is a single global value, not scene-tuned.** Every scene and
+> every edit uses `0.02`: all 24 Part-2 runs in `VoxelSTG3_Experiments.csv`
+> carry the identical `MB02_maxVar02` suffix. Nothing in either part is tuned
+> per scene. Earlier versions of this file and of `method_config.py` said the
+> threshold "is scene-tuned"; that described what the diagnostic *would* let
+> you do, not what was done, and it is corrected here.
+>
+> It remains the most scene-sensitive quantity in the method, because the gap
+> between the wanted edit and the over-edit region is narrow, so holding it
+> fixed is a stated limitation rather than a tuning step. **If you do need to
+> change it:** read it off `dc_debug/voxel_cache_variance_map` and set it in the
+> gap between the wanted edit (low variance) and the over-edit region (high
+> variance), staying above the former. With `variance_decay` on, read it in the
+> decayed scale (the map already is). Read it mid-run on a healthy run: once an
+> over-edit *consolidates* (all views agreeing on the wrong edit), its variance
+> collapses and the map can no longer separate it. Any change applies to every
+> scene at once.
+
+> **`cv_trilinear` (default `False`) — how the gate reads that variance.**
+> The cached *mean* is read with observed-weighted trilinear interpolation (§4),
+> but the trust signals — counts, variance, angular factor, mass — are read at
+> the nearest voxel. So a query point near a voxel face gets a value blended
+> from both sides while being gated by whichever centre is nearest, making the
+> confidence field piecewise-constant at grid resolution. Since confidence
+> multiplies fusion strength, those steps reach the gradient.
+>
+> Setting `mask_voxel_cache_cv_trilinear = True` reads the cross-view variance
+> with the same 8-corner interpolation, so the gate ramps across a boundary
+> instead of stepping. Two details make it a *trust* read rather than a copy of
+> the value read:
+> 1. A corner only contributes if it has **at least two unique views**. A voxel
+>    with `count <= 1` stores `σ² = 0` because its dispersion is *undefined*,
+>    not because its views agree; averaging that zero in would raise the
+>    neighbour's confidence. Weighting by `observed` alone (what the value read
+>    does) inflates confidence ~57% over the nearest-voxel baseline in the
+>    single-view-neighbour case.
+> 2. Only the **within-voxel** term is used. A textbook pooled variance would
+>    add `Σ wᵢ(μᵢ − μ̄)²`, but the corners are different spatial locations, not
+>    repeated measurements, so that term measures the spatial gradient of the
+>    mask field, not view disagreement — and it is off-scale: two neighbours at
+>    `μ = 0.85` and `0.35` contribute `0.0625`, over 3× the global
+>    `max_variance = 0.02`, which would clamp confidence to zero at every mask
+>    boundary.
+>
+> The scene-wide mean is preserved (it is a weighted average of the same grid),
+> so `max_variance` stays on scale. What changes is local: a contested voxel
+> beside an agreed one is pulled toward it, opening the gate about half a voxel
+> past each boundary (~2 cm at resolution 64 on a 2–3 m capture). Because
+> `max_variance` is global, re-check it on clown before trusting a run.
 
 ### How to read this when re-orienting
 
