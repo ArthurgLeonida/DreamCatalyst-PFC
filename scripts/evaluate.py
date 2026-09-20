@@ -1333,6 +1333,89 @@ def log_results_to_wandb(results, config_path, config, metrics_path, run_id=None
     wandb.finish()
 
 
+def push_metrics_to_wandb(
+    metrics_path,
+    wandb_run_id=None,
+    wandb_dir=None,
+    wandb_project=None,
+):
+    """Push an existing metrics.json into its WandB run without re-rendering.
+
+    `evaluate_experiment` already logs to WandB when `--log-wandb` is passed,
+    but re-running it only to refresh WandB costs a full render pass per run
+    (and a GPU). This reads the metrics a previous evaluation already wrote and
+    replays them through the same `log_results_to_wandb` path, so the numbers
+    in WandB are byte-identical to the ones in metrics.json.
+
+    Everything lands in `run.summary`, so re-pushing overwrites the existing
+    keys in place rather than appending a new logged step. Running this twice
+    is a no-op.
+
+    Args:
+        metrics_path: path to a metrics.json written by `eval`.
+        wandb_run_id: attach to this run id instead of the discovered one.
+        wandb_dir: directory holding the local WandB run files.
+        wandb_project: override the project name.
+
+    Returns:
+        True if the push was attempted, False if the file was unusable.
+    """
+    metrics_path = Path(metrics_path)
+    if not metrics_path.is_file():
+        print(f"WARNING: {metrics_path} not found, skipping.")
+        return False
+
+    try:
+        with open(metrics_path, "r", encoding="utf-8") as handle:
+            results = json.load(handle)
+    except Exception as exc:
+        print(f"WARNING: Could not read {metrics_path}: {exc}")
+        return False
+
+    if "metrics" not in results or "num_views" not in results:
+        print(f"WARNING: {metrics_path} has no metrics block, skipping.")
+        return False
+
+    # metrics.json records the config it was produced from; fall back to the
+    # sibling config.yml when the recorded path has since moved.
+    config_path = Path(results.get("config", ""))
+    if not config_path.is_file():
+        sibling = metrics_path.parent / "config.yml"
+        if not sibling.is_file():
+            print(
+                f"WARNING: No config.yml for {metrics_path} "
+                f"(recorded: {results.get('config')!r}), skipping."
+            )
+            return False
+        config_path = sibling
+
+    config = load_experiment_config(config_path)
+    metadata = load_wandb_run_metadata(config_path) or {}
+    resolved_wandb_dir = Path(wandb_dir) if wandb_dir else infer_wandb_dir(config_path)
+    resolved_run_id = (
+        wandb_run_id
+        or metadata.get("run_id")
+        or discover_wandb_run_id(resolved_wandb_dir)
+    )
+    resolved_project = wandb_project or metadata.get("project") or infer_project_name(config)
+
+    if not resolved_run_id:
+        print(
+            f"NOTE: No WandB run id found for {metrics_path}; a new "
+            f"'<experiment>_eval' run will be created instead of updating one."
+        )
+
+    log_results_to_wandb(
+        results,
+        config_path,
+        config,
+        metrics_path,
+        run_id=resolved_run_id,
+        wandb_project=resolved_project,
+    )
+    return True
+
+
 def _resize_image_like(tensor, size, mode="bilinear"):
     """Resize [1,C,H,W] tensor to size while preserving value range."""
     kwargs = {"mode": mode}
@@ -2255,7 +2338,63 @@ def main():
         help="HuggingFace CLIPSeg checkpoint used to segment the region.",
     )
 
+    push_parser = subparsers.add_parser(
+        "push-wandb",
+        help="Push existing metrics.json files into their WandB runs (no re-render)",
+    )
+    push_parser.add_argument(
+        "metrics",
+        type=str,
+        nargs="+",
+        help="One or more metrics.json paths, or run directories containing one.",
+    )
+    push_parser.add_argument(
+        "--wandb-run-id",
+        type=str,
+        default=None,
+        help="Attach to this run id instead of the discovered one (single input only).",
+    )
+    push_parser.add_argument(
+        "--wandb-dir", type=str, default=None,
+        help="Directory containing local WandB run files.",
+    )
+    push_parser.add_argument(
+        "--wandb-project", type=str, default=None,
+        help="Override the WandB project name.",
+    )
+
     args = parser.parse_args()
+
+    if args.command == "push-wandb":
+        targets = []
+        for raw in args.metrics:
+            path = Path(raw)
+            if path.is_dir():
+                found = sorted(path.rglob("metrics.json"))
+                if not found:
+                    print(f"WARNING: No metrics.json under {path}, skipping.")
+                targets.extend(found)
+            else:
+                targets.append(path)
+
+        if args.wandb_run_id and len(targets) > 1:
+            parser.error(
+                "--wandb-run-id targets a single run; it cannot be applied to "
+                f"{len(targets)} metrics files at once."
+            )
+
+        pushed = 0
+        for index, target in enumerate(targets, start=1):
+            print(f"[{index}/{len(targets)}] {target}")
+            if push_metrics_to_wandb(
+                target,
+                wandb_run_id=args.wandb_run_id,
+                wandb_dir=args.wandb_dir,
+                wandb_project=args.wandb_project,
+            ):
+                pushed += 1
+        print(f"\nPushed {pushed}/{len(targets)} metrics files to WandB.")
+        return
 
     if args.command == "eval":
         evaluate_experiment(
