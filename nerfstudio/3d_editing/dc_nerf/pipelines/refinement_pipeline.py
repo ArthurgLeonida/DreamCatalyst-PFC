@@ -87,11 +87,11 @@ class RefinementPipeline(ModifiedVanillaPipeline):
 
         if step % self.config.edit_rate == 0:
             for i in range(self.config.edit_count):
-                rendered_image, original_image, current_spot = self.get_current_rendering()
-                input_img = original_image
+                rendered_image, _, current_spot = self.get_current_rendering()
+                # Refine the current edit and use the result as fixed supervision.
+                input_img = rendered_image.detach()
 
-                # with torch.no_grad():
-                if True:
+                with torch.no_grad():
                     h, w = input_img.shape[2:]
                     l = min(h, w)
                     h = int(h * 512 / l)
@@ -100,15 +100,14 @@ class RefinementPipeline(ModifiedVanillaPipeline):
                     resized_img = torch.nn.functional.interpolate(input_img, size=(h, w), mode="bilinear")
                     latents = self.dc.encode_image(resized_img.to(self.dc_device))
 
-                ## config ##
-                x0 = latents
-                num_inference_steps = self.dc.config.num_inference_steps
-                min_step = int(num_inference_steps * self.config.skip_min_ratio)
-                max_step = int(num_inference_steps * self.config.skip_max_ratio)
-                skip = random.randint(min_step, max_step)
+                    x0 = latents
+                    num_inference_steps = self.dc.config.num_inference_steps
+                    min_step = int(num_inference_steps * self.config.skip_min_ratio)
+                    max_step = int(num_inference_steps * self.config.skip_max_ratio)
+                    skip = random.randint(min_step, max_step)
 
-                edit_x0 = self.dc.run_sdedit(x0, skip=skip)
-                edit_img = self.dc.decode_latent(edit_x0)
+                    edit_x0 = self.dc.run_sdedit(x0, skip=skip)
+                    edit_img = self.dc.decode_latent(edit_x0)
 
                 if edit_img.shape[2:] != rendered_image.shape[2:]:
                     edit_img = torch.nn.functional.interpolate(

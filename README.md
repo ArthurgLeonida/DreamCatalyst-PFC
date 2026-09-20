@@ -72,13 +72,13 @@ Output: `data/<scene>_processed/` with `transforms.json`.
 ## Step 2 — Train NeRF reconstruction
 
 ```bash
-bash scripts/train.sh <scene> 30000 nerf
+bash scripts/train.sh <scene> 30000 1 nerfacto
 # equivalent to: ns-train nerfacto ... nerfstudio-data --data data/<scene>_processed
 ```
 
 Output: `outputs/<scene>/nerfacto/<timestamp>/`
 
-> For the 3DGS path, pass `splat` instead of `nerf`.
+> The third argument is the downscale (`1`, `2`, or `4`); use the same value for reconstruction, editing, and refinement. For the 3DGS path, pass `splatfacto` instead of `nerfacto` as the fourth argument.
 
 ## Step 3 — Edit with DreamCatalyst (DDS)
 
@@ -122,7 +122,7 @@ RUN_NAME=my_refine bash scripts/refine.sh <scene> \
     30000
 ```
 
-Uses SDEdit (SD 1.5, 20 denoising steps with `skip=7`) to produce edited 2D images and retrains the NeRF against them. This step was part of the original DreamCatalyst pipeline and is kept here for completeness, but it is **not part of the current experimental evaluation**: Step 3 is where the contributions live, and refinement adds significant runtime without altering the scientific claim. The option remains available for anyone who wants to produce polished final renders.
+Uses SDEdit (SD 1.5) to refine the current edited renders and retrains the NeRF against the resulting detached 2D targets. This step was part of the original DreamCatalyst pipeline and is kept here for completeness, but it is **not part of the current experimental evaluation**: Step 3 is where the contributions live, and refinement adds significant runtime without altering the scientific claim. The option remains available for anyone who wants to produce polished final renders.
 
 ## Novelties
 

@@ -650,7 +650,9 @@ def _region_cache_signature(
         "min_prob_scale": float(min_prob_scale),
         "dilate_fraction": float(dilate_fraction),
         "feather_fraction": float(feather_fraction),
-        "format": "uint8_png_soft_mask_v2",
+        # Invalidate older caches that may contain stale masks from a failed
+        # regeneration under a different signature.
+        "format": "uint8_png_soft_mask_v3",
     }
 
 
@@ -873,7 +875,16 @@ def build_region_masks(
             cached_meta = json.loads(meta_path.read_text())
         except Exception:
             cached_meta = None
-    cache_valid = bool(cached_meta) and cached_meta.get("signature") == signature
+    cache_valid = isinstance(cached_meta, dict) and cached_meta.get("signature") == signature
+    if not cache_valid:
+        # This directory contains generated masks only; explicitly supplied
+        # --region-mask-dir folders returned above and are never invalidated.
+        # Remove metadata first so an interrupted regeneration cannot certify
+        # a mixture of old and new PNGs. Removing the old PNGs also keeps them
+        # out of evaluations that reuse this folder via --region-mask-dir.
+        meta_path.unlink(missing_ok=True)
+        for path in cache_dir.glob("*.png"):
+            path.unlink()
 
     info["region_mask_source"] = "clipseg"
     info["region_mask_cache_dir"] = str(cache_dir)
@@ -885,10 +896,14 @@ def build_region_masks(
         path = cache_dir / f"{name}.png"
         if cache_valid and path.exists():
             try:
-                masks[i] = _load_region_mask_file(path, sizes[i])
-                continue
+                mask = _load_region_mask_file(path, sizes[i])
+                if _region_coverage_ok(mask):
+                    masks[i] = mask
+                    continue
             except Exception as exc:
                 print(f"WARNING: Failed to read cached region mask {path}: {exc}")
+            # A rejected cache entry must stay absent if regeneration fails.
+            path.unlink()
         pending.append(i)
 
     degenerate = []
@@ -1324,11 +1339,31 @@ def log_results_to_wandb(results, config_path, config, metrics_path, run_id=None
             job_type="evaluation",
         )
 
-    run.summary["eval/config"] = str(config_path)
-    run.summary["eval/metrics_path"] = str(metrics_path)
-    run.summary["eval/attached_to_existing_run"] = attached
-    for key, value in flattened_metrics.items():
-        run.summary[key] = value
+    summary_payload = dict(flattened_metrics)
+    summary_payload["eval/config"] = str(config_path)
+    summary_payload["eval/metrics_path"] = str(metrics_path)
+    summary_payload["eval/attached_to_existing_run"] = attached
+
+    # The region provenance is a TOP-LEVEL block, not part of results["metrics"],
+    # so flatten_wandb_metrics never sees it. Push it explicitly: without it a
+    # WandB export cannot tell you which region phrase, anchor or dilation the
+    # numbers were produced with, which makes "did my re-run actually change
+    # anything?" unanswerable from WandB alone.
+    for key, value in (results.get("region") or {}).items():
+        if isinstance(value, (str, bool, int, float)) or value is None:
+            summary_payload[f"region/{key}"] = value
+        elif isinstance(value, (list, tuple)) and all(
+            isinstance(v, (str, int, float)) for v in value
+        ):
+            summary_payload[f"region/{key}"] = ", ".join(str(v) for v in value)
+
+    # A new evaluation replaces the previous one, including metrics and region
+    # provenance that disappeared (disabled metrics, unusable masks, etc.).
+    # Leave training summaries and other namespaces untouched.
+    for key in list(run.summary.keys()):
+        if key.startswith(("eval/", "region/")) and key not in summary_payload:
+            del run.summary[key]
+    run.summary.update(summary_payload)
 
     wandb.finish()
 
