@@ -54,6 +54,11 @@ def log_dc_debug_to_wandb(
     cross_attention_mask_weight_current: Optional[float],
     tensor_to_pil_fn,
     resize_image_fn,
+    internal_grad_mask: Optional[torch.Tensor] = None,
+    preservation_mask: Optional[torch.Tensor] = None,
+    stg_perturbation: Optional[torch.Tensor] = None,
+    source_blend_enabled: bool = False,
+    self_mask_ema_beta: Optional[float] = None,
 ):
     """Log the most useful DC debugging images and scalars to WandB."""
     import wandb
@@ -97,6 +102,37 @@ def log_dc_debug_to_wandb(
     }
     if current_edit_strength is not None:
         log_payload["dc_debug/edit_strength"] = float(current_edit_strength)
+    if self_mask_ema_beta is not None:
+        log_payload["dc_debug/self_mask_ema_beta"] = float(self_mask_ema_beta)
+
+    # STG already passes through source blending. Compare its effective
+    # contribution to the TAG-only DDS delta, using the SAME mask on both.
+    stg_delta = stg_perturbation if stg_perturbation is not None else torch.zeros_like(eps_tgt)
+    base_delta = eps_tgt - eps_src - stg_delta
+    if source_blend_enabled and grad_mask is not None:
+        stg_effective = grad_mask * stg_delta
+        base_effective = grad_mask * base_delta
+    else:
+        stg_effective, base_effective = stg_delta, base_delta
+    stg_norm = batch_l2_norm_mean(stg_effective)
+    base_norm = batch_l2_norm_mean(base_effective)
+    log_payload["dc_debug/stg_effective_delta_norm"] = stg_norm
+    log_payload["dc_debug/tag_only_effective_delta_norm"] = base_norm
+    log_payload["dc_debug/stg_to_tag_only_dds_ratio"] = stg_norm / max(base_norm, 1e-8)
+
+    for name, mask in (("internal_mask", internal_grad_mask), ("preservation_mask", preservation_mask)):
+        if mask is not None:
+            log_payload[f"dc_debug/{name}"] = make_wandb_image(
+                mask, tensor_to_pil_fn, resize_image_fn, caption,
+            )
+            for key, value in summarize_mask(mask).items():
+                log_payload[f"dc_debug/{name}_{key}"] = value
+    if internal_grad_mask is not None and grad_mask is not None:
+        addition = (grad_mask - internal_grad_mask).clamp_min(0.0)
+        log_payload["dc_debug/cache_addition_mean"] = addition.detach().float().mean().item()
+        log_payload["dc_debug/cache_addition"] = make_wandb_image(
+            addition, tensor_to_pil_fn, resize_image_fn, caption,
+        )
     if cross_attention_mask_weight_current is not None:
         log_payload["dc_debug/cross_attention_mask_weight_current"] = float(
             cross_attention_mask_weight_current

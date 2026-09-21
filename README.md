@@ -128,6 +128,8 @@ Uses SDEdit (SD 1.5) to refine the current edited renders and retrains the NeRF 
 
 The main DDS orchestration lives in `nerfstudio/dc/dc.py`; reusable novelty math lives in `nerfstudio/dc/guidance_utils.py`; **all knobs are configured centrally in `nerfstudio/dc/method_config.py`** — `DC_CUSTOM_PARAMS` (Part 1, unpacked into `DCConfig`) and `VOXEL_CACHE_PARAMS` (Part 2, loaded by `DCPipelineConfig`). That file is the single source of truth for which mechanisms are active in any run; consult it rather than any copy here.
 
+Opt-in controls for per-view EMA memory, instruction-only masks, early CA restriction, and cache/preservation coupling are documented in [`docs/LocalizationAblations.md`](docs/LocalizationAblations.md), with a staged experiment plan. Their defaults preserve the existing method; they have not been evaluated. Use `SEED=43 bash scripts/edit.sh ...` to vary the training seed (default 42).
+
 ### Localization branch — Part 1 (main research direction)
 
 | Novelty | Config | Description |

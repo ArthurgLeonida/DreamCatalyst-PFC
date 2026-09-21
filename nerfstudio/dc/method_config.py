@@ -42,6 +42,10 @@
 #      mask_voxel_cache_enabled=False
 #    (with all localization flags off no relevance mask is built, so the
 #    remaining mask-shaping values — blur/gamma/quantile — are inert)
+#
+# Opt-in localization ablations (2026-09): all new defaults preserve the
+# existing configurations. Rationale, exact deltas, and experiment order:
+# docs/LocalizationAblations.md. These are hypotheses, not evaluated results.
 
 DC_CUSTOM_PARAMS = dict(
     # ---------------------------------------------------------------------
@@ -52,12 +56,20 @@ DC_CUSTOM_PARAMS = dict(
 
     outside_mask_anchor_weight=0.15,
     outside_mask_anchor_edit_strength_adaptive=True,
+    outside_mask_anchor_mask_source="final",  # final | internal (pre-cache) | source (fixed)
+    external_mask_ca_gate_weight=0.0,  # 1 requires CA support for cache additions
 
     gradient_mask_blur=0.5,
     gradient_mask_gamma=1.2,
     gradient_mask_ema_beta=0.0,
     gradient_mask_ema_beta_auto=True,
     gradient_mask_ema_beta_camera_factor=2.0,
+    gradient_mask_ema_mode="legacy_camera",  # per_view fixes the EMA update clock
+    gradient_mask_ema_memory_visits=2.0,  # per_view e-folding time; requires beta_auto
+    gradient_mask_source="dds",  # dds | target_instruction | source_instruction
+    localization_source_timestep_ratio=0.5,  # fraction of training noise timesteps
+    localization_source_num_samples=4,  # source-only masks: average magnitudes before normalization
+    localization_source_seed=42,  # private per-view RNG; does not consume training RNG
     gradient_mask_raw_norm_quantile=0.95,
 
     cross_attention_mask_enabled=True,
@@ -65,6 +77,7 @@ DC_CUSTOM_PARAMS = dict(
     cross_attention_mask_blur=0.5,
     cross_attention_mask_gamma=1.2,
     cross_attention_mask_weight_schedule_power=0.75,
+    cross_attention_mask_weight_min=0.0,  # early CA floor; 1 = full CA throughout
 
     latent_mean_anchor_weight=0.005,
 

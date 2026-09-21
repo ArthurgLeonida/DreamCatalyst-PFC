@@ -1,4 +1,5 @@
 from collections import defaultdict
+import math
 from dataclasses import dataclass, field
 from typing import Optional, Type, Union
 
@@ -122,13 +123,19 @@ class DCPipeline(ModifiedVanillaPipeline):
             factor = max(
                 float(self.config.dc.gradient_mask_ema_beta_camera_factor), 1e-6
             )
-            auto_beta = 1.0 - 1.0 / (factor * float(n_cameras))
-            auto_beta = min(max(auto_beta, 0.0), 0.9999)
+            if self.config.dc.gradient_mask_ema_mode == "per_view":
+                memory = self.config.dc.gradient_mask_ema_memory_visits
+                auto_beta = math.exp(-1.0 / memory)
+                ema_description = f"per_view, e-folding memory={memory} camera updates"
+            else:
+                auto_beta = 1.0 - 1.0 / (factor * float(n_cameras))
+                auto_beta = min(max(auto_beta, 0.0), 0.9999)
+                ema_description = f"legacy_camera, N_cam={n_cameras}, factor={factor}"
             self.config.dc.gradient_mask_ema_beta = auto_beta
             self.dc.config.gradient_mask_ema_beta = auto_beta
             print(
                 f"[self-mask] auto EMA beta = {auto_beta:.6f} "
-                f"(N_cam={n_cameras}, factor={factor})"
+                f"({ema_description})"
             )
         # Caching source's x0 and IP2P image-conditioning latent per view.
         self.src_x0s = dict()

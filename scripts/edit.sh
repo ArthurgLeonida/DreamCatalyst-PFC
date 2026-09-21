@@ -5,7 +5,7 @@ set -euo pipefail
 #   bash scripts/edit.sh <scene> <src_prompt> <tgt_prompt> <load_dir> [max_iters] [rep] [downscale]
 #
 # Runtime knobs kept here:
-#   RUN_NAME, PROJECT_NAME, VIS_MODE, EVAL_AFTER_EDIT, EVAL_DEVICE, CUDA_VISIBLE_DEVICES
+#   RUN_NAME, PROJECT_NAME, VIS_MODE, EVAL_AFTER_EDIT, EVAL_DEVICE, CUDA_VISIBLE_DEVICES, SEED
 #
 # Method knobs live in:
 #   nerfstudio/dc/method_config.py
@@ -24,6 +24,7 @@ PROJECT_NAME="${PROJECT_NAME:-dreamcatalyst-pfc}"
 EXPERIMENT_NAME="${RUN_NAME:-${SCENE}_dc_edit}"
 EVAL_AFTER_EDIT="${EVAL_AFTER_EDIT:-1}"
 EVAL_DEVICE="${EVAL_DEVICE:-cuda}"
+SEED="${SEED:-42}"
 RUN_DIR=""
 TRAIN_LOG=""
 
@@ -82,6 +83,22 @@ dc = module.DC_CUSTOM_PARAMS
 enabled = 1 if voxel.get("mask_voxel_cache_enabled") else 0
 ca_enabled = 1 if dc.get("cross_attention_mask_enabled") else 0
 
+print(f" Self mask: {dc.get('gradient_mask_source', 'dds')}")
+if dc.get("gradient_mask_ema_beta_auto", False):
+    mode = dc.get("gradient_mask_ema_mode", "legacy_camera")
+    if mode == "per_view":
+        print(f" Self EMA:  per_view, memory={dc['gradient_mask_ema_memory_visits']} updates/view")
+    else:
+        print(f" Self EMA:  legacy_camera, factor={dc['gradient_mask_ema_beta_camera_factor']}")
+else:
+    print(f" Self EMA:  manual beta={dc['gradient_mask_ema_beta']}")
+print(f" Anchor:    {dc.get('outside_mask_anchor_mask_source', 'final')} mask")
+print(f" Cache CA:  {dc.get('external_mask_ca_gate_weight', 0.0)}")
+if dc.get('gradient_mask_source') == 'source_instruction' or dc.get('outside_mask_anchor_mask_source') == 'source':
+    print(
+        f" Source mask: t_ratio={dc['localization_source_timestep_ratio']}, "
+        f"samples={dc['localization_source_num_samples']}, seed={dc['localization_source_seed']}"
+    )
 print(f" CA mask:   {ca_enabled}")
 if ca_enabled:
     branch = "\u251c\u2500"
@@ -90,7 +107,7 @@ if ca_enabled:
     print(f"   {branch} gamma:      {dc['cross_attention_mask_gamma']}")
     print(
         f"   {last} schedule:   "
-        f"reverse_tag 0{arrow}1 "
+        f"reverse_tag {dc.get('cross_attention_mask_weight_min', 0.0)}{arrow}1 "
         f"(power={dc['cross_attention_mask_weight_schedule_power']})"
     )
 print(f" Voxel 3D:  {enabled}")
@@ -155,6 +172,7 @@ echo " Editing:   ${METHOD}"
 echo " Scene:     ${SCENE}"
 echo " Data:      ${DATA_DIR}"
 echo " Iters:     ${MAX_ITERS}"
+echo " Seed:      ${SEED}"
 echo " Downscale: ${DOWN_SCALE}"
 echo " Src:       ${SRC_PROMPT}"
 echo " Tgt:       ${TGT_PROMPT}"
@@ -176,7 +194,7 @@ if [ ! -d "${LOAD_DIR}" ]; then
 fi
 
 CMD=(ns-train "${METHOD}" \
-    --machine.seed 42 \
+    --machine.seed "${SEED}" \
     --max-num-iterations "${MAX_ITERS}" \
     --mixed-precision False \
     --vis "${VIS_MODE}" \

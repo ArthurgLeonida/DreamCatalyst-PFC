@@ -16,19 +16,22 @@ def compute_ca_mask_weight(
     min_step_ratio: float,
     max_step_ratio: float,
     schedule_power: float,
+    min_weight: float = 0.0,
 ) -> float:
     """Return the Cross-Attention mask weight for the current timestep.
 
-    w_CA(t) = progress^(schedule_power · e): near zero at the start of the
-    edit (high noise), rising to 1 by the end — CA sharpens localization only
-    after the raw edit has had room to form structure.
+    w_CA(t) = min_weight + (1-min_weight)*progress^(schedule_power · e).
+    Default 0 reproduces the old schedule; 1 applies full CA from the start.
     """
     min_t = min(max(float(min_step_ratio), 0.0), 1.0)
     max_t = min(max(float(max_step_ratio), min_t + 1e-8), 1.0)
     t = min(max(float(t_normalized), min_t), max_t)
     progress = (max_t - t) / max(max_t - min_t, 1e-8)
     exponent = max(float(schedule_power), 1e-8) * math.e
-    return progress ** exponent
+    scheduled = progress ** exponent
+    if min_weight == 0.0:
+        return scheduled
+    return min_weight + (1.0 - min_weight) * scheduled
 
 
 def apply_tag(noise_pred: torch.Tensor, latents_noisy: torch.Tensor, eta: float) -> torch.Tensor:
@@ -181,8 +184,18 @@ def apply_latent_mean_anchor(
 def compute_gate_signal(
     target_ca: Optional[torch.Tensor],
     sm: Optional[torch.Tensor],
+    ca_gate_weight: float = 0.0,
 ) -> Optional[torch.Tensor]:
-    """Semantic gate for the cache fusion: pixel-wise max of the CA and self masks."""
+    """Legacy max gate, optionally attenuated where CA support is absent.
+
+    Positive additions only: this never subtracts from the internal mask.
+    Missing CA maps count as zero evidence for the optional CA requirement.
+    """
     if sm is not None and target_ca is not None:
-        return torch.maximum(target_ca, sm).clamp(0.0, 1.0)
-    return target_ca if target_ca is not None else sm
+        gate = torch.maximum(target_ca, sm).clamp(0.0, 1.0)
+    else:
+        gate = target_ca if target_ca is not None else sm
+    if ca_gate_weight == 0.0 or gate is None:
+        return gate
+    ca = target_ca if target_ca is not None else torch.zeros_like(gate)
+    return gate * ((1.0 - ca_gate_weight) + ca_gate_weight * ca)

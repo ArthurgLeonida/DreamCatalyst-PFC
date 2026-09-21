@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from diffusers import DDIMScheduler, DiffusionPipeline
 from jaxtyping import Float
 from PIL import Image
-from typing import List, Dict, Optional
+from typing import List, Dict, Literal, Optional
 from dc.attention_utils import (
     run_unet_with_cross_attention_capture,
     run_unet_with_skipped_attn,
@@ -79,25 +79,69 @@ class DCConfig:
     gradient_mask_ema_beta: float = 0.99
     gradient_mask_ema_beta_auto: bool = True
     gradient_mask_ema_beta_camera_factor: float = 2.0
+    # legacy_camera reproduces the original camera-count formula. per_view
+    # measures the EMA e-folding time in updates of this camera's own mask.
+    gradient_mask_ema_mode: Literal["legacy_camera", "per_view"] = "legacy_camera"
+    gradient_mask_ema_memory_visits: float = 2.0
+    gradient_mask_source: Literal["dds", "target_instruction", "source_instruction"] = "dds"
+    # Fixed-source localization has its own noise level and RNG, independent
+    # of DDS annealing. These also serve the optional source preservation mask.
+    localization_source_timestep_ratio: float = 0.5
+    localization_source_num_samples: int = 4
+    localization_source_seed: int = 42
     gradient_mask_gamma: float = 1.2
     gradient_mask_raw_norm_quantile: float = 0.95
     source_blend_localization_enabled: bool = True
 
     outside_mask_anchor_weight: float = 0.2
     outside_mask_anchor_edit_strength_adaptive: bool = True
+    outside_mask_anchor_mask_source: Literal["final", "internal", "source"] = "final"
+    # Multiply the legacy cache gate by (1-lambda) + lambda*M_CA.
+    # At 1, cache additions require CA support even when the self-mask is high.
+    external_mask_ca_gate_weight: float = 0.0
 
     cross_attention_mask_enabled: bool = True
     cross_attention_mask_layers: List[int] = field(default_factory=lambda: [1, 2])
     cross_attention_mask_blur: float = 0.5
     cross_attention_mask_gamma: float = 1.2
     cross_attention_mask_weight_schedule_power: float = 0.75
+    cross_attention_mask_weight_min: float = 0.0
 
     latent_mean_anchor_weight: float = 0.005
+
+    def __post_init__(self):
+        self.validate_localization_options()
+
+    def validate_localization_options(self):
+        if self.gradient_mask_ema_mode not in ("legacy_camera", "per_view"):
+            raise ValueError("Unknown gradient_mask_ema_mode")
+        if self.gradient_mask_source not in ("dds", "target_instruction", "source_instruction"):
+            raise ValueError("Unknown gradient_mask_source")
+        if self.outside_mask_anchor_mask_source not in ("final", "internal", "source"):
+            raise ValueError("Unknown outside_mask_anchor_mask_source")
+        if (
+            not math.isfinite(self.gradient_mask_ema_memory_visits)
+            or self.gradient_mask_ema_memory_visits <= 0
+        ):
+            raise ValueError("gradient_mask_ema_memory_visits must be finite and positive")
+        if not 0.0 < self.localization_source_timestep_ratio < 1.0:
+            raise ValueError("localization_source_timestep_ratio must be between 0 and 1 (exclusive)")
+        if self.localization_source_num_samples < 1:
+            raise ValueError("localization_source_num_samples must be at least 1")
+        if self.localization_source_seed < 0:
+            raise ValueError("localization_source_seed must be nonnegative")
+        for name in ("cross_attention_mask_weight_min", "external_mask_ca_gate_weight"):
+            if not 0.0 <= getattr(self, name) <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1]")
+        if self.external_mask_ca_gate_weight > 0 and not self.cross_attention_mask_enabled:
+            raise ValueError("external_mask_ca_gate_weight requires cross_attention_mask_enabled")
 
 
 class DC(object):
     def __init__(self, config: DCConfig, use_wandb=False):
         self.config = config
+        # Also validate configs modified after dataclass construction (CLI).
+        config.validate_localization_options()
         self.device = torch.device(config.device)
 
         self.pipe = DiffusionPipeline.from_pretrained(config.sd_pretrained_model_or_path).to(self.device)
@@ -130,6 +174,8 @@ class DC(object):
         self.iteration = 0
         self.max_iteration = config.max_iteration
         self.gradient_mask_ema: Dict[int, torch.Tensor] = {}
+        self.source_relevance_cache: Dict[int, torch.Tensor] = {}
+        self.source_relevance_signature = None
 
         b1 = self.config.freeu_b1
         b2 = self.config.freeu_b2
@@ -139,11 +185,11 @@ class DC(object):
         register_free_upblock2d_in(self.unet, b1, b2, s1, s2)
         register_free_crossattn_upblock2d_in(self.unet, b1, b2, s1, s2)
 
-    def _build_gradient_relevance_mask(self, eps_tgt, eps_src, current_spot):
-        """Build a soft latent-space relevance mask from the DDS delta.
+    def _build_gradient_relevance_mask(self, relevance, current_spot):
+        """Normalize and smooth the selected latent-space relevance signal.
 
         The mask is:
-        1. derived from ||eps_tgt - eps_src||_2 per spatial location,
+        1. supplied as a channel-L2 magnitude per spatial location,
         2. percentile-normalized per sample,
         3. temporally smoothed via EMA per view,
         4. optionally sharpened and blurred,
@@ -158,10 +204,8 @@ class DC(object):
         (e.g. the voxel cache) lose signal. The raw variant preserves
         absolute structure for those consumers.
         """
-        relevance = (eps_tgt - eps_src).norm(dim=1, keepdim=True) # B, 1, H, W
-        # Per-sample max-normalization: preserves absolute structure within a
-        # frame while keeping values in [0, 1]. Each frame is rescaled by its
-        # own max so values are comparable across the cache's spatial extent.
+        # Both the 2D mask and voxel-cache observations use the selected
+        # evidence. Neither TAG/STG nor cache fusion feeds this signal.
         B = relevance.shape[0]
         flat_relevance = relevance.view(B, -1)
         # Robust per-frame scale: divide by the q-quantile (q=0.95) so a single
@@ -190,6 +234,66 @@ class DC(object):
         )
 
         return mask.detach(), raw_mask
+
+    @torch.no_grad()
+    def _get_source_instruction_relevance(self, src_x0, src_encoded, current_spot):
+        """Cache source-only instruction contrast, averaged over independent noise.
+
+        Both predictions share the same noisy source latent AND source image
+        condition; only the instruction differs. A private per-view generator
+        leaves the training RNG stream unchanged. Cache scalar maps on CPU.
+        """
+        signature = (
+            self.src_prompt, self.tgt_prompt,
+            self.config.localization_source_timestep_ratio,
+            self.config.localization_source_num_samples,
+            self.config.localization_source_seed,
+        )
+        if signature != self.source_relevance_signature:
+            self.source_relevance_cache.clear()
+            if (
+                self.source_relevance_signature is not None
+                and self.config.gradient_mask_source == "source_instruction"
+            ):
+                self.gradient_mask_ema.clear()
+            self.source_relevance_signature = signature
+        expected_shape = (src_x0.shape[0], 1, *src_x0.shape[-2:])
+        cached = self.source_relevance_cache.get(current_spot)
+        if cached is not None and cached.shape == expected_shape:
+            return cached.to(device=src_x0.device)
+
+        num_train_steps = self.scheduler.config.num_train_timesteps
+        timestep = int(round(
+            self.config.localization_source_timestep_ratio * (num_train_steps - 1)
+        ))
+        t_local = torch.full((src_x0.shape[0],), timestep, device=src_x0.device, dtype=torch.long)
+        generator = torch.Generator(device=src_x0.device)
+        generator.manual_seed((self.config.localization_source_seed + int(current_spot)) % (2**63 - 1))
+        embeddings = torch.cat([self.tgt_text_feature, self.null_text_feature], dim=0)
+        # Match the conditioning layout used by the existing IP2P DDS path.
+        embeddings = torch.cat([embeddings, embeddings], dim=1)
+        image_condition = torch.cat([src_encoded, src_encoded], dim=0)
+        relevance = torch.zeros(expected_shape, device=src_x0.device, dtype=torch.float32)
+        for _ in range(self.config.localization_source_num_samples):
+            local_noise = torch.randn(
+                src_x0.shape, device=src_x0.device, dtype=src_x0.dtype, generator=generator,
+            )
+            noisy_source = self.scheduler.add_noise(src_x0, local_noise, t_local)
+            model_input = torch.cat(
+                [torch.cat([noisy_source, noisy_source], dim=0), image_condition], dim=1,
+            )
+            pred = self.unet.forward(
+                model_input,
+                torch.cat([t_local, t_local]),
+                encoder_hidden_states=embeddings,
+            ).sample
+            pred_text, pred_image = pred.chunk(2)
+            # Average magnitudes, not signed vectors that can cancel.
+            relevance += (pred_text.float() - pred_image.float()).norm(dim=1, keepdim=True)
+        # Keep localization statistics in float32 for quantile normalization.
+        relevance = relevance / self.config.localization_source_num_samples
+        self.source_relevance_cache[current_spot] = relevance.cpu()
+        return relevance
 
         
     def compute_posterior_mean(self, xt, noise_pred, t, t_prev):
@@ -328,6 +432,7 @@ class DC(object):
         base_text_embeddings_by_name = dict()
         base_latent_model_inputs = dict()
         target_cross_attention_mask = None
+        target_instruction_relevance = None
         target_cross_attention_token_indices = None
         if self.config.cross_attention_mask_enabled:
             target_cross_attention_token_indices = get_cross_attention_token_indices(
@@ -380,6 +485,10 @@ class DC(object):
 
             if name == "tgt":
                 noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
+                if self.config.gradient_mask_source == "target_instruction":
+                    target_instruction_relevance = (
+                        noise_pred_text.detach().float() - noise_pred_image.detach().float()
+                    ).norm(dim=1, keepdim=True)
                 noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_image) + \
                     self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
             else:
@@ -395,6 +504,7 @@ class DC(object):
             self.config.min_step_ratio,
             self.config.max_step_ratio,
             self.config.cross_attention_mask_weight_schedule_power,
+            min_weight=self.config.cross_attention_mask_weight_min,
         )
 
         grad_mask = None
@@ -405,10 +515,26 @@ class DC(object):
             or self.config.cross_attention_mask_enabled
         )
 
+        source_relevance = None
+        if (
+            (needs_self_mask and self.config.gradient_mask_source == "source_instruction")
+            or (
+                self.config.outside_mask_anchor_weight > 0
+                and self.config.outside_mask_anchor_mask_source == "source"
+            )
+        ):
+            source_relevance = self._get_source_instruction_relevance(src_x0, src_encoded, current_spot)
+
         self_grad_mask_raw: Optional[torch.Tensor] = None
         if needs_self_mask:
+            if self.config.gradient_mask_source == "target_instruction":
+                relevance = target_instruction_relevance
+            elif self.config.gradient_mask_source == "source_instruction":
+                relevance = source_relevance
+            else:
+                relevance = (eps_raw["tgt"] - eps_raw["src"]).norm(dim=1, keepdim=True)
             self_grad_mask, self_grad_mask_raw = self._build_gradient_relevance_mask(
-                eps_raw["tgt"], eps_raw["src"], current_spot
+                relevance, current_spot
             )
             grad_mask = self_grad_mask
 
@@ -479,9 +605,8 @@ class DC(object):
                 # where the 3D consensus exceeds the 2D mask; it never
                 # subtracts. The addition is modulated by the warmup blend and
                 # the per-pixel cache confidence (both folded into
-                # blend_tensor) and by the semantic gate max(M_attn, M_self),
-                # so the cache cannot push edits into regions the 2D masks do
-                # not recognize.
+                # blend_tensor) and by max(M_attn, M_self). Optionally require
+                # additional CA support: agreement alone is not correctness.
                 target_shape = grad_mask.shape[-2:]
 
                 def _to_target(m):
@@ -499,6 +624,7 @@ class DC(object):
                 gate_signal = compute_gate_signal(
                     target_ca=_to_target(target_cross_attention_mask),
                     sm=_to_target(self_grad_mask),
+                    ca_gate_weight=self.config.external_mask_ca_gate_weight,
                 )
                 gate = gate_signal if gate_signal is not None else 1.0
 
@@ -518,6 +644,7 @@ class DC(object):
             iteration=iteration_for_stg,
         )
 
+        stg_perturbation = None
         # Phase 2: apply guidance novelties from cached eps_raw after the clean current mask exists.
         for name in ["tgt", "src"]:
             eps_full = eps_raw[name]
@@ -559,9 +686,19 @@ class DC(object):
         if self.config.source_blend_localization_enabled and grad_mask is not None:
             eps_tgt_for_grad = apply_source_blend(eps["tgt"], eps["src"], grad_mask)
 
+        preservation_mask = grad_mask
+        if self.config.outside_mask_anchor_mask_source == "internal":
+            preservation_mask = internal_grad_mask
+        elif self.config.outside_mask_anchor_mask_source == "source" and source_relevance is not None:
+            preservation_mask = apply_mask_postprocessing(
+                normalize_relevance_map(source_relevance),
+                gamma=self.config.gradient_mask_gamma,
+                sigma=self.config.gradient_mask_blur,
+            ).detach()
+
         preserve_weight = compute_preserve_weight(
             psi=self.config.psi,
-            grad_mask=grad_mask,
+            grad_mask=preservation_mask,
             outside_mask_anchor_weight=self.config.outside_mask_anchor_weight,
             outside_mask_anchor_edit_strength_adaptive=self.config.outside_mask_anchor_edit_strength_adaptive,
             edit_strength=current_edit_strength,
@@ -609,6 +746,11 @@ class DC(object):
                 cross_attention_mask_weight_current=current_cross_attention_mask_weight,
                 tensor_to_pil_fn=tensor_to_pil,
                 resize_image_fn=resize_image,
+                internal_grad_mask=internal_grad_mask,
+                preservation_mask=preservation_mask,
+                stg_perturbation=stg_perturbation,
+                source_blend_enabled=self.config.source_blend_localization_enabled,
+                self_mask_ema_beta=self.config.gradient_mask_ema_beta,
             )
         
         if return_dict:
@@ -618,6 +760,7 @@ class DC(object):
                 "t": t,
                 "grad_mask": grad_mask,
                 "internal_grad_mask": internal_grad_mask,
+                "preservation_mask": preservation_mask,
                 "self_grad_mask": self_grad_mask,
                 "self_grad_mask_raw": self_grad_mask_raw,
                 "cross_attention_mask": target_cross_attention_mask,
