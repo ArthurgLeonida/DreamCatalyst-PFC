@@ -53,12 +53,12 @@
 #    REGION_BINARIZE_THRESHOLD  Binarize the region mask   (default: soft)
 #    REGION_ANCHOR     union|source|target: which phrase   (default: evaluate.py
 #                      the SOURCE frame is segmented for    default = union)
-#    REGION_DILATE_FRAC  Grow R by this fraction of the    (default: 0 = off)
-#                      image diagonal. Set it for the scenes whose edit grows
-#                      geometry outside the source object (fangzhou helmet,
-#                      person->stormtrooper); use INCLUDE_REGEX to give those
-#                      scenes their own pass so the value does not leak into
-#                      scenes that do not need it.
+#    REGION_DILATE_FRAC  Grow R by this fraction of the    (default: evaluate.py
+#                      image diagonal. Unset = the global    default = 0.05)
+#                      standard, applied to every scene and method. Set it only
+#                      for a sensitivity pass over ALL runs (e.g. 0.03, or 0 to
+#                      reproduce the undilated numbers), written to its own
+#                      OUT_ROOT. Never set it per scene with INCLUDE_REGEX.
 #    DISABLE_REGION_METRICS=1   Old metrics only           (default: 0)
 #    REGION_METRICS_ARGS  Extra raw args for the new metrics
 #    LOG_WANDB=1       Push metrics into the WandB run     (default: 0)

@@ -114,10 +114,11 @@ tell a real edit from reconstruction noise that happened to point the right
 way, and CLIP_direction_local is a cosine, so it does not shrink when the
 change does.
 
---region-anchor and --region-dilate-frac must be fixed per SCENE and shared by
-every method on it. Sharing the mask folder enforces that mechanically. The
-part that code cannot enforce is choosing them from the source frames before
-looking at any metric, which is the honest way to use them.
+--region-anchor and --region-dilate-frac are fixed GLOBALLY: one value for every
+scene and every method (the dilation default, DEFAULT_REGION_DILATE_FRACTION,
+is the project standard). Sharing the mask folder enforces "same R for every
+method" mechanically. The part that code cannot enforce is never moving either
+value after looking at a method comparison, which is the honest way to use them.
 
 Usage:
   python scripts/evaluate.py eval \
@@ -140,8 +141,11 @@ Usage:
   # Reproduce the pre-region metric set exactly:
   python scripts/evaluate.py eval ... --no-localized-metrics
 
-  # Edits that grow geometry outside the source object (fangzhou helmet,
-  # stormtrooper armor) need headroom, or the new geometry counts as leakage:
+  # R is dilated by the global standard (0.05 of the image diagonal) by
+  # default, so geometry an edit grows outside the source object (fangzhou
+  # helmet, elf ears, stormtrooper armor) is not scored as leakage. Override it
+  # only for a sensitivity check of the whole comparison, never per scene;
+  # 0 reproduces the undilated numbers:
   python scripts/evaluate.py eval ... --region-dilate-frac 0.03
 """
 
@@ -227,8 +231,8 @@ def compute_lpips(img1_tensor, img2_tensor, lpips_model):
 #  CLIP_direction (global) is still reported: the claim is that the pair
 #  (local, bg) EXPLAINS the global number, not that the global one is wrong.
 #
-#  WHICH ANCHOR EACH SCENE NEEDS (--region-anchor, --region-dilate-frac)
-#  ---------------------------------------------------------------------
+#  WHICH ANCHOR EACH SCENE NEEDS, AND WHY R IS DILATED EVERYWHERE
+#  --------------------------------------------------------------
 #  Every target prompt in this project is an INSTRUCTION naming something that
 #  does not exist in the source yet, so segmenting the source for the target
 #  phrase asks for something provably absent. The default anchor is therefore
@@ -239,15 +243,20 @@ def compute_lpips(img1_tensor, img2_tensor, lpips_model):
 #                                                                  target phrase
 #                                                                  may partly fire
 #                                                                  (both are bears)
-#    face -> Tolkien elf          "face"           "tolkien elf"   source anchor
-#    face -> Einstein             "face"           "einstein"      source anchor
+#    face -> Tolkien elf          "face"           "tolkien elf"   source anchor;
+#                                                                  grown: ears and
+#                                                                  hair fall
+#                                                                  outside a face
+#                                                                  mask
+#    face -> Einstein             "face"           "einstein"      source anchor;
+#                                                                  grown: hair
 #    person -> clown              "person"         "clown"         source anchor
-#    person -> stormtrooper       "person"         "stormtrooper"  source anchor +
-#                                                                  dilation: armor
-#                                                                  grows past the
+#    person -> stormtrooper       "person"         "stormtrooper"  source anchor;
+#                                                                  grown: armor
+#                                                                  past the
 #                                                                  silhouette
-#    fangzhou -> knight helmet    "face"           "knight helmet" source anchor +
-#                                                                  dilation: the
+#    fangzhou -> knight helmet    "face"           "knight helmet" source anchor;
+#                                                                  grown: the
 #                                                                  helmet sits
 #                                                                  ABOVE the head,
 #                                                                  outside any
@@ -261,10 +270,14 @@ def compute_lpips(img1_tensor, img2_tensor, lpips_model):
 #                                                                  why this edit is
 #                                                                  the easy case
 #
-#  Read that table as: without dilation, fangzhou and stormtrooper will report
-#  worse localization than they deserve, for EVERY method equally. That is a
-#  conservative bias, not a favourable one, but it should be disclosed rather
-#  than left for a reviewer to find.
+#  Every row marked "grown" would be scored as leakage without dilation, for
+#  EVERY method equally. That is a property of the scene class, not of one
+#  scene (the face scenes share the "face" anchor), so R is dilated by ONE
+#  global value, DEFAULT_REGION_DILATE_FRACTION, on every scene and method,
+#  including the rows that grow nothing. The price is that the added ring also
+#  absorbs leakage near the subject, which can favour methods that leak there.
+#  Check that method rankings hold at 0, 0.03 and the default before reporting,
+#  and disclose the setting rather than leave it for a reviewer to find.
 
 DEFAULT_CLIPSEG_MODEL = "CIDAS/clipseg-rd64-refined"
 REGION_PHRASE_MODES = ("diff_anchored", "diff", "head_noun", "target_prompt")
@@ -290,6 +303,13 @@ REGION_MIN_PROB_SCALE = 0.25
 # producing the degenerate numbers described above.
 REGION_DEGENERATE_MIN_COVERAGE = 0.002
 REGION_DEGENERATE_MAX_COVERAGE = 0.98
+# Project-wide dilation of R, as a fraction of the image diagonal. ONE value for
+# every scene and every method: the face scenes' "face" anchor excludes hair,
+# ears and the top of the head, and armor grows past a person's silhouette, so
+# without it legitimately grown geometry is scored as leakage. 0.05 is what the
+# fangzhou helmet needed. Change it only to test the whole comparison's
+# sensitivity, never per scene.
+DEFAULT_REGION_DILATE_FRACTION = 0.05
 # Stopwords used when the training-time helper cannot be imported. Kept in sync
 # with DEFAULT_CROSS_ATTENTION_STOPWORDS in nerfstudio/dc/localization_utils.py,
 # plus the instruction verbs and the possessive fragment that the word regex
@@ -736,7 +756,7 @@ def build_region_masks(
     norm_quantile=0.95,
     binarize_threshold=None,
     min_prob_scale=REGION_MIN_PROB_SCALE,
-    dilate_fraction=0.0,
+    dilate_fraction=DEFAULT_REGION_DILATE_FRACTION,
     feather_fraction=0.0,
     clipseg_model=DEFAULT_CLIPSEG_MODEL,
 ):
@@ -793,7 +813,10 @@ def build_region_masks(
             flag
             for flag, was_set in (
                 ("--region-binarize-threshold", binarize_threshold is not None),
-                ("--region-dilate-frac", float(dilate_fraction) > 0.0),
+                # Compared with the default, like the probability floor below:
+                # the standard dilation is always "set", and a folder produced
+                # by another run of the same protocol is already dilated.
+                ("--region-dilate-frac", float(dilate_fraction) != DEFAULT_REGION_DILATE_FRACTION),
                 ("--region-feather-frac", float(feather_fraction) > 0.0),
                 ("--region-min-prob-scale", float(min_prob_scale) != REGION_MIN_PROB_SCALE),
             )
@@ -1826,7 +1849,7 @@ def evaluate_experiment(
     region_norm_quantile=0.95,
     region_binarize_threshold=None,
     region_min_prob_scale=REGION_MIN_PROB_SCALE,
-    region_dilate_fraction=0.0,
+    region_dilate_fraction=DEFAULT_REGION_DILATE_FRACTION,
     region_feather_fraction=0.0,
     clipseg_model=DEFAULT_CLIPSEG_MODEL,
 ):
@@ -2342,14 +2365,15 @@ def main():
     eval_parser.add_argument(
         "--region-dilate-frac",
         type=float,
-        default=0.0,
+        default=DEFAULT_REGION_DILATE_FRACTION,
         help="Grow the region outward by this fraction of the image diagonal "
-             "(default 0 = off). Needed when the edit GROWS geometry outside "
-             "the source object, e.g. a knight's helmet above the head or "
-             "stormtrooper armor past the person's silhouette; without it that "
-             "legitimate new geometry is scored as background leakage. Around "
-             "0.02-0.03 is a reasonable starting point. Use the SAME value for "
-             "every method compared on a scene.",
+             f"(default {DEFAULT_REGION_DILATE_FRACTION}, the project-wide "
+             "standard applied to every scene and every method). Without it, "
+             "geometry an edit GROWS outside the source object (a knight's "
+             "helmet above the head, elf ears outside a face mask, armor past a "
+             "person's silhouette) is scored as background leakage. Change it "
+             "only to test the sensitivity of the whole comparison, never per "
+             "scene; 0 reproduces the undilated numbers.",
     )
     eval_parser.add_argument(
         "--region-feather-frac",
