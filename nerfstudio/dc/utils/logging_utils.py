@@ -59,6 +59,7 @@ def log_dc_debug_to_wandb(
     stg_perturbation: Optional[torch.Tensor] = None,
     source_blend_enabled: bool = False,
     self_mask_ema_beta: Optional[float] = None,
+    ca_veto_floor_addition: Optional[torch.Tensor] = None,
 ):
     """Log the most useful DC debugging images and scalars to WandB."""
     import wandb
@@ -132,6 +133,16 @@ def log_dc_debug_to_wandb(
         log_payload["dc_debug/cache_addition_mean"] = addition.detach().float().mean().item()
         log_payload["dc_debug/cache_addition"] = make_wandb_image(
             addition, tensor_to_pil_fn, resize_image_fn, caption,
+        )
+    if ca_veto_floor_addition is not None:
+        # Support the CA veto floor gave back: where the floored internal mask
+        # exceeds the plain self/CA hybrid. Should light up the hands, not the
+        # background; a broad halo here means the floor reopens too much.
+        log_payload["dc_debug/ca_veto_floor_addition_mean"] = (
+            ca_veto_floor_addition.detach().float().mean().item()
+        )
+        log_payload["dc_debug/ca_veto_floor_addition"] = make_wandb_image(
+            ca_veto_floor_addition, tensor_to_pil_fn, resize_image_fn, caption,
         )
     if cross_attention_mask_weight_current is not None:
         log_payload["dc_debug/cross_attention_mask_weight_current"] = float(

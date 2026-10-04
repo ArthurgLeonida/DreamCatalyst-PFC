@@ -78,6 +78,8 @@ DC_CUSTOM_PARAMS = dict(
     cross_attention_mask_gamma=1.2,
     cross_attention_mask_weight_schedule_power=0.75,
     cross_attention_mask_weight_min=0.0,  # early CA floor; 1 = full CA throughout
+    cross_attention_mask_veto_floor=0.0,  # >0: CA cannot veto below kappa * floor mask; 0 = off
+    cross_attention_mask_veto_floor_mask="agreement",  # agreement = min(self, source) | source
 
     latent_mean_anchor_weight=0.005,
 

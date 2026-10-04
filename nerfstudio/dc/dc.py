@@ -106,6 +106,13 @@ class DCConfig:
     cross_attention_mask_gamma: float = 1.2
     cross_attention_mask_weight_schedule_power: float = 0.75
     cross_attention_mask_weight_min: float = 0.0
+    # CA only subtracts, so it can veto parts of the requested edit that the
+    # target tokens do not attend to (a stormtrooper's hands). Floor the
+    # internal mask at kappa * F: F = min(self-mask, source-instruction mask)
+    # for "agreement" (no veto where both instruction masks agree), or the
+    # source-instruction mask itself for "source". 0 = off (previous behavior).
+    cross_attention_mask_veto_floor: float = 0.0
+    cross_attention_mask_veto_floor_mask: Literal["agreement", "source"] = "agreement"
 
     latent_mean_anchor_weight: float = 0.005
 
@@ -119,6 +126,8 @@ class DCConfig:
             raise ValueError("Unknown gradient_mask_source")
         if self.outside_mask_anchor_mask_source not in ("final", "internal", "source"):
             raise ValueError("Unknown outside_mask_anchor_mask_source")
+        if self.cross_attention_mask_veto_floor_mask not in ("agreement", "source"):
+            raise ValueError("Unknown cross_attention_mask_veto_floor_mask")
         if (
             not math.isfinite(self.gradient_mask_ema_memory_visits)
             or self.gradient_mask_ema_memory_visits <= 0
@@ -130,7 +139,11 @@ class DCConfig:
             raise ValueError("localization_source_num_samples must be at least 1")
         if self.localization_source_seed < 0:
             raise ValueError("localization_source_seed must be nonnegative")
-        for name in ("cross_attention_mask_weight_min", "external_mask_ca_gate_weight"):
+        for name in (
+            "cross_attention_mask_weight_min",
+            "external_mask_ca_gate_weight",
+            "cross_attention_mask_veto_floor",
+        ):
             if not 0.0 <= getattr(self, name) <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1]")
         if self.external_mask_ca_gate_weight > 0 and not self.cross_attention_mask_enabled:
@@ -522,8 +535,19 @@ class DC(object):
                 self.config.outside_mask_anchor_weight > 0
                 and self.config.outside_mask_anchor_mask_source == "source"
             )
+            or self.config.cross_attention_mask_veto_floor > 0
         ):
             source_relevance = self._get_source_instruction_relevance(src_x0, src_encoded, current_spot)
+
+        # Source-instruction support, post-processed exactly like the self-mask.
+        # Shared by the "source" preservation mask and the CA veto floor.
+        source_support_mask = None
+        if source_relevance is not None:
+            source_support_mask = apply_mask_postprocessing(
+                normalize_relevance_map(source_relevance),
+                gamma=self.config.gradient_mask_gamma,
+                sigma=self.config.gradient_mask_blur,
+            ).detach()
 
         self_grad_mask_raw: Optional[torch.Tensor] = None
         if needs_self_mask:
@@ -554,6 +578,39 @@ class DC(object):
                 self_mask = grad_mask
                 grad_mask = self_mask * ((1.0 - weight) + weight * target_cross_attention_mask)
             grad_mask = grad_mask.clamp(0.0, 1.0)
+
+        # CA veto floor: attention may tighten the mask, but not below
+        # kappa * floor_support. "agreement" only reopens where the self-mask
+        # and the source mask both mark the requested edit (a CA false
+        # negative); regions only one of them marks stay under CA's veto.
+        # Without a CA mask, "agreement" is a no-op (min(S, S_src) <= S) and
+        # "source" reduces to a plain union with the source mask.
+        ca_veto_floor_addition = None
+        if (
+            grad_mask is not None
+            and source_support_mask is not None
+            and self.config.cross_attention_mask_veto_floor > 0
+        ):
+            floor_support = None
+            if self.config.cross_attention_mask_veto_floor_mask == "source":
+                floor_support = source_support_mask
+            elif self_grad_mask is not None:
+                floor_support = torch.minimum(self_grad_mask, source_support_mask)
+            if floor_support is not None:
+                if floor_support.shape[-2:] != grad_mask.shape[-2:]:
+                    floor_support = F.interpolate(
+                        floor_support,
+                        size=grad_mask.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                floor_support = floor_support.to(device=grad_mask.device, dtype=grad_mask.dtype)
+                floored = torch.maximum(
+                    grad_mask,
+                    self.config.cross_attention_mask_veto_floor * floor_support,
+                ).clamp(0.0, 1.0)
+                ca_veto_floor_addition = (floored - grad_mask).clamp_min(0.0).detach()
+                grad_mask = floored
 
         internal_grad_mask = grad_mask.detach().clone() if grad_mask is not None else None
 
@@ -689,12 +746,8 @@ class DC(object):
         preservation_mask = grad_mask
         if self.config.outside_mask_anchor_mask_source == "internal":
             preservation_mask = internal_grad_mask
-        elif self.config.outside_mask_anchor_mask_source == "source" and source_relevance is not None:
-            preservation_mask = apply_mask_postprocessing(
-                normalize_relevance_map(source_relevance),
-                gamma=self.config.gradient_mask_gamma,
-                sigma=self.config.gradient_mask_blur,
-            ).detach()
+        elif self.config.outside_mask_anchor_mask_source == "source" and source_support_mask is not None:
+            preservation_mask = source_support_mask
 
         preserve_weight = compute_preserve_weight(
             psi=self.config.psi,
@@ -751,6 +804,7 @@ class DC(object):
                 stg_perturbation=stg_perturbation,
                 source_blend_enabled=self.config.source_blend_localization_enabled,
                 self_mask_ema_beta=self.config.gradient_mask_ema_beta,
+                ca_veto_floor_addition=ca_veto_floor_addition,
             )
         
         if return_dict:

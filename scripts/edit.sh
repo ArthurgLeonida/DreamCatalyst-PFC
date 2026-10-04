@@ -94,7 +94,11 @@ else:
     print(f" Self EMA:  manual beta={dc['gradient_mask_ema_beta']}")
 print(f" Anchor:    {dc.get('outside_mask_anchor_mask_source', 'final')} mask")
 print(f" Cache CA:  {dc.get('external_mask_ca_gate_weight', 0.0)}")
-if dc.get('gradient_mask_source') == 'source_instruction' or dc.get('outside_mask_anchor_mask_source') == 'source':
+if (
+    dc.get('gradient_mask_source') == 'source_instruction'
+    or dc.get('outside_mask_anchor_mask_source') == 'source'
+    or dc.get('cross_attention_mask_veto_floor', 0.0) > 0
+):
     print(
         f" Source mask: t_ratio={dc['localization_source_timestep_ratio']}, "
         f"samples={dc['localization_source_num_samples']}, seed={dc['localization_source_seed']}"
@@ -106,10 +110,18 @@ if ca_enabled:
     arrow = "\u2192"
     print(f"   {branch} gamma:      {dc['cross_attention_mask_gamma']}")
     print(
-        f"   {last} schedule:   "
+        f"   {branch} schedule:   "
         f"reverse_tag {dc.get('cross_attention_mask_weight_min', 0.0)}{arrow}1 "
         f"(power={dc['cross_attention_mask_weight_schedule_power']})"
     )
+    veto_floor = dc.get('cross_attention_mask_veto_floor', 0.0)
+    if veto_floor > 0:
+        print(
+            f"   {last} veto floor: {veto_floor} "
+            f"({dc.get('cross_attention_mask_veto_floor_mask', 'agreement')})"
+        )
+    else:
+        print(f"   {last} veto floor: off")
 print(f" Voxel 3D:  {enabled}")
 if enabled:
     branch = "\u251c\u2500"

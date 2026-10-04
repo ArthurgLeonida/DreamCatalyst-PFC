@@ -284,6 +284,8 @@ histories if investigating their effect.
 | `cross_attention_mask_weight_min` | `0.0` | `0.25` |
 | `external_mask_ca_gate_weight` | `0.0` | `1.0` |
 | `outside_mask_anchor_mask_source` | `"final"` | `"internal"`; optionally `"source"` later |
+| `cross_attention_mask_veto_floor` | `0.0` | `1.0` with full early CA (section 6) |
+| `cross_attention_mask_veto_floor_mask` | `"agreement"` | keep `"agreement"`; `"source"` is the fallback |
 
 ### 1. Measure self-mask EMA memory in updates of one camera
 
@@ -414,6 +416,43 @@ separate, stronger hypothesis and can resist desired structural changes. The
 adaptive scalar `(1-s)` still evolves in both modes; only spatial support is
 decoupled. With zero outside-anchor weight these options have no gradient effect.
 
+### 6. Stop CA from vetoing the requested edit
+
+Added 2026-10-04 for the working IEEE configuration
+(`docs/configs/method_config_3d_ieee.py`: `target_instruction` self-mask,
+`"source"` preservation mask, `cross_attention_mask_weight_min=1`). Full CA from
+the first step improved preservation, but the stormtrooper hands stayed a
+skin-colored remnant: the hybrid `S*((1-w)+w*A)` can only subtract, and the
+target tokens barely attend to hands, so CA vetoed part of the requested edit.
+A CA floor of 0.5 gave a better hand but leaks half the self-mask everywhere.
+
+The floor is applied after the hybrid and before cache fusion:
+
+```text
+M_internal = max(S*((1-w) + w*A), kappa * F)
+F = min(S, S_src)   ("agreement")    or    F = S_src   ("source")
+```
+
+`S_src` is the source-instruction mask with the same normalization, gamma and
+blur as the self-mask (the map the `"source"` preservation mask already uses;
+the floor triggers its computation when needed). `kappa=0` is the previous
+behavior.
+
+- `"agreement"` lifts the veto only where the self-mask and the source mask
+  both mark the region, i.e. a CA false negative. Regions only one of them marks
+  (target-only drift, the source halo without current demand) stay under CA's
+  veto, so early CA keeps its preservation effect there. The floored mask never
+  exceeds `S`: it can undo CA's veto, never create new support.
+- `"source"` lifts the veto over the whole source support. Use it only if the
+  late `self_mask` also shows just the small hand, since then `min(S, S_src)` is
+  small at the hand periphery. It also reopens the source halo.
+
+First run: stormtrooper with `kappa=1`, `"agreement"`, everything else as in the
+run it is compared against, plus clown as a check. If the source and target
+masks both mark the clown arms, this floor reopens them as well; that is IP2P's
+own reading of the instruction, not something a mask rule can separate from
+the stormtrooper's gloves.
+
 ## Diagnostics
 
 New WandB fields under `dc_debug/`:
@@ -423,6 +462,9 @@ New WandB fields under `dc_debug/`:
   where editing is allowed and where preservation is relaxed.
 - `cache_addition`, `cache_addition_mean`: actual nonnegative addition to the
   internal mask, after confidence, validity, and the configured gate.
+- `ca_veto_floor_addition`, `ca_veto_floor_addition_mean`: support the CA veto
+  floor gave back over the plain self/CA hybrid (section 6). It should light up
+  the hands; a broad halo means the floor reopens too much.
 - `stg_effective_delta_norm`, `tag_only_effective_delta_norm`,
   `stg_to_tag_only_dds_ratio`: compare the STG residual with the TAG-only DDS
   delta, applying the same source-blend mask to both when enabled. STG-off steps
