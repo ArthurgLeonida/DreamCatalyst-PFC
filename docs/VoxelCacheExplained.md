@@ -205,13 +205,13 @@ result and pull edge values toward "uncertain"; weighting by observation keeps
 unobserved corners from bleeding in.
 
 This smooths the readback **without** changing grid resolution, so observation
-density — and the variance/angular statistics — is untouched. **Only the returned
-mean value is interpolated.** The count (`unique_view_count`), variance, angular
-factor, and `observed`/valid signals are all read at the nearest voxel, so those
-gates behave identically to a nearest read. The one exception is the mass gate
-(§14), which is derived from the returned value itself and therefore tracks the
-trilinear read. Trilinear changes *what magnitude* the cache feeds back (and how
-the mass gate reads it), not whether the count/variance/angular gates trust it.
+density (and with it the variance/angular statistics) is untouched. The count
+(`unique_view_count`), angular factor and `observed`/valid signals are read at
+the nearest voxel. Two signals follow the trilinear support instead: the mass
+gate (§14), which is derived from the returned value itself, and the cross-view
+variance, which is read with its own eligibility-weighted trilinear estimator so
+the agreement gate is continuous across voxel boundaries like the value it gates
+(see the variance-read note in §16).
 
 ### Numerical example
 
@@ -327,8 +327,11 @@ Where:
   **`mask_voxel_cache_max_blend`** across **`warmup_start` → `warmup_end`**. It
   lets the cache phase in gradually as evidence accumulates.
 - `C̃(q)` is the per-voxel confidence (§9, §11, §14).
-- `G` is the semantic gate, fixed to `max(M_attn, M_self)` — the cross-attention
-  mask and the self-mask, whichever is stronger. This is what keeps the cache
+- `G` is the semantic gate, fixed to `max(M_attn, M_self) · M_attn`. The cache
+  may only add where the current view confirms the region, and the
+  cross-attention mask must be part of that confirmation: the self-mask alone
+  cannot authorize an addition, because the cache is built from the self-mask
+  itself. Without an attention map the gate is zero. This is what keeps the cache
   from pushing edits into regions the 2D masks don't recognize.
 
 **Why positive-only?** During development a *subtractive* branch (letting
@@ -469,8 +472,10 @@ whose two views split hard (0.2 then 0.9): after just those two views it reads
 
 ### Decayed (exponentially-weighted) variance
 
-> **Knob: `mask_voxel_cache_variance_decay`** = the EW weight `α` below (`0.0` =
-> cumulative Welford; the adopted config uses `0.2`).
+> **Knob: `mask_voxel_cache_variance_decay`** = the EW weight `α` below, in
+> `(0, 1)`; the adopted config uses `0.2`. This is the estimator the code runs:
+> the cumulative Welford branch above (`α = 0`) was removed on 2026-10-13 and is
+> kept in this section only as the baseline the EW version is explained against.
 
 Cumulative Welford weights every distinct view equally over the *entire* run. But
 the edit is **non-stationary**: the scene changes as training proceeds. A voxel
@@ -524,9 +529,10 @@ Where:
 - `n(q)` is the unique-view count.
 - `n_min` is camera-count-aware: `n_min = clamp(ceil(N_cameras · frac), floor, cap)`
   with `frac = observation_fraction` (0.10), `floor = 5`, `cap = 12`.
-- `σ²(q)` is the running variance (Welford or EW, §8).
+- `σ²(q)` is the exponentially weighted cross-view variance (§8), read
+  trilinearly over eligible corners (§16).
 - `σ²_max` = `mask_voxel_cache_max_variance`, above which a voxel is fully
-  untrusted (scene-tuned; the examples below use 0.04).
+  untrusted (one global 0.02 in every run; the examples below use 0.04).
 
 `C(q)` multiplies into the fusion (§6). Two more multiplicative factors — angular
 diversity (§11) and mass (§14) — extend this to the full `C̃(q)` shown in §15.
@@ -568,8 +574,13 @@ Bypass percentile normalization for the cache input. Use the raw edit magnitude,
 scaled per frame:
 
 ```
-raw_self = ||ε_tgt − ε_src|| / scale_per_frame
+raw_self = R / scale_per_frame
+R = ||ε(render, I_src, instruction) − ε(render, I_src, "")||
 ```
+
+`R` is the target-instruction contrast that also builds the self-mask `S` (the
+reported thesis runs used the raw DDS delta `||ε_tgt − ε_src||`; the final
+configuration replaced it, see `dc.py`).
 
 Per-frame scaling preserves within-frame absolute structure (foreground stays
 high, background stays low) while keeping values in `[0, 1]`. After this the
@@ -817,9 +828,9 @@ where:
             then scale-matched to [0,1]                               (§7)
     p_pixel = ray_origin + depth · ray_direction                      (§3)
     α(t)  = warmup ramp from 0 to max_blend                           (§6)
-    G     = semantic gate, max(M_attn, M_self)                        (§6)
+    G     = semantic gate, max(M_attn, M_self) · M_attn               (§6)
     C̃(q) = 1[n(q) ≥ n_min]                                           (§9)
-            · max(0, 1 − σ²(q)/σ²_max)      (σ²: Welford OR EW, §8)    (§9)
+            · max(0, 1 − σ²(q)/σ²_max)      (σ²: EW, trilinear read)   (§8, §16)
             · min(1, (1 − R(q)) / Ā_frozen)                           (§11–§13)
             · min(1, m(q) / m_threshold)                              (§14)
     Ā_frozen = peak of the trusted-population mean angular factor,
@@ -844,7 +855,7 @@ open while sweeping.
 | `mask_voxel_cache_max_blend` | ceiling of `α(t)` | stronger cache pull overall | 6 |
 | `mask_voxel_cache_warmup_start` / `_end` | ramp window of `α(t)` | later / slower phase-in | 6 |
 | `mask_voxel_cache_scale_normalize_quantile` | `q` in the `M_3D` re-ranging stretch | larger `q` = gentler stretch | 7 |
-| `mask_voxel_cache_variance_decay` | `σ²` estimator (`α` EW weight; `0.0` = Welford) | forgets stale edit-drift; flattens variance climb | 8 |
+| `mask_voxel_cache_variance_decay` | `α`, the EW weight of the newest view, in `(0, 1)` | forgets stale edit-drift; flattens variance climb | 8 |
 | `mask_voxel_cache_max_variance` | `σ²_max` (variance gate) | looser gate, more voxels pass | 9 |
 | `mask_voxel_cache_observation_fraction` / `_min_observations_floor` / `_min_observations_cap` | `n_min` (count gate) | needs more views before a voxel counts | 9 |
 | `gradient_mask_raw_norm_quantile` *(in `DCConfig`)* | per-frame scale of `raw_self` (the cache input) | robust divisor; less spurious variance | 10 |
@@ -852,10 +863,11 @@ open while sweeping.
 | `mask_voxel_cache_mass_threshold` | `m_threshold` (mass gate) | higher = damp more low-edit-signal voxels | 14 |
 
 **Fixed behaviors (not knobs).** These are hardcoded on, so don't look for a flag:
-observed-weighted trilinear read (§4), scale-matching (§7), positive-only fusion
-(§6), the semantic gate `G = max(M_attn, M_self)` (§6), camera-count-auto β (§5)
-and `n_min` (§9), scene-relative angular normalization (§11–§12), and the
-observed bbox (§3).
+observed-weighted trilinear read (§4), the trilinear variance read (§16),
+the exponentially weighted variance (§8), scale-matching (§7), positive-only
+fusion (§6), the semantic gate `G = max(M_attn, M_self) · M_attn` (§6),
+camera-count-auto β (§5) and `n_min` (§9), scene-relative angular normalization
+(§11–§12), and the observed bbox (§3).
 
 ### Per-voxel state
 
@@ -863,17 +875,11 @@ observed bbox (§3).
 grid[q]               # EMA mean (running average) — β auto: 1 − 1/(c·N_cam)
 observed[q]           # bool: has this voxel ever been observed
 unique_view_count[q]  # n(q): number of distinct views
-running_mean[q]       # μ (Welford or EW mean)
-running_m2[q]         # Welford: M2 → σ² = M2/(n−1);  EW: holds σ² directly
+running_mean[q]       # μ, the EW mean across views
+running_m2[q]         # σ², the EW variance itself (not a sum of squares)
 view_observed[q, v]   # bool: which views have observed each voxel
 view_dir_sum[q]       # Σ d̂_v for the angular resultant R(q)
 ```
-
-`geom_view_count[q]` / `view_observed_geom[q, v]` also exist but are
-**diagnostic only** — they count every ray that intersected a voxel (ignoring the
-evidence gate) so you can measure per scene how much the value gate restricts the
-trusted population. The confidence gate uses the evidence-gated
-`unique_view_count`.
 
 ---
 
@@ -891,9 +897,9 @@ is active whenever the cache is enabled; this is the quick status map.
 | EMA aggregation (camera-count-auto β) | 5 | core |
 | Positive-only fusion with the 2D mask | 6 | core; cache adds edit force, never subtracts |
 | Scale-matching the cache value | 7 | core; makes `M_3D` comparable to the sharp 2D mask |
-| Cross-view variance (Welford **or** EW/decayed) | 8 | EW on (`variance_decay = 0.2`); recency-weighted |
+| Cross-view variance (exponentially weighted) | 8 | `variance_decay = 0.2`; recency-weighted |
 | Confidence gate (count + variance) | 9 | core; `max_variance` is one **global** 0.02 |
-| Variance readback (nearest **or** trilinear) | 9 | `cv_trilinear = False` (nearest) in all reported results |
+| Variance readback (trilinear over eligible corners) | 9 | always on since 2026-10-13; the reported thesis results used the nearest voxel |
 | Raw-self input + robust per-frame scale | 10 | core; reduces spurious variance |
 | Angular-diversity factor (linear, scene-relative) | 11–12 | core |
 | Auto-freeze of the angular denominator | 13 | core; keeps the gate consistent across training |
@@ -917,18 +923,18 @@ is active whenever the cache is enabled; this is the quick status map.
 > collapses and the map can no longer separate it. Any change applies to every
 > scene at once.
 
-> **`cv_trilinear` (default `False`) — how the gate reads that variance.**
-> The cached *mean* is read with observed-weighted trilinear interpolation (§4),
-> but the trust signals — counts, variance, angular factor, mass — are read at
-> the nearest voxel. So a query point near a voxel face gets a value blended
-> from both sides while being gated by whichever centre is nearest, making the
-> confidence field piecewise-constant at grid resolution. Since confidence
-> multiplies fusion strength, those steps reach the gradient.
+> **How the gate reads the variance (trilinear, always on).**
+> The cached *mean* is read with observed-weighted trilinear interpolation (§4).
+> If the variance were read at the nearest voxel (as in the reported thesis
+> runs), a query point near a voxel face would get a value blended from both
+> sides while being gated by whichever centre is nearest, making the confidence
+> field piecewise-constant at grid resolution. Since confidence multiplies
+> fusion strength, those steps would reach the gradient.
 >
-> Setting `mask_voxel_cache_cv_trilinear = True` reads the cross-view variance
-> with the same 8-corner interpolation, so the gate ramps across a boundary
-> instead of stepping. Two details make it a *trust* read rather than a copy of
-> the value read:
+> The code therefore reads the cross-view variance with the same 8-corner
+> interpolation (`_trilinear_variance_read`), so the gate ramps across a
+> boundary instead of stepping. Two details make it a *trust* read rather than
+> a copy of the value read:
 > 1. A corner only contributes if it has **at least two unique views**. A voxel
 >    with `count <= 1` stores `σ² = 0` because its dispersion is *undefined*,
 >    not because its views agree; averaging that zero in would raise the

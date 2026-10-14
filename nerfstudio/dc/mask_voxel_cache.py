@@ -1,104 +1,63 @@
-"""3D voxel-grid cache for cross-view mask aggregation.
+"""World-space voxel cache that shares the edit mask across views (Part 2).
 
-Stage-1 prototype of the "lift the mask into 3D" idea. Per-view diffusion
-masks are projected into a coarse voxel grid via the rendered depth, EMA-
-aggregated across views, and queried back per-view to provide a
-3D-consistent localization signal to the DDS gradient.
+Each iteration the pipeline backprojects the current view's edit-magnitude
+mask (``raw_self``) to 3D with the rendered depth and calls ``update``; later
+views read the accumulated value back with ``query``. Per voxel the cache keeps:
 
-References (where each piece comes from):
-    - Volume rendering equation (the depth-along-ray semantics that lets
-      us backproject pixel + depth → 3D point):
-      Mildenhall et al., "NeRF: Representing Scenes as Neural Radiance
-      Fields for View Synthesis," ECCV 2020. Eq. 1–3.
-    - Pinhole-camera depth-backprojection: standard Hartley & Zisserman
-      "Multiple View Geometry" pinhole model.
-    - Lifting per-view 2D signals into a 3D scene-level field for cross-
-      view aggregation: Semantic NeRF (Zhi et al., ICCV 2021, §3.2 — the
-      "3D-consistent semantics from 2D supervision" argument). The voxel
-      cache is the non-parametric / cache-based variant of this idea.
-    - Per-frame label accumulation into a 3D scene field via running
-      averages: Panoptic Lifting (Siddiqui et al., CVPR 2023, §3.1).
-    - Closest direct precedent for diffusion-derived mask aggregation
-      into a 3D representation: RoMaP (Kim et al., SNU 2025), which
-      attaches per-Gaussian mask attributes for masked SDS editing in
-      3DGS. The voxel-grid form here is the NeRF-friendly cousin.
+    grid                EMA mean of the mask: the value read back
+    observed            whether any view has written the voxel
+    unique_view_count   number of distinct views that observed it (n)
+    view_observed       which views did, so revisiting a camera is not a new sample
+    running_mean/_m2    exponentially weighted mean and variance across those views
+    view_dir_sum        sum of their unit viewing directions
+
+``query`` returns the value and a confidence in [0, 1], the product of four
+linear gates: enough views (count), agreement across views (variance), spread
+of viewing directions (angular), and edit mass (the value itself).
+
+Background: lifting per-view 2D signals into a 3D field follows Semantic NeRF
+(Zhi et al., ICCV 2021) and Panoptic Lifting (Siddiqui et al., CVPR 2023); this
+is a non-parametric grid variant. Full walkthrough: docs/VoxelCacheExplained.md.
 """
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, Union
+from typing import Iterator, Optional, Tuple
 
 import torch
 
 
 class MaskVoxelCache:
-    """Coarse 3D voxel grid storing EMA-aggregated mask values.
-
-    Stage-1 prototype: no learned MLP, no gradient flow through the cache.
-    Mask values come from per-view diffusion-derived masks, are scattered
-    into the grid via depth backprojection, and read back into image space
-    via the same backprojection on subsequent views. By construction, two
-    views observing the same 3D point read the same cached mask value, so
-    the rendered mask is cross-view-consistent up to voxel-grid
-    discretization.
-    """
+    """Coarse voxel grid of cross-view mask statistics (no learned parameters)."""
 
     def __init__(
         self,
         bbox_min: torch.Tensor,
         bbox_max: torch.Tensor,
-        resolution: int = 128,
-        ema_beta: float = 0.9,
+        resolution: int,
+        ema_beta: float,
+        num_views: int,
+        variance_decay: float,
         fallback_value: float = 0.5,
-        num_views: Optional[int] = None,
-        variance_decay: float = 0.0,
-        cv_trilinear: bool = False,
         device: Optional[torch.device] = None,
     ) -> None:
         """
         Args:
-            bbox_min, bbox_max: [3] world-space scene bounding box.
-                Read from `dataparser_outputs.scene_box.aabb`.
-            resolution: per-axis grid resolution. 128 → 128**3 ≈ 2M voxels,
-                ~8MB at fp32. Coarser = cheaper but blurrier across-views.
-            ema_beta: EMA decay applied to existing voxel values. Higher
-                values mean slower change. Standard value 0.9 (matches the
-                running-average pattern used in Panoptic Lifting §3.1).
-            fallback_value: returned for voxels never observed. 0.5 is
-                "uncertain"; safer than 0.0 (would over-suppress edits in
-                unseen regions) or 1.0 (would over-edit them).
-            variance_decay: 0.0 (default) = cumulative Welford cross-view
-                variance (every distinct view that ever observed a voxel is
-                weighted equally). A value in (0, 1) switches to an
-                exponentially-weighted variance (Finch 2009, "Incremental
-                calculation of weighted mean and variance"), where it is the
-                weight on the newest view's sample and (1 − value) the
-                retention of past evidence. Because views first-observe a
-                voxel in training-time order, exponential weighting down-
-                weights stale early-training (immature-edit) observations, so
-                the variance tracks *current* cross-view disagreement instead
-                of accumulating the edit's evolution over training as fake
-                inconsistency. Effective memory ≈ 1/value views (0.2 ≈ last 5).
-                Note: the EW estimator is biased low by ≈ (1 − value), so its
-                absolute scale differs from the cumulative one — re-read
-                `query_variance_mean` and re-tune `max_variance` after enabling.
-            cv_trilinear: False (default) = the agreement gate reads the
-                cross-view variance at the nearest voxel, which is what all
-                reported results use. True = read it with the eligibility-
-                weighted trilinear estimator of `_trilinear_variance_read`,
-                matching the interpolation already applied to the mean value
-                so the confidence field stops being piecewise-constant at grid
-                resolution. The scene-wide mean is preserved (the read is a
-                weighted average of the same grid), so `query_variance_mean`
-                and `max_variance` stay on the same scale. What changes is
-                local: a contested voxel adjacent to an agreed one is pulled
-                toward it, so the gate opens up to roughly half a voxel past
-                each boundary. `max_variance` is one global value shared by
-                every scene and edit, so re-check it against the scene most
-                prone to over-editing (clown, arms) before trusting a run:
-                any change there changes every other scene too.
-            device: torch device. Defaults to current CUDA device.
+            bbox_min, bbox_max: [3] world-space corners of the box the grid spans.
+            resolution: voxels per axis V; the grid holds V**3 cells.
+            ema_beta: decay of the grid mean; every touch keeps ema_beta of the old value.
+            num_views: number of training cameras (view ids are in [0, num_views)).
+            variance_decay: weight of the newest view in the exponentially weighted
+                cross-view mean and variance, in (0, 1); memory of about 1/variance_decay
+                views. Down-weights early views, whose edit was still immature.
+            fallback_value: value returned where nothing has been observed.
+            device: torch device for all state.
         """
+        if not 0.0 < float(variance_decay) < 1.0:
+            raise ValueError("variance_decay must be in (0, 1)")
+        if int(num_views) <= 0:
+            raise ValueError("num_views must be positive")
+
         self.device = device if device is not None else torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
@@ -106,175 +65,59 @@ class MaskVoxelCache:
         self.bbox_max = bbox_max.to(self.device).float()
         self.resolution = int(resolution)
         self.ema_beta = float(ema_beta)
+        self.variance_decay = float(variance_decay)
+        self.num_views = int(num_views)
         self.fallback_value = float(fallback_value)
-        # 0.0 = cumulative Welford variance; (0,1) = exponentially-weighted
-        # variance with this as the new-sample weight. See __init__ docstring.
-        self.variance_decay = min(max(float(variance_decay), 0.0), 0.999)
-        # False = agreement gate reads variance at the nearest voxel (all
-        # reported results); True = eligibility-weighted trilinear read.
-        # See __init__ docstring.
-        self.cv_trilinear = bool(cv_trilinear)
-        self.num_views = int(num_views) if num_views is not None and int(num_views) > 0 else None
 
         V = self.resolution
-        n_voxels = V * V * V
-        # Grid of mask values, initialized to the fallback. Shape [V, V, V].
-        self.grid = torch.full(
-            (V, V, V),
-            fill_value=self.fallback_value,
-            device=self.device,
-            dtype=torch.float32,
-        )
-        # Tracks which voxels have been observed at least once.
-        self.observed = torch.zeros(
-            (V, V, V),
-            dtype=torch.bool,
-            device=self.device,
-        )
-        # Per-voxel cross-view consistency statistics. Each update contributes
-        # one per-view mean mask value per touched voxel. Welford statistics
-        # let us estimate disagreement between different views that hit the
-        # same 3D location without storing a history.
-        self.update_count = torch.zeros(
-            (V, V, V),
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self.unique_view_count = torch.zeros(
-            (V, V, V),
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self.view_observed = (
-            torch.zeros(
-                (n_voxels, self.num_views),
-                dtype=torch.bool,
-                device=self.device,
-            )
-            if self.num_views is not None
-            else None
-        )
-        # Geometry twin of `view_observed`, kept for diagnostics only (never
-        # used in gate math). The split dates from a since-removed update
-        # evidence gate that made "camera saw the voxel" differ from "camera
-        # produced mask evidence" (diagnosed on stormtrooper helmet voxels
-        # early in training).
-        self.view_observed_geom = (
-            torch.zeros(
-                (n_voxels, self.num_views),
-                dtype=torch.bool,
-                device=self.device,
-            )
-            if self.num_views is not None
-            else None
-        )
-        # Geometric-only unique-view count (counts every in-bounds
-        # observation, regardless of value threshold). Used as the
-        # denominator for the angular resultant length so that
-        # ‖view_dir_sum‖ / geom_view_count reflects pure triangulation.
-        self.geom_view_count = torch.zeros(
-            (V, V, V),
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self.running_mean = torch.zeros(
-            (V, V, V),
-            device=self.device,
-            dtype=torch.float32,
-        )
-        self.running_m2 = torch.zeros(
-            (V, V, V),
-            device=self.device,
-            dtype=torch.float32,
-        )
-        # Sum of unit ray directions over all observations for each voxel.
-        # `‖view_dir_sum / unique_view_count‖` is the resultant length of a
-        # set of unit vectors; it tends to 1 when all observations come from
-        # parallel rays (no angular diversity) and to 0 when observations are
-        # spherically distributed (maximal diversity). This is the standard
-        # circular-statistics resultant-length measure (Fisher, 1953, "Dispersion
-        # on a sphere"). We use 1 − resultant_length as the per-voxel angular
-        # coverage factor in `query`, which down-weights confidence on voxels
-        # observed only from a narrow cone of viewpoints (the elf failure
-        # mode: many cameras, but clustered — low variance with no real
-        # correspondence information).
-        self.view_dir_sum = torch.zeros(
-            (V, V, V, 3),
-            device=self.device,
-            dtype=torch.float32,
-        )
-        # Frozen denominator for scene-relative angular normalization.
-        # Set externally by `freeze_angular_denominator(min_views)` once the
-        # trusted population has stabilized (typically near the peak of the
-        # trusted angular factor, before edge voxels reaching min_views
-        # dilute it). After freezing, `query` uses this value instead of
-        # recomputing the mean each call. Diagnosed empirically: without
-        # freezing, the per-iteration mean keeps drifting downward as late-
-        # arriving edge voxels with low diversity reach `min_observations`,
-        # eventually clamping ~every voxel's normalized factor to 1.0 and
-        # making the gate a no-op.
+        shape = (V, V, V)
+        self.grid = torch.full(shape, self.fallback_value, device=self.device, dtype=torch.float32)
+        self.observed = torch.zeros(shape, dtype=torch.bool, device=self.device)
+        self.unique_view_count = torch.zeros(shape, dtype=torch.int32, device=self.device)
+        self.view_observed = torch.zeros((V ** 3, self.num_views), dtype=torch.bool, device=self.device)
+        self.running_mean = torch.zeros(shape, dtype=torch.float32, device=self.device)
+        # Holds the exponentially weighted variance itself (not a sum of squares).
+        self.running_m2 = torch.zeros(shape, dtype=torch.float32, device=self.device)
+        self.view_dir_sum = torch.zeros((*shape, 3), dtype=torch.float32, device=self.device)
+
+        # Scene-relative angular normalization: the denominator is frozen at the
+        # peak of the trusted population's mean angular factor
+        # (try_auto_freeze_angular_denominator), so the same voxel is judged the
+        # same way for the rest of training.
         self._frozen_angular_denominator: Optional[float] = None
-        # Peak-tracking state for the auto-freeze heuristic.
-        #   `_angular_peak_value`: highest mean_angular_factor_trusted seen.
-        #   `_angular_peak_step`: edit-step at which that peak was reached.
-        # Used by `try_auto_freeze_angular_denominator` to detect when the
-        # trusted curve has stopped improving and snapshot the peak value
-        # before drift sets in. Scene-adaptive: each scene's peak is
-        # determined by its own observation geometry, not a hardcoded step.
         self._angular_peak_value: float = 0.0
         self._angular_peak_step: int = -1
 
     # -----------------------------------------------------------------
-    # Spatial coordinate conversion
+    # Grid indexing
     # -----------------------------------------------------------------
 
     def _world_to_voxel(self, points_world: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Map world-space points to voxel indices.
+        """Nearest-voxel indices of world points.
 
-        Uses the standard normalized-grid mapping
-            idx = floor((x - bbox_min) / (bbox_max - bbox_min) * V).
-        Out-of-bounds points are clamped to the grid surface.
-
-        Returns:
-            idx: [..., 3] long tensor of voxel indices in [0, V).
-            in_bounds: [...] bool tensor flagging which points fell inside
-                the bounding box before clamping. Useful for ignoring
-                far-away rays (sky / infinite depth).
+        idx = floor((x - bbox_min) / (bbox_max - bbox_min) * V), clamped to the
+        grid. Also returns which points were inside the box before clamping.
         """
-        normalized = (points_world - self.bbox_min) / (
-            self.bbox_max - self.bbox_min
-        ).clamp_min(1e-8)
+        normalized = (points_world - self.bbox_min) / (self.bbox_max - self.bbox_min).clamp_min(1e-8)
         in_bounds = ((normalized >= 0.0) & (normalized < 1.0)).all(dim=-1)
         idx = (normalized * self.resolution).long().clamp_(0, self.resolution - 1)
         return idx, in_bounds
 
-    def _trilinear_observed_read(self, flat_points: torch.Tensor) -> torch.Tensor:
-        """Observed-weighted trilinear read of the grid mean value.
+    def _trilinear_corners(
+        self, flat_points: torch.Tensor
+    ) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Yield (ix, iy, iz, weight) for the 8 voxel centers around each point.
 
-        Standard trilinear interpolation over the 8 voxel centers surrounding
-        each point, but every corner is weighted by whether that voxel has been
-        observed — so unobserved (fallback) voxels never bleed into the result.
-        Where no surrounding voxel is observed, returns ``fallback_value``.
-
-        Args:
-            flat_points: [N, 3] world-space points.
-
-        Returns:
-            [N] interpolated mean values.
+        Voxel centers sit at (index + 0.5) / V in normalized coordinates; points
+        beyond the outermost centers are clamped to them.
         """
         V = self.resolution
-        normalized = (flat_points - self.bbox_min) / (
-            self.bbox_max - self.bbox_min
-        ).clamp_min(1e-8)
-
+        normalized = (flat_points - self.bbox_min) / (self.bbox_max - self.bbox_min).clamp_min(1e-8)
         c = (normalized * V - 0.5).clamp(0.0, float(V - 1))
-        i0 = c.floor().long().clamp_(0, V - 1)      # [N, 3]
-        i1 = (i0 + 1).clamp_(0, V - 1)              # [N, 3]
-        frac = (c - i0.float()).clamp(0.0, 1.0)     # [N, 3]
+        i0 = c.floor().long().clamp_(0, V - 1)
+        i1 = (i0 + 1).clamp_(0, V - 1)
+        frac = (c - i0.float()).clamp(0.0, 1.0)
 
-        num = torch.zeros(flat_points.shape[0], device=self.device, dtype=torch.float32)
-        den = torch.zeros_like(num)
-        # Accumulate the 8 cube corners.
         for cx in (0, 1):
             wx = frac[:, 0] if cx else (1.0 - frac[:, 0])
             gx = i1[:, 0] if cx else i0[:, 0]
@@ -284,11 +127,21 @@ class MaskVoxelCache:
                 for cz in (0, 1):
                     wz = frac[:, 2] if cz else (1.0 - frac[:, 2])
                     gz = i1[:, 2] if cz else i0[:, 2]
-                    w = wx * wy * wz                 # [N] trilinear weight
-                    obs = self.observed[gx, gy, gz].float()
-                    val = self.grid[gx, gy, gz]
-                    num = num + w * obs * val
-                    den = den + w * obs
+                    yield gx, gy, gz, wx * wy * wz
+
+    def _trilinear_observed_read(self, flat_points: torch.Tensor) -> torch.Tensor:
+        """Trilinear read of the grid mean, counting only observed corners.
+
+        Unobserved corners hold the fallback value; weighting them out keeps it
+        from bleeding into the result. Points with no observed corner read the
+        fallback.
+        """
+        num = torch.zeros(flat_points.shape[0], device=self.device, dtype=torch.float32)
+        den = torch.zeros_like(num)
+        for gx, gy, gz, w in self._trilinear_corners(flat_points):
+            obs = self.observed[gx, gy, gz].float()
+            num = num + w * obs * self.grid[gx, gy, gz]
+            den = den + w * obs
         return torch.where(
             den > 1e-6,
             num / den.clamp_min(1e-6),
@@ -298,483 +151,196 @@ class MaskVoxelCache:
     def _trilinear_variance_read(
         self, flat_points: torch.Tensor, nearest_variance: torch.Tensor
     ) -> torch.Tensor:
-        """Smoothed trilinear read of the cross-view variance (``cv_trilinear``).
+        """Trilinear read of the cross-view variance, so the agreement gate is
+        continuous across voxel boundaries like the value it gates.
 
-        The mean value is already read over the 8 surrounding voxel centers,
-        so a query point near a voxel face receives a value blended from both
-        sides while the agreement gate judges it by whichever center happens
-        to be nearest. That makes the confidence field piecewise-constant at
-        grid resolution, and since confidence multiplies the fusion strength,
-        those steps reach the gradient. This read removes that asymmetry.
-
-        It differs from `_trilinear_observed_read` in two ways that matter for
-        a *trust* signal rather than a value:
-
-        1. **A corner only contributes if it has at least two unique views.**
-           A voxel with `count <= 1` stores variance 0 because its dispersion
-           is *undefined*, not because its views agree. Averaging that 0 into
-           a neighbour would lower the neighbour's variance and so raise its
-           confidence, which is backwards: single-view voxels carry no
-           cross-view evidence at all. Weighting by `observed` alone (what the
-           value read does) would introduce exactly that bias.
-
-        2. **Only the within-voxel term is used, deliberately.** A textbook
-           pooled variance would add the between-corner spread of the means,
-           `sum_i w_i * (mu_i - mu_bar)^2`. That is correct when the corners
-           are sub-samples of one population, but here they are eight
-           *different spatial locations*, so the between term measures the
-           spatial gradient of the mask field rather than cross-view
-           disagreement, and it is not on the scale `max_variance` is
-           calibrated against. The magnitudes are not close: mask means live
-           in [0, 1] while cross-view variance runs 0.005-0.03, so two
-           neighbours at mu = 0.85 and 0.35 contribute a between term of
-           0.0625, over 3x the global `max_variance` of 0.02. Including it
-           would clamp confidence to zero at every mask boundary, which is
-           where the cache is most needed. Within-only keeps the estimate on
-           the scale the threshold already uses.
-
-        Points with no eligible corner fall back to `nearest_variance`, so the
-        gate never becomes *more* permissive than the nearest-voxel default
-        just because the neighbourhood is poorly observed.
-
-        Args:
-            flat_points: [N, 3] world-space points.
-            nearest_variance: [N] nearest-voxel variance, used as fallback.
-
-        Returns:
-            [N] smoothed cross-view variance.
+        Unlike the value read: a corner contributes only with at least two
+        views (with one view the variance is undefined, not zero), and only the
+        within-voxel variance is averaged. The spread between the corners'
+        means is a spatial gradient, not view disagreement. Points with no
+        eligible corner keep the nearest-voxel variance.
         """
-        V = self.resolution
-        normalized = (flat_points - self.bbox_min) / (
-            self.bbox_max - self.bbox_min
-        ).clamp_min(1e-8)
-
-        c = (normalized * V - 0.5).clamp(0.0, float(V - 1))
-        i0 = c.floor().long().clamp_(0, V - 1)      # [N, 3]
-        i1 = (i0 + 1).clamp_(0, V - 1)              # [N, 3]
-        frac = (c - i0.float()).clamp(0.0, 1.0)     # [N, 3]
-
-        n_pts = flat_points.shape[0]
-        den = torch.zeros(n_pts, device=self.device, dtype=torch.float32)
+        den = torch.zeros(flat_points.shape[0], device=self.device, dtype=torch.float32)
         within = torch.zeros_like(den)
-
-        for cx in (0, 1):
-            wx = frac[:, 0] if cx else (1.0 - frac[:, 0])
-            gx = i1[:, 0] if cx else i0[:, 0]
-            for cy in (0, 1):
-                wy = frac[:, 1] if cy else (1.0 - frac[:, 1])
-                gy = i1[:, 1] if cy else i0[:, 1]
-                for cz in (0, 1):
-                    wz = frac[:, 2] if cz else (1.0 - frac[:, 2])
-                    gz = i1[:, 2] if cz else i0[:, 2]
-                    w = wx * wy * wz                 # [N] trilinear weight
-
-                    counts_c = self.unique_view_count[gx, gy, gz].float()
-                    m2_c = self.running_m2[gx, gy, gz]
-                    # Same estimator query() uses, so the smoothed value stays
-                    # on the scale max_variance is tuned against.
-                    if self.variance_decay > 0.0:
-                        var_c = m2_c
-                    else:
-                        var_c = m2_c / (counts_c - 1.0).clamp_min(1.0)
-                    # Eligibility: observed AND cross-view variance defined.
-                    elig = (
-                        self.observed[gx, gy, gz] & (counts_c > 1.0)
-                    ).float()
-
-                    w_eff = w * elig
-                    den = den + w_eff
-                    within = within + w_eff * var_c
-
+        for gx, gy, gz, w in self._trilinear_corners(flat_points):
+            counts_c = self.unique_view_count[gx, gy, gz].float()
+            eligible = (self.observed[gx, gy, gz] & (counts_c > 1.0)).float()
+            w_eff = w * eligible
+            den = den + w_eff
+            within = within + w_eff * self.running_m2[gx, gy, gz]
         smoothed = within / den.clamp_min(1e-6)
         return torch.where(den > 1e-6, smoothed, nearest_variance)
 
     # -----------------------------------------------------------------
-    # Depth-backprojection helper
-    # -----------------------------------------------------------------
-
-    @staticmethod
-    def backproject_via_rays(
-        ray_origins: torch.Tensor,
-        ray_directions: torch.Tensor,
-        depth: torch.Tensor,
-    ) -> torch.Tensor:
-        """Backproject (origin, direction, depth) → world-space 3D points.
-
-        Uses the parametric ray equation r(t) = o + t·d. This is exactly
-        the form used inside NeRF's volume rendering (Mildenhall et al.,
-        ECCV 2020, Eq. 1) and avoids any camera-convention ambiguity
-        because we consume Nerfstudio's already-world-space rays.
-
-        Args:
-            ray_origins: [H, W, 3] world-space ray origins.
-            ray_directions: [H, W, 3] world-space ray directions
-                (unit-norm or not — Nerfstudio rays are unit-norm).
-            depth: [H, W] or [H, W, 1] depth along the ray.
-
-        Returns:
-            [H, W, 3] world-space points where each ray reaches `depth`.
-        """
-        if depth.dim() == 3 and depth.shape[-1] == 1:
-            depth = depth.squeeze(-1)
-        return ray_origins + depth.unsqueeze(-1) * ray_directions
-
-    # -----------------------------------------------------------------
-    # Update — scatter per-view mask into voxels
+    # Update: write one view's mask into the grid
     # -----------------------------------------------------------------
 
     def update(
         self,
         points_world: torch.Tensor,
         mask_values: torch.Tensor,
-        in_bounds: Optional[torch.Tensor] = None,
-        view_id: Optional[int] = None,
+        in_bounds: torch.Tensor,
+        view_id: int,
+        ray_directions: torch.Tensor,
         return_per_voxel_mean: bool = False,
-        ray_directions: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
-        """EMA-update voxels at backprojected 3D positions.
+        """Write one view's mask values at their backprojected points.
 
-        Within-batch duplicates (multiple pixels falling in the same voxel
-        in this view) are averaged before the EMA step. This avoids the
-        last-write-wins indexing artifact and matches the per-frame label-
-        accumulation pattern in Panoptic Lifting (Siddiqui et al., CVPR
-        2023, §3.1).
-
-        Voxels observed for the first time take the input value directly
-        (no EMA blending against the fallback).
+        Pixels of this view are first averaged per voxel (one sample per view and
+        voxel, so dense regions do not dominate). Then:
+          - the grid mean takes an EMA step; a voxel's first touch copies the value;
+          - only on this view's FIRST observation of a voxel, the cross-view
+            statistics (count, EW mean/variance, direction sum) are updated, so
+            revisiting a camera never counts as a new, agreeing view.
 
         Args:
-            points_world: [N, 3] world-space points.
-            mask_values: [N] mask values in [0, 1].
-            in_bounds: [N] optional bool mask; if provided, points marked
-                False are skipped.
-            view_id: optional integer camera index. When provided and
-                the cache was constructed with `num_views`, the Welford
-                cross-view statistics increment only the first time
-                this view observes each voxel — preventing repeat
-                visits to the same training view from inflating the
-                effective sample size and deflating variance.
-            return_per_voxel_mean: if True, returns the per-voxel mean
-                values (one scalar per touched voxel) for histogram
-                diagnostics. Returns None otherwise.
+            points_world: [N, 3] world points; mask_values: [N] in [0, 1];
+            in_bounds: [N] validity (surface hit); view_id: camera slot;
+            ray_directions: [N, 3] viewing directions of the pixels.
+
+        Returns the per-voxel values this view wrote when ``return_per_voxel_mean``
+        (for histograms), else None.
         """
         points_world = points_world.reshape(-1, 3).to(self.device)
         mask_values = mask_values.reshape(-1).to(self.device).float().clamp(0.0, 1.0)
-        empty_return: Optional[torch.Tensor] = (
-            mask_values.new_empty(0) if return_per_voxel_mean else None
-        )
+        empty = mask_values.new_empty(0) if return_per_voxel_mean else None
         if points_world.numel() == 0:
-            return empty_return
+            return empty
 
-        idx, default_in_bounds = self._world_to_voxel(points_world)  # [N, 3], [N]
-        if in_bounds is None:
-            valid = default_in_bounds
-        else:
-            valid = in_bounds.reshape(-1).to(self.device).bool() & default_in_bounds
-        if ray_directions is not None:
-            rd_full = ray_directions.reshape(-1, 3).to(self.device).float()
-            rd_full = rd_full / rd_full.norm(dim=1, keepdim=True).clamp_min(1e-8)
-            rd_filtered = rd_full[valid]
-        else:
-            rd_filtered = None
-
+        idx, inside = self._world_to_voxel(points_world)
+        valid = in_bounds.reshape(-1).to(self.device).bool() & inside
+        directions = ray_directions.reshape(-1, 3).to(self.device).float()
+        directions = directions / directions.norm(dim=1, keepdim=True).clamp_min(1e-8)
         idx = idx[valid]
         mask_values = mask_values[valid]
+        directions = directions[valid]
         if idx.numel() == 0:
-            return empty_return
+            return empty
 
         V = self.resolution
-        flat = idx[:, 0] * V * V + idx[:, 1] * V + idx[:, 2]  # [N]
+        n_voxels = V ** 3
+        flat = idx[:, 0] * V * V + idx[:, 1] * V + idx[:, 2]
 
-        # Within-batch averaging: per-voxel mean of mask values from this view.
-        # Equivalent to scatter_reduce(reduce="mean") but using sum / count for
-        # backwards-compatibility across PyTorch versions.
-        n_voxels = V * V * V
+        # Per-voxel mean of this view's pixels, and its mean viewing direction.
         sums = torch.zeros(n_voxels, device=self.device, dtype=torch.float32)
         counts = torch.zeros(n_voxels, device=self.device, dtype=torch.float32)
         sums.index_add_(0, flat, mask_values)
         counts.index_add_(0, flat, torch.ones_like(mask_values))
+        dir_sums = torch.zeros(n_voxels, 3, device=self.device, dtype=torch.float32)
+        dir_sums.index_add_(0, flat, directions)
+        view_dirs = dir_sums / dir_sums.norm(dim=1, keepdim=True).clamp_min(1e-8)
 
-        # Per-voxel mean ray direction from this view. Aggregate the unit
-        # ray directions of all pixels mapping to each voxel and renormalize.
-        # The result represents "the direction this view observed this voxel
-        # from"; the running sum across views drives the angular-diversity
-        # factor in `query`.
-        per_voxel_view_dir: Optional[torch.Tensor] = None
-        if rd_filtered is not None:
-            dir_sums = torch.zeros(n_voxels, 3, device=self.device, dtype=torch.float32)
-            dir_sums.index_add_(0, flat, rd_filtered)
-            dir_norms = dir_sums.norm(dim=1, keepdim=True).clamp_min(1e-8)
-            per_voxel_view_dir = dir_sums / dir_norms  # [n_voxels, 3] unit vectors
+        touched_idx = (counts > 0).nonzero(as_tuple=True)[0]
+        if touched_idx.numel() == 0:
+            return empty
+        touched_values = sums[touched_idx] / counts[touched_idx]
+        snapshot = touched_values.detach().clone() if return_per_voxel_mean else None
 
-        touched = counts > 0  # [n_voxels]
-        if not touched.any():
-            return empty_return
-        per_voxel_mean = torch.zeros_like(sums)
-        per_voxel_mean[touched] = sums[touched] / counts[touched]
-        # Snapshot for diagnostics: per-voxel mean values from this view.
-        mean_snapshot = (
-            per_voxel_mean[touched].detach().clone()
-            if return_per_voxel_mean
-            else None
-        )
+        # Cross-view statistics: only voxels this view has never observed before.
+        vid = int(view_id)
+        if not 0 <= vid < self.num_views:
+            raise ValueError(f"view_id {vid} is outside [0, {self.num_views})")
+        is_new_view = ~self.view_observed[touched_idx, vid]
+        if is_new_view.any():
+            new_idx = touched_idx[is_new_view]
+            self.view_observed[new_idx, vid] = True
+            self._update_cross_view_statistics(new_idx, touched_values[is_new_view], view_dirs[new_idx])
 
-        # Diagnostic-only geometry counters, NOT used by the gate math (kept
-        # on the instance for analysis/logging). The `view_dir_sum`
-        # accumulation happens later, in the evidence block — see the note in
-        # `query()` about why coupling the angular factor to the evidence
-        # population is load-bearing.
-        if (
-            per_voxel_view_dir is not None
-            and self.view_observed_geom is not None
-            and view_id is not None
-        ):
-            vid_geom = int(view_id)
-            if 0 <= vid_geom < self.num_views:
-                touched_geom_idx = touched.nonzero(as_tuple=True)[0]
-                is_new_geom_view = ~self.view_observed_geom[touched_geom_idx, vid_geom]
-                if is_new_geom_view.any():
-                    geom_idx_diag = touched_geom_idx[is_new_geom_view]
-                    self.view_observed_geom[geom_idx_diag, vid_geom] = True
-                    flat_geom_count_diag = self.geom_view_count.view(-1)
-                    flat_geom_count_diag[geom_idx_diag] += 1
-
-        # EMA blend into existing grid for already-observed voxels;
-        # direct copy for first-time-observed voxels.
+        # Grid mean: an EMA step on every touch, revisits included.
         flat_grid = self.grid.view(-1)
         flat_observed = self.observed.view(-1)
-        flat_update_count = self.update_count.view(-1)
-        flat_unique_view_count = self.unique_view_count.view(-1)
-        flat_running_mean = self.running_mean.view(-1)
-        flat_running_m2 = self.running_m2.view(-1)
-
-        touched_idx = touched.nonzero(as_tuple=True)[0]
-        touched_values = per_voxel_mean[touched_idx]
-        flat_update_count[touched_idx] += 1
-
-        stats_idx = touched_idx
-        stats_values = touched_values
-        if self.view_observed is not None:
-            if view_id is None:
-                raise ValueError(
-                    "view_id is required when the cache was constructed with "
-                    "num_views (per-view unique-observation tracking is on). "
-                    "Pass the camera index, or rebuild the cache with "
-                    "num_views=None to disable per-view tracking."
-                )
-            vid = int(view_id)
-            if 0 <= vid < self.num_views:
-                is_new_view = ~self.view_observed[touched_idx, vid]
-                if is_new_view.any():
-                    stats_idx = touched_idx[is_new_view]
-                    stats_values = touched_values[is_new_view]
-                    self.view_observed[stats_idx, vid] = True
-                    flat_unique_view_count[stats_idx] += 1
-                else:
-                    stats_idx = touched_idx[:0]
-                    stats_values = touched_values[:0]
-        else:
-            flat_unique_view_count[touched_idx] += 1
-
-        # Cross-view correspondence statistics: every time a view maps to a
-        # voxel, compare its per-view mean against previous observations of
-        # that same voxel. Low variance means the same 3D location receives
-        # consistent mask evidence across views; high variance means this voxel
-        # is unreliable for suppressing or amplifying the 2D mask.
-        if stats_idx.numel() > 0:
-            old_count = (flat_unique_view_count[stats_idx].float() - 1.0).clamp_min(0.0)
-            old_mean = flat_running_mean[stats_idx]
-            delta = stats_values - old_mean
-            if self.variance_decay > 0.0:
-                # Exponentially-weighted mean + variance (Finch 2009). Here
-                # `flat_running_m2` stores the EW VARIANCE directly (not the
-                # sum of squared deviations). The first view for a voxel
-                # (old_count == 0) seeds mean = value, variance = 0; every
-                # later view blends with weight `alpha` on the newest sample,
-                # so stale early-training observations decay out.
-                alpha = self.variance_decay
-                first = old_count == 0.0
-                ew_incr = alpha * delta
-                # Mean: first obs takes the value directly (old_mean is 0),
-                # else EW blend toward the newest sample.
-                new_mean = old_mean + torch.where(first, delta, ew_incr)
-                new_var = torch.where(
-                    first,
-                    torch.zeros_like(old_mean),
-                    (1.0 - alpha) * (flat_running_m2[stats_idx] + delta * ew_incr),
-                )
-                flat_running_mean[stats_idx] = new_mean
-                flat_running_m2[stats_idx] = new_var
-            else:
-                # Cumulative Welford: every distinct view weighted equally.
-                new_count = old_count + 1.0
-                new_mean = old_mean + delta / new_count
-                delta2 = stats_values - new_mean
-                flat_running_mean[stats_idx] = new_mean
-                flat_running_m2[stats_idx] = flat_running_m2[stats_idx] + delta * delta2
-
-        # Angular-diversity update: accumulate this view's per-voxel mean
-        # direction into the running view-direction sum. Same gating as
-        # the Welford stats above (new evidence-gated view only) — the
-        # angular factor in `query` divides ‖view_dir_sum‖ by the
-        # evidence-gated `unique_view_count`, so both must be updated on
-        # the same population (a geometry-only variant caused stormtrooper
-        # hand artifacts; see the note in `query`).
-        if per_voxel_view_dir is not None and stats_idx.numel() > 0:
-            flat_view_dir_sum = self.view_dir_sum.view(-1, 3)
-            flat_view_dir_sum[stats_idx] = (
-                flat_view_dir_sum[stats_idx] + per_voxel_view_dir[stats_idx]
+        seen_before = flat_observed[touched_idx]
+        old_idx = touched_idx[seen_before]
+        first_idx = touched_idx[~seen_before]
+        if old_idx.numel() > 0:
+            flat_grid[old_idx] = (
+                self.ema_beta * flat_grid[old_idx]
+                + (1.0 - self.ema_beta) * touched_values[seen_before]
             )
+        if first_idx.numel() > 0:
+            # First observation: copy instead of blending with the fallback.
+            flat_grid[first_idx] = touched_values[~seen_before]
+            flat_observed[first_idx] = True
 
-        existing_and_touched = touched & flat_observed
-        first_time = touched & (~flat_observed)
+        return snapshot
 
-        if existing_and_touched.any():
-            beta = self.ema_beta
-            flat_grid[existing_and_touched] = (
-                beta * flat_grid[existing_and_touched]
-                + (1.0 - beta) * per_voxel_mean[existing_and_touched]
-            )
-        if first_time.any():
-            flat_grid[first_time] = per_voxel_mean[first_time]
-            flat_observed[first_time] = True
+    def _update_cross_view_statistics(
+        self, voxel_idx: torch.Tensor, values: torch.Tensor, view_dirs: torch.Tensor
+    ) -> None:
+        """Add one new view's sample to the count, EW mean/variance and direction sum.
 
-        return mean_snapshot if return_per_voxel_mean else None
+        Exponentially weighted mean and variance (Finch 2009) with new-sample
+        weight alpha = variance_decay; a voxel's first view seeds mean = value and
+        variance = 0.
+        """
+        flat_count = self.unique_view_count.view(-1)
+        flat_mean = self.running_mean.view(-1)
+        flat_var = self.running_m2.view(-1)
+        flat_dirs = self.view_dir_sum.view(-1, 3)
+
+        flat_count[voxel_idx] += 1
+        first = flat_count[voxel_idx] == 1
+        alpha = self.variance_decay
+        old_mean = flat_mean[voxel_idx]
+        delta = values - old_mean
+        ew_incr = alpha * delta
+        flat_mean[voxel_idx] = old_mean + torch.where(first, delta, ew_incr)
+        flat_var[voxel_idx] = torch.where(
+            first,
+            torch.zeros_like(old_mean),
+            (1.0 - alpha) * (flat_var[voxel_idx] + delta * ew_incr),
+        )
+        flat_dirs[voxel_idx] = flat_dirs[voxel_idx] + view_dirs
 
     # -----------------------------------------------------------------
-    # Query — read voxels back at backprojected 3D positions
+    # Query: read the cache back at a view's points
     # -----------------------------------------------------------------
 
     def query(
         self,
         points_world: torch.Tensor,
-        in_bounds: Optional[torch.Tensor] = None,
-        return_valid: bool = False,
-        return_stats: bool = False,
-        min_observations: int = 1,
-        max_variance: Optional[float] = None,
-        mass_threshold: float = 0.0,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
-        """Look up mask values at world-space positions.
+        in_bounds: torch.Tensor,
+        min_observations: int,
+        max_variance: float,
+        mass_threshold: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Read the cache at world points.
 
-        The stored mean is read via observed-weighted trilinear interpolation
-        over the 8 surrounding voxel centers: this smooths the value the cache
-        feeds back (removing blocky discretization artifacts where one voxel
-        straddles two surfaces) without raising the grid resolution. The trust
-        signals (counts, variance, angular factor, observed/valid, mass) are
-        read at the nearest voxel, so gating semantics are unaffected by the
-        interpolation. The one exception is `cv_trilinear=True`, which reads
-        the cross-view variance with the eligibility-weighted trilinear estimator of
-        `_trilinear_variance_read` so that the agreement gate is continuous
-        across voxel boundaries like the value it gates.
+        Returns (values, valid, confidence, counts, variance), each shaped like
+        ``points_world[..., 0]``:
+            values      observed-weighted trilinear mean; fallback where invalid
+            valid       nearest voxel observed and the point inside the box
+            confidence  valid * count gate * variance gate * angular gate * mass gate
+            counts      unique views of the nearest voxel
+            variance    cross-view variance (trilinear over eligible corners)
 
-        Returns `fallback_value` for voxels never observed. Out-of-bounds
-        points (if `in_bounds` is provided) are also returned as fallback.
-        If `return_valid=True`, also returns a bool tensor indicating which
-        lookups came from observed, in-bounds voxels.
-        If `return_stats=True`, also returns a confidence map, observation
-        counts, and cross-view variance estimates. Confidence is zero until a
-        voxel has at least `min_observations`; if `max_variance` is provided,
-        it then decays linearly to zero as variance approaches that threshold.
-
-        The angular-diversity factor `1 − ‖mean_view_dir‖` multiplies into the
-        confidence directly (linearly). It is scene-relative: each voxel's
-        value is divided by the scene-wide mean angular factor (frozen at its
-        peak, see `try_auto_freeze_angular_denominator`) and clamped to
-        [0, 1], so the gate works across capture geometries — a
-        horizontal-arc capture (clown, mean ~0.05) and a forward-facing
-        capture (elf, ~0.01) both look "almost zero" in absolute terms;
-        normalized, each voxel is judged against its own scene's typical
-        diversity.
-
-        `mass_threshold` controls the mass gate
-        `C_mass = min(1, m(q) / mass_threshold)`. Voxels whose cached mean
-        value is below `mass_threshold` get damped — they represent regions
-        the diffusion model isn't actively editing, and letting the cache
-        contribute there produces visible artifacts on extremity regions and
-        blurs high-frequency detail. With `mass_threshold = 0` the gate is
-        off.
+        Gates (all linear, in [0, 1]):
+            count     1 if counts >= min_observations else 0
+            variance  1 - variance / max_variance
+            angular   (1 - |mean viewing direction|) relative to the scene's frozen mean
+            mass      value / mass_threshold (the model barely edits here)
         """
         original_shape = points_world.shape[:-1]
         flat_points = points_world.reshape(-1, 3).to(self.device)
-        idx, default_in_bounds = self._world_to_voxel(flat_points)
-        if in_bounds is None:
-            in_bounds = default_in_bounds
-        else:
-            in_bounds = in_bounds.reshape(-1).to(self.device) & default_in_bounds
-
+        idx, inside = self._world_to_voxel(flat_points)
+        in_bounds = in_bounds.reshape(-1).to(self.device) & inside
         ix, iy, iz = idx[:, 0], idx[:, 1], idx[:, 2]
-        # Observed-weighted trilinear read of the mean value; the trust
-        # statistics below are read at the nearest voxel.
+
         values = self._trilinear_observed_read(flat_points)
         observed = self.observed[ix, iy, iz]
         counts = self.unique_view_count[ix, iy, iz].float()
         m2 = self.running_m2[ix, iy, iz]
-        if self.variance_decay > 0.0:
-            # running_m2 already holds the EW variance; single-view voxels read 0.
-            variance = torch.where(counts > 1.0, m2, torch.zeros_like(m2))
-        else:
-            variance = torch.where(
-                counts > 1.0,
-                m2 / (counts - 1.0).clamp_min(1.0),
-                torch.zeros_like(m2),
-            )
-        if self.cv_trilinear:
-            # Match the interpolation already applied to the mean value, so a
-            # point blended from 8 voxels is not gated by just one of them.
-            variance = self._trilinear_variance_read(flat_points, variance)
+        # Variance is undefined (stored as 0) below two views.
+        nearest_variance = torch.where(counts > 1.0, m2, torch.zeros_like(m2))
+        variance = self._trilinear_variance_read(flat_points, nearest_variance)
 
-        # Replace unobserved or out-of-bounds with fallback.
         valid = observed & in_bounds
-        min_observations = max(int(min_observations), 1)
-        enough_views = counts >= float(min_observations)
-        if max_variance is not None and float(max_variance) > 0.0:
+        enough_views = counts >= float(max(int(min_observations), 1))
+        if float(max_variance) > 0.0:
             var_confidence = (1.0 - variance / float(max_variance)).clamp(0.0, 1.0)
         else:
             var_confidence = torch.ones_like(values)
-
-        # Angular-diversity factor. The resultant length of the per-voxel
-        # sum of unit view-directions, divided by the count, lies in [0, 1].
-        # 1 means "all observations came from parallel rays" — the cache has
-        # no real correspondence evidence and should be down-trusted.
-        # 0 means "observations spread uniformly on the sphere" — maximal
-        # information from triangulation. (1 − resultant) is the diversity.
-        dir_sum = self.view_dir_sum[ix, iy, iz]  # [N, 3]
-        # Denominator is the evidence-gated unique view count, not the
-        # geometry-only count: the pure-geometric variant let voxels
-        # with no edit activity (stormtrooper hand, crotch) receive the
-        # full cache contribution, producing artifacts. The evidence
-        # gating couples "is this voxel being edited" into the factor;
-        # the mass gate below is the explicit version of that coupling.
-        safe_counts = counts.clamp_min(1.0)
-        resultant_len = (dir_sum.norm(dim=-1) / safe_counts).clamp(0.0, 1.0)
-        angular_factor = (1.0 - resultant_len).clamp(0.0, 1.0)
-
-        # Scene-relative normalization: divide by the scene mean over
-        # trusted-population voxels, so the factor reads "better/worse
-        # triangulated than average for this scene." Without it, a clown
-        # voxel at 0.06 looks as untrustworthy as an elf voxel at 0.01
-        # even when it sits at the top of its scene's distribution. The
-        # mean is restricted to voxels with ≥ `min_observations` views —
-        # including all 2-view voxels would let nearly-parallel edge
-        # observations collapse the denominator toward 0.
-        if self._frozen_angular_denominator is not None:
-            scene_mean = float(self._frozen_angular_denominator)
-        else:
-            scene_mean = float(
-                self.mean_angular_factor_at(min_views=min_observations)
-            )
-        if scene_mean > 1e-6:
-            angular_factor = (angular_factor / scene_mean).clamp(0.0, 1.0)
-
-        angular_confidence = angular_factor
-
-        # Mass gate C_mass = min(1, m(q)/threshold): damp confidence
-        # where the cached mean is low. Distinct from variance (cross-view
-        # agreement) and the angular factor (triangulation): mass measures
-        # "is the model committing edit signal here at all." Muting the
-        # cache in low-mass regions avoids artifacts on extremities
-        # (stormtrooper hand) and blurred high-frequency detail (elf eyes).
+        angular_confidence = self._angular_confidence(ix, iy, iz, counts, min_observations)
         if float(mass_threshold) > 1e-6:
             mass_confidence = (values / float(mass_threshold)).clamp(0.0, 1.0)
         else:
@@ -787,98 +353,68 @@ class MaskVoxelCache:
             * angular_confidence
             * mass_confidence
         )
-
-        values = torch.where(
-            valid, values, torch.full_like(values, self.fallback_value)
+        values = torch.where(valid, values, torch.full_like(values, self.fallback_value))
+        return (
+            values.view(*original_shape),
+            valid.view(*original_shape),
+            confidence.view(*original_shape),
+            counts.view(*original_shape),
+            variance.view(*original_shape),
         )
-        values = values.view(*original_shape)
-        confidence = confidence.view(*original_shape)
-        counts = counts.view(*original_shape)
-        variance = variance.view(*original_shape)
-        if return_valid:
-            valid = valid.view(*original_shape)
-            if return_stats:
-                return values, valid, confidence, counts, variance
-            return values, valid
-        if return_stats:
-            return values, confidence, counts, variance
-        return values
 
-    # -----------------------------------------------------------------
-    # Diagnostics
-    # -----------------------------------------------------------------
+    def _angular_confidence(self, ix, iy, iz, counts, min_observations) -> torch.Tensor:
+        """Angular gate: how spread out the viewing directions of a voxel are.
 
-    @property
-    def occupancy(self) -> float:
-        """Fraction of voxels that have been observed at least once."""
-        return float(self.observed.float().mean().item())
-
-    @property
-    def mean_observation_count(self) -> float:
-        """Mean number of unique view observations over observed voxels.
-        Counts each view once per voxel. Use this for diagnostics on the
-        variance gate.
+        A = 1 - |sum of unit directions| / n: 0 when every view looked from the
+        same direction (no triangulation), toward 1 when directions spread over
+        the sphere. Divided by the scene's mean A over trusted voxels (frozen at
+        its peak), so a capture rig with little absolute spread is judged
+        against itself; clamped to [0, 1].
         """
-        observed = self.observed
-        if not observed.any():
-            return 0.0
-        return float(self.unique_view_count[observed].float().mean().item())
-
-    @property
-    def mean_geom_observation_count(self) -> float:
-        """Mean number of geometric (in-bounds) view observations over
-        observed voxels. Counts every view whose ray intersected the
-        voxel. Diagnostic companion to `mean_observation_count`.
-        """
-        observed = self.observed
-        if not observed.any():
-            return 0.0
-        return float(self.geom_view_count[observed].float().mean().item())
-
-    @property
-    def mean_observed_variance(self) -> float:
-        """Mean cross-view variance over voxels with at least two unique views."""
-        counts = self.unique_view_count.float()
-        valid = counts > 1.0
-        if not valid.any():
-            return 0.0
-        if self.variance_decay > 0.0:
-            # running_m2 already holds the EW variance per voxel.
-            variance = self.running_m2[valid]
+        resultant = (self.view_dir_sum[ix, iy, iz].norm(dim=-1) / counts.clamp_min(1.0)).clamp(0.0, 1.0)
+        angular = (1.0 - resultant).clamp(0.0, 1.0)
+        if self._frozen_angular_denominator is not None:
+            scene_mean = float(self._frozen_angular_denominator)
         else:
-            variance = self.running_m2[valid] / (counts[valid] - 1.0).clamp_min(1.0)
-        return float(variance.mean().item())
+            scene_mean = float(self.mean_angular_factor_at(min_views=min_observations))
+        if scene_mean > 1e-6:
+            angular = (angular / scene_mean).clamp(0.0, 1.0)
+        return angular
+
+    # -----------------------------------------------------------------
+    # Angular denominator freeze and diagnostics
+    # -----------------------------------------------------------------
+
+    def mean_angular_factor_at(self, min_views: int = 2) -> float:
+        """Mean angular factor (1 - resultant length) over voxels with >= min_views views.
+
+        Restricting to the trusted population (min_views = the count gate's
+        threshold) matters: averaging all two-view voxels would drag the mean
+        toward 0, because late edge voxels seen by two nearby cameras dominate.
+        """
+        min_views = max(int(min_views), 2)
+        counts = self.unique_view_count.float()
+        trusted = counts >= float(min_views)
+        if not trusted.any():
+            return 0.0
+        resultant = (self.view_dir_sum[trusted].norm(dim=-1) / counts[trusted]).clamp(0.0, 1.0)
+        return float((1.0 - resultant).mean().item())
 
     def try_auto_freeze_angular_denominator(
         self,
         edit_step: int,
         min_views: int,
-        patience: int = 500,
+        patience: int,
+        warmup_steps: int,
         min_value: float = 1e-3,
-        warmup_steps: int = 50,
     ) -> Optional[float]:
-        """Scene-adaptive auto-freeze of the angular denominator.
+        """Freeze the angular denominator at the peak of the trusted mean.
 
-        Tracks the running maximum of `mean_angular_factor_at(min_views)`
-        across calls. When the peak has not improved for `patience`
-        consecutive edit-steps, freezes the denominator at that peak.
-        Returns the frozen value if a freeze fired on this call, else None.
-
-        The patience-on-no-improvement heuristic catches the scene-specific
-        peak wherever it occurs (clown peaks ~edit-step 100; other rigs
-        later), sidestepping a hardcoded freeze step that would over- or
-        under-shoot across capture geometries.
-
-        Args:
-            edit_step: current edit-relative iteration (not global step).
-            min_views: trusted-population threshold for computing the mean.
-            patience: edit-steps of no-improvement before freezing.
-            min_value: do not freeze on values below this — protects
-                against pathological scenes where the trusted population
-                is genuinely empty for a while.
-            warmup_steps: do not start tracking until this many edit-steps
-                have elapsed. Avoids treating the cache's startup transient
-                as a "peak."
+        After ``warmup_steps`` edit steps, tracks the running maximum of
+        ``mean_angular_factor_at(min_views)``. When it has not improved for
+        ``patience`` steps, freezes it (if above ``min_value``). A new peak after
+        a freeze thaws it, and the patience check fires again on the new peak.
+        Returns the frozen value on the call that froze it, else None.
         """
         if edit_step < int(warmup_steps):
             return None
@@ -886,57 +422,17 @@ class MaskVoxelCache:
         if current > self._angular_peak_value:
             self._angular_peak_value = float(current)
             self._angular_peak_step = int(edit_step)
-            # If a prior freeze captured a premature peak and the true peak
-            # is still climbing, thaw and let the no-improvement check
-            # refire on the new peak. Idempotent under steady-state because
-            # `current > peak` is false once the peak is real.
-            if self._frozen_angular_denominator is not None:
-                self._frozen_angular_denominator = None
+            self._frozen_angular_denominator = None
             return None
         if self._frozen_angular_denominator is not None:
             return None
-        steps_since_peak = edit_step - self._angular_peak_step
         if (
-            steps_since_peak >= int(patience)
+            edit_step - self._angular_peak_step >= int(patience)
             and self._angular_peak_value > float(min_value)
         ):
             self._frozen_angular_denominator = float(self._angular_peak_value)
             return self._frozen_angular_denominator
         return None
-
-    @property
-    def angular_peak_value(self) -> float:
-        """Highest `mean_angular_factor_trusted` seen so far (diagnostic).
-
-        Useful for verifying that the auto-freeze captured the right value:
-        compare against the post-freeze constant in
-        `frozen_angular_denominator`. After freezing, this property
-        continues to read the same peak — the peak is monotone.
-        """
-        return float(self._angular_peak_value)
-
-    @property
-    def angular_peak_step(self) -> int:
-        """Edit-step at which `angular_peak_value` was reached."""
-        return int(self._angular_peak_step)
-
-    def freeze_angular_denominator(self, min_views: int) -> float:
-        """Snapshot the current scene mean angular factor and cache it for
-        all subsequent `query` calls.
-
-        Should be called once after the trusted-population voxels have
-        accumulated enough observations to be representative — typically
-        at the cache's `warmup_end` iteration. The frozen value becomes
-        the denominator $\\bar{A}$ for scene-relative normalization,
-        replacing the per-call recomputation that otherwise drifts
-        downward as late-arriving low-diversity voxels reach the
-        `min_observations` threshold.
-
-        Returns the frozen value (also stored internally).
-        """
-        snapshot = self.mean_angular_factor_at(min_views=min_views)
-        self._frozen_angular_denominator = float(snapshot)
-        return snapshot
 
     @property
     def angular_denominator_is_frozen(self) -> bool:
@@ -946,44 +442,37 @@ class MaskVoxelCache:
     def frozen_angular_denominator(self) -> Optional[float]:
         return self._frozen_angular_denominator
 
-    def mean_angular_factor_at(self, min_views: int = 2) -> float:
-        """Mean angular-diversity factor (1 − ‖mean_view_dir‖) over voxels
-        observed by at least `min_views` unique views.
+    @property
+    def angular_peak_value(self) -> float:
+        """Highest trusted mean angular factor seen so far."""
+        return float(self._angular_peak_value)
 
-        Close to 0 means observing rays are clustered in direction (cache
-        has narrow-cone evidence); close to 1 means rays span a wide
-        angular range (cache has true triangulation evidence).
-
-        The choice of `min_views` matters and is load-bearing for the
-        scene-relative normalization in `query`. Including 2-observation
-        voxels (any voxel seen by just two cameras) drives the mean toward
-        zero as training progresses, because edge voxels with only 2
-        nearly-parallel observations dominate the population. Using
-        `min_views = min_observations` (the same threshold the confidence
-        gate uses) restricts the mean to the population the gate actually
-        cares about — voxels in the "trusted" regime — which keeps the
-        scene-relative denominator meaningful and stable.
-        """
-        min_views = max(int(min_views), 2)
-        # Use the evidence-gated unique view count to match `query`'s
-        # angular factor denominator. The geom_view_count is kept on the
-        # instance for diagnostics but is not load-bearing in the gate
-        # math; the evidence-gated count's implicit coupling to "voxel
-        # is being edited" turned out to be necessary.
-        counts = self.unique_view_count.float()
-        mask = counts >= float(min_views)
-        if not mask.any():
-            return 0.0
-        dir_sum = self.view_dir_sum[mask]  # [M, 3]
-        resultant = (dir_sum.norm(dim=-1) / counts[mask]).clamp(0.0, 1.0)
-        return float((1.0 - resultant).mean().item())
+    @property
+    def angular_peak_step(self) -> int:
+        """Edit step at which ``angular_peak_value`` was reached."""
+        return int(self._angular_peak_step)
 
     @property
     def mean_angular_factor(self) -> float:
-        """Mean angular-diversity factor over multi-view voxels (≥2 views).
-
-        Diagnostic-grade quantity. For the scene-relative normalization in
-        `query`, prefer `mean_angular_factor_at(min_observations)` so the
-        denominator is restricted to the population the gate cares about.
-        """
+        """Mean angular factor over every voxel with at least two views (diagnostic)."""
         return self.mean_angular_factor_at(min_views=2)
+
+    @property
+    def occupancy(self) -> float:
+        """Fraction of voxels observed at least once."""
+        return float(self.observed.float().mean().item())
+
+    @property
+    def mean_observation_count(self) -> float:
+        """Mean number of unique views over observed voxels."""
+        if not self.observed.any():
+            return 0.0
+        return float(self.unique_view_count[self.observed].float().mean().item())
+
+    @property
+    def mean_observed_variance(self) -> float:
+        """Mean cross-view variance over voxels with at least two views."""
+        multi_view = self.unique_view_count > 1
+        if not multi_view.any():
+            return 0.0
+        return float(self.running_m2[multi_view].mean().item())

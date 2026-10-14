@@ -1,4 +1,30 @@
+"""DreamCatalyst editing loss (DDS on InstructPix2Pix) with the PFC extensions.
+
+Upstream DreamCatalyst (KAIST) is kept as it was: the first block of DCConfig,
+the DC methods from ``compute_posterior_mean`` to ``get_variance``, and the
+image helpers at the end of the file. Everything else implements the method of
+the paper. One ``DC.__call__`` is one editing iteration on one view:
+
+  1. IP2P noise predictions for the current render (target) and the source.
+  2. Localization masks, from those clean predictions (before amplification):
+       S      target-instruction mask: where the instruction, applied to the
+              current render, still differs from reconstructing the source
+       S_src  source-instruction mask: the same contrast on the source image,
+              computed once per view
+       A      cross-attention mask of the edit tokens
+       M      = max(S * A, min(S, S_src)), plus optional voxel-cache support
+  3. Amplification of the target prediction only: adaptive TAG and scheduled STG.
+  4. Gradient = w_DDS * M * (eps_tgt - eps_src)                (localized DDS)
+              + e^t * (psi + w_out (1 - s)(1 - S_src)) * (z - z_src)  (preservation)
+              + latent-mean anchor.
+
+Every extension can be switched off in method_config.py, which reproduces
+upstream DreamCatalyst (the "dc baseline" values listed there).
+"""
+
 from dataclasses import dataclass, field
+import math
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -6,7 +32,7 @@ import torch.nn.functional as F
 from diffusers import DDIMScheduler, DiffusionPipeline
 from jaxtyping import Float
 from PIL import Image
-from typing import List, Dict, Literal, Optional
+
 from dc.attention_utils import (
     run_unet_with_cross_attention_capture,
     run_unet_with_skipped_attn,
@@ -16,9 +42,8 @@ from dc.guidance_utils import (
     apply_latent_mean_anchor,
     apply_source_blend,
     apply_tag,
-    compute_ca_mask_weight,
+    compute_cache_gate,
     compute_edit_strength,
-    compute_gate_signal,
     compute_preserve_weight,
     compute_stg_scale,
     compute_tag_eta,
@@ -31,13 +56,15 @@ from dc.localization_utils import (
 )
 from dc.utils.free_lunch import register_free_upblock2d_in, register_free_crossattn_upblock2d_in
 from dc.utils.logging_utils import log_dc_debug_to_wandb
-import math
 
 
 @dataclass
 class DCConfig:
+    # ------------------------------------------------------------------
+    # Upstream DreamCatalyst
+    # ------------------------------------------------------------------
     sd_pretrained_model_or_path: str = "runwayml/stable-diffusion-v1-5"
-    
+
     num_inference_steps: int = 500
     min_step_ratio: float = 0.2
     max_step_ratio: float = 0.9
@@ -62,99 +89,105 @@ class DCConfig:
 
     max_iteration: int = 3000
 
-    eta_tag: float = 1.25
-    adaptive_tag: bool = True
-    asymmetric_tag: bool = True
-
-
-    stg_enabled: bool = True
-    stg_scale: float = 2.0
+    # ------------------------------------------------------------------
+    # Guidance amplification (target branch only)
+    # ------------------------------------------------------------------
+    # Adaptive TAG ceiling: eta(t) = 1 + (eta_tag - 1) * t^(1/e). 1.0 disables TAG.
+    eta_tag: float = 1.2
+    # STG peak scale, attenuated by (1 - s). 0.0 disables STG.
+    stg_scale: float = 3.0
+    # UNet up-blocks whose self-attention the STG weak pass skips.
     stg_skip_layers: List[int] = field(default_factory=lambda: [2])
-    stg_schedule_start_ratio: float = 0.4
-    stg_schedule_end_ratio: float = 0.7
+    # Bump schedule over training progress: zero outside [start, end], peak at
+    # start + peak_ratio * (end - start).
+    stg_schedule_start_ratio: float = 0.0
+    stg_schedule_end_ratio: float = 0.8
     stg_bump_peak_ratio: float = 0.5
 
-    # Self-derived relevance masking
+    # ------------------------------------------------------------------
+    # Localization: where the edit may act
+    # ------------------------------------------------------------------
+    # Restrict the DDS delta to the edit mask M.
+    source_blend_localization_enabled: bool = True
+    # Shaping of S and S_src: gamma sharpening, then a Gaussian blur (latent px).
+    gradient_mask_gamma: float = 1.2
     gradient_mask_blur: float = 0.5
-    gradient_mask_ema_beta: float = 0.99
-    gradient_mask_ema_beta_auto: bool = True
-    gradient_mask_ema_beta_camera_factor: float = 2.0
-    # legacy_camera reproduces the original camera-count formula. per_view
-    # measures the EMA e-folding time in updates of this camera's own mask.
-    gradient_mask_ema_mode: Literal["legacy_camera", "per_view"] = "legacy_camera"
-    gradient_mask_ema_memory_visits: float = 2.0
-    gradient_mask_source: Literal["dds", "target_instruction", "source_instruction"] = "dds"
-    # Fixed-source localization has its own noise level and RNG, independent
-    # of DDS annealing. These also serve the optional source preservation mask.
+    # Voxel-cache input: S's magnitude divided by this per-frame quantile.
+    gradient_mask_raw_norm_quantile: float = 0.95
+    # Per-view EMA of S, memory counted in visits of that view:
+    # beta = exp(-1 / memory).
+    gradient_mask_ema_memory_visits: float = 5.0
+    # S_src: noise level (fraction of the training timesteps), number of noise
+    # draws averaged per view, and the seed of its private RNG.
     localization_source_timestep_ratio: float = 0.5
     localization_source_num_samples: int = 4
     localization_source_seed: int = 42
-    gradient_mask_gamma: float = 1.2
-    gradient_mask_raw_norm_quantile: float = 0.95
-    source_blend_localization_enabled: bool = True
-
-    outside_mask_anchor_weight: float = 0.2
-    outside_mask_anchor_edit_strength_adaptive: bool = True
-    outside_mask_anchor_mask_source: Literal["final", "internal", "source"] = "final"
-    # Multiply the legacy cache gate by (1-lambda) + lambda*M_CA.
-    # At 1, cache additions require CA support even when the self-mask is high.
-    external_mask_ca_gate_weight: float = 0.0
-
+    # A: cross-attention mask of the edit tokens, read from these up-blocks.
     cross_attention_mask_enabled: bool = True
     cross_attention_mask_layers: List[int] = field(default_factory=lambda: [1, 2])
-    cross_attention_mask_blur: float = 0.5
     cross_attention_mask_gamma: float = 1.2
-    cross_attention_mask_weight_schedule_power: float = 0.75
-    cross_attention_mask_weight_min: float = 0.0
-    # CA only subtracts, so it can veto parts of the requested edit that the
-    # target tokens do not attend to (a stormtrooper's hands). Floor the
-    # internal mask at kappa * F: F = min(self-mask, source-instruction mask)
-    # for "agreement" (no veto where both instruction masks agree), or the
-    # source-instruction mask itself for "source". 0 = off (previous behavior).
-    cross_attention_mask_veto_floor: float = 0.0
-    cross_attention_mask_veto_floor_mask: Literal["agreement", "source"] = "agreement"
+    cross_attention_mask_blur: float = 0.5
 
+    # ------------------------------------------------------------------
+    # Preservation: what stays like the source
+    # ------------------------------------------------------------------
+    # Extra preservation outside S_src, attenuated by (1 - s). 0.0 disables it.
+    outside_mask_anchor_weight: float = 0.25
+    # Per-channel latent-mean anchor. 0.0 disables it.
     latent_mean_anchor_weight: float = 0.005
 
     def __post_init__(self):
-        self.validate_localization_options()
+        self.validate()
 
-    def validate_localization_options(self):
-        if self.gradient_mask_ema_mode not in ("legacy_camera", "per_view"):
-            raise ValueError("Unknown gradient_mask_ema_mode")
-        if self.gradient_mask_source not in ("dds", "target_instruction", "source_instruction"):
-            raise ValueError("Unknown gradient_mask_source")
-        if self.outside_mask_anchor_mask_source not in ("final", "internal", "source"):
-            raise ValueError("Unknown outside_mask_anchor_mask_source")
-        if self.cross_attention_mask_veto_floor_mask not in ("agreement", "source"):
-            raise ValueError("Unknown cross_attention_mask_veto_floor_mask")
-        if (
-            not math.isfinite(self.gradient_mask_ema_memory_visits)
-            or self.gradient_mask_ema_memory_visits <= 0
-        ):
+    def validate(self):
+        """Check the PFC settings. DC calls this again: the CLI can edit fields."""
+        memory = self.gradient_mask_ema_memory_visits
+        if not math.isfinite(memory) or memory <= 0:
             raise ValueError("gradient_mask_ema_memory_visits must be finite and positive")
         if not 0.0 < self.localization_source_timestep_ratio < 1.0:
-            raise ValueError("localization_source_timestep_ratio must be between 0 and 1 (exclusive)")
+            raise ValueError("localization_source_timestep_ratio must be in (0, 1)")
         if self.localization_source_num_samples < 1:
             raise ValueError("localization_source_num_samples must be at least 1")
         if self.localization_source_seed < 0:
             raise ValueError("localization_source_seed must be nonnegative")
-        for name in (
-            "cross_attention_mask_weight_min",
-            "external_mask_ca_gate_weight",
-            "cross_attention_mask_veto_floor",
-        ):
-            if not 0.0 <= getattr(self, name) <= 1.0:
-                raise ValueError(f"{name} must be in [0, 1]")
-        if self.external_mask_ca_gate_weight > 0 and not self.cross_attention_mask_enabled:
-            raise ValueError("external_mask_ca_gate_weight requires cross_attention_mask_enabled")
+
+    @property
+    def localization_enabled(self) -> bool:
+        """Whether any mechanism needs the localization masks (all off = upstream DC)."""
+        return (
+            self.source_blend_localization_enabled
+            or self.outside_mask_anchor_weight > 0
+            or self.cross_attention_mask_enabled
+        )
+
+
+@dataclass
+class LocalizationMasks:
+    """The masks of one iteration, each [B, 1, h, w] in [0, 1] at latent resolution."""
+
+    self_mask: torch.Tensor  # S: target-instruction mask (per-view EMA, gamma, blur)
+    self_mask_raw: torch.Tensor  # S's magnitude over its 95th percentile: voxel-cache input
+    source_mask: torch.Tensor  # S_src: source-instruction mask, also the preservation mask
+    ca_mask: Optional[torch.Tensor]  # A: cross-attention mask (None when disabled)
+    internal: torch.Tensor  # max(S * A, min(S, S_src)): the edit mask before the cache
+    final: torch.Tensor  # edit mask M after voxel-cache fusion (= internal without it)
+    veto_floor_addition: Optional[torch.Tensor]  # support min(S, S_src) restored over S * A
+
+
+def _match_mask_shape(mask: torch.Tensor, shape, mode: str = "bilinear") -> torch.Tensor:
+    """Resize a [B, 1, h, w] map to ``shape``; a no-op when it already matches."""
+    if mask.shape[-2:] == shape:
+        return mask
+    if mode == "nearest":
+        return F.interpolate(mask, size=shape, mode="nearest")
+    return F.interpolate(mask, size=shape, mode="bilinear", align_corners=False)
 
 
 class DC(object):
     def __init__(self, config: DCConfig, use_wandb=False):
         self.config = config
-        # Also validate configs modified after dataclass construction (CLI).
-        config.validate_localization_options()
+        # The CLI can modify fields after the dataclass was built: validate again.
+        config.validate()
         self.device = torch.device(config.device)
 
         self.pipe = DiffusionPipeline.from_pretrained(config.sd_pretrained_model_or_path).to(self.device)
@@ -181,12 +214,15 @@ class DC(object):
 
         self.update_text_features(src_prompt=self.src_prompt, tgt_prompt=self.tgt_prompt)
         self.null_text_feature = self.encode_text("")
-    
+
         self.use_wandb = use_wandb
 
         self.iteration = 0
         self.max_iteration = config.max_iteration
-        self.gradient_mask_ema: Dict[int, torch.Tensor] = {}
+        # Per-view EMA of S, keyed by camera slot.
+        self.self_mask_ema: Dict[int, torch.Tensor] = {}
+        self.self_mask_ema_beta = math.exp(-1.0 / config.gradient_mask_ema_memory_visits)
+        # S_src relevance per camera slot (on CPU), valid for the signature below.
         self.source_relevance_cache: Dict[int, torch.Tensor] = {}
         self.source_relevance_signature = None
 
@@ -198,64 +234,109 @@ class DC(object):
         register_free_upblock2d_in(self.unet, b1, b2, s1, s2)
         register_free_crossattn_upblock2d_in(self.unet, b1, b2, s1, s2)
 
-    def _build_gradient_relevance_mask(self, relevance, current_spot):
-        """Normalize and smooth the selected latent-space relevance signal.
+    # ------------------------------------------------------------------
+    # IP2P predictions
+    # ------------------------------------------------------------------
 
-        The mask is:
-        1. supplied as a channel-L2 magnitude per spatial location,
-        2. percentile-normalized per sample,
-        3. temporally smoothed via EMA per view,
-        4. optionally sharpened and blurred,
-        5. detached before use so it does not backprop through the mask.
+    def _ip2p_unet(self, latents_noisy, cond_text_embedding, src_encoded, t, ca_token_indices=None):
+        """One UNet pass on the IP2P batch [text + image, image only, unconditional].
 
-        Also returns a raw, quantile-normalized variant of the relevance map
-        (no percentile pass, no EMA, no post-processing). The percentile pass
-        is the right choice for the DDS gradient mask — it keeps the spatial
-        rank ordering and is invariant to noise-level scale — but it
-        compresses absolute confidence toward the median, which makes
-        downstream consumers that need foreground/background discrimination
-        (e.g. the voxel cache) lose signal. The raw variant preserves
-        absolute structure for those consumers.
+        Returns (pred_text, pred_image, pred_uncond, model_input, text_embeddings,
+        ca_mask). The model input and text embeddings are reused by the STG weak
+        pass; ca_mask is the cross-attention mask A when ``ca_token_indices`` is
+        given, else None.
         """
-        # Both the 2D mask and voxel-cache observations use the selected
-        # evidence. Neither TAG/STG nor cache fusion feeds this signal.
-        B = relevance.shape[0]
-        flat_relevance = relevance.view(B, -1)
-        # Robust per-frame scale: divide by the q-quantile (q=0.95) so a single
-        # hot pixel cannot deflate the whole frame's mask (a major source of
-        # spurious cross-view variance once these masks are aggregated into the
-        # 3D voxel cache). Pixels above the quantile saturate to 1.
-        q_norm = min(max(float(self.config.gradient_mask_raw_norm_quantile), 0.5), 0.999)
-        per_sample_scale = torch.quantile(flat_relevance, q_norm, dim=1)
-        per_sample_scale = per_sample_scale.clamp_min(1e-8).view(B, 1, 1, 1)
-        raw_mask = (relevance / per_sample_scale).clamp(0.0, 1.0).detach()
+        uncond_embedding = self.null_text_feature
+        text_embeddings = torch.cat([cond_text_embedding, uncond_embedding, uncond_embedding], dim=0)
+        # Same conditioning layout as the upstream IP2P path.
+        text_embeddings = torch.cat([text_embeddings, text_embeddings], dim=1)
+        image_latents = torch.cat([src_encoded, src_encoded, torch.zeros_like(src_encoded)], dim=0)
+        model_input = torch.cat([torch.cat([latents_noisy] * 3, dim=0), image_latents], dim=1)
+        timestep_input = torch.cat([t] * 3).to(self.device)
 
-        normalized = normalize_relevance_map(relevance)
-
-        prev_mask = self.gradient_mask_ema.get(current_spot)
-        if prev_mask is None or prev_mask.shape != normalized.shape:
-            ema_mask = normalized.detach()
+        ca_mask = None
+        if ca_token_indices is not None:
+            noise_pred, ca_mask = run_unet_with_cross_attention_capture(
+                self.unet,
+                self.config.cross_attention_mask_layers,
+                ca_token_indices,
+                model_input,
+                timestep_input,
+                text_embeddings,
+                conditioned_batch_size=latents_noisy.shape[0],
+                build_attention_mask_fn=lambda maps: build_cross_attention_relevance_mask(
+                    maps,
+                    gamma=self.config.cross_attention_mask_gamma,
+                    sigma=self.config.cross_attention_mask_blur,
+                    target_shape=latents_noisy.shape[-2:],
+                ),
+            )
         else:
-            beta = self.config.gradient_mask_ema_beta
-            ema_mask = beta * prev_mask + (1.0 - beta) * normalized.detach()
-        self.gradient_mask_ema[current_spot] = ema_mask
+            noise_pred = self.unet.forward(
+                model_input,
+                timestep_input,
+                encoder_hidden_states=text_embeddings,
+            ).sample
+
+        pred_text, pred_image, pred_uncond = noise_pred.chunk(3)
+        return pred_text, pred_image, pred_uncond, model_input, text_embeddings, ca_mask
+
+    def _ip2p_guidance(self, pred_text, pred_image, pred_uncond, use_text: bool):
+        """IP2P classifier-free guidance; the source branch drops the text term."""
+        if use_text:
+            return pred_uncond + self.config.guidance_scale * (pred_text - pred_image) + \
+                self.config.image_guidance_scale * (pred_image - pred_uncond)
+        return pred_uncond + self.config.image_guidance_scale * (pred_image - pred_uncond)
+
+    # ------------------------------------------------------------------
+    # Localization masks
+    # ------------------------------------------------------------------
+
+    def _target_instruction_mask(self, relevance, current_spot):
+        """S from the target-instruction relevance, plus the voxel-cache input.
+
+        relevance = ||eps(render, I_src, instruction) - eps(render, I_src, "")||
+        per latent pixel. Returns (mask, raw):
+            mask  p5-p95 normalized, per-view EMA, gamma, blur (enters M)
+            raw   divided by its per-frame 95th percentile and clipped to [0, 1].
+                  The cache needs absolute foreground/background contrast,
+                  which the rank normalization of ``mask`` erases.
+        """
+        B = relevance.shape[0]
+        # A robust quantile rather than the max, so one hot pixel cannot rescale
+        # the whole frame (spurious cross-view variance in the cache).
+        q = min(max(float(self.config.gradient_mask_raw_norm_quantile), 0.5), 0.999)
+        scale = torch.quantile(relevance.view(B, -1), q, dim=1)
+        scale = scale.clamp_min(1e-8).view(B, 1, 1, 1)
+        raw = (relevance / scale).clamp(0.0, 1.0).detach()
+
+        normalized = normalize_relevance_map(relevance).detach()
+        previous = self.self_mask_ema.get(current_spot)
+        if previous is not None and previous.shape == normalized.shape:
+            # EMA over this view's own visits (a view's first visit seeds it).
+            beta = self.self_mask_ema_beta
+            normalized = beta * previous + (1.0 - beta) * normalized
+        self.self_mask_ema[current_spot] = normalized
 
         mask = apply_mask_postprocessing(
-            ema_mask,
+            normalized,
             gamma=self.config.gradient_mask_gamma,
             sigma=self.config.gradient_mask_blur,
         )
-
-        return mask.detach(), raw_mask
+        return mask.detach(), raw
 
     @torch.no_grad()
-    def _get_source_instruction_relevance(self, src_x0, src_encoded, current_spot):
-        """Cache source-only instruction contrast, averaged over independent noise.
+    def _source_instruction_relevance(self, src_x0, src_encoded, current_spot):
+        """S_src relevance: the instruction contrast on the noisy SOURCE latent.
 
-        Both predictions share the same noisy source latent AND source image
-        condition; only the instruction differs. A private per-view generator
-        leaves the training RNG stream unchanged. Cache scalar maps on CPU.
+        ||eps(z_src_t, I_src, instruction) - eps(z_src_t, I_src, "")|| at a fixed
+        timestep, with channel magnitudes averaged over
+        ``localization_source_num_samples`` noise draws. It does not depend on
+        the edit's progress, so it is computed on a view's first visit and
+        cached on CPU. The noise comes from a private generator seeded per view,
+        so the training RNG stream is untouched.
         """
+        # Changed prompts or settings make every cached map stale.
         signature = (
             self.src_prompt, self.tgt_prompt,
             self.config.localization_source_timestep_ratio,
@@ -264,11 +345,6 @@ class DC(object):
         )
         if signature != self.source_relevance_signature:
             self.source_relevance_cache.clear()
-            if (
-                self.source_relevance_signature is not None
-                and self.config.gradient_mask_source == "source_instruction"
-            ):
-                self.gradient_mask_ema.clear()
             self.source_relevance_signature = signature
         expected_shape = (src_x0.shape[0], 1, *src_x0.shape[-2:])
         cached = self.source_relevance_cache.get(current_spot)
@@ -283,7 +359,7 @@ class DC(object):
         generator = torch.Generator(device=src_x0.device)
         generator.manual_seed((self.config.localization_source_seed + int(current_spot)) % (2**63 - 1))
         embeddings = torch.cat([self.tgt_text_feature, self.null_text_feature], dim=0)
-        # Match the conditioning layout used by the existing IP2P DDS path.
+        # Same conditioning layout as the IP2P DDS path.
         embeddings = torch.cat([embeddings, embeddings], dim=1)
         image_condition = torch.cat([src_encoded, src_encoded], dim=0)
         relevance = torch.zeros(expected_shape, device=src_x0.device, dtype=torch.float32)
@@ -301,14 +377,108 @@ class DC(object):
                 encoder_hidden_states=embeddings,
             ).sample
             pred_text, pred_image = pred.chunk(2)
-            # Average magnitudes, not signed vectors that can cancel.
+            # Average magnitudes, not signed vectors that could cancel.
             relevance += (pred_text.float() - pred_image.float()).norm(dim=1, keepdim=True)
-        # Keep localization statistics in float32 for quantile normalization.
         relevance = relevance / self.config.localization_source_num_samples
         self.source_relevance_cache[current_spot] = relevance.cpu()
         return relevance
 
-        
+    def _source_instruction_mask(self, src_x0, src_encoded, current_spot):
+        """S_src: the cached source relevance shaped like S (no EMA: it is fixed per view)."""
+        relevance = self._source_instruction_relevance(src_x0, src_encoded, current_spot)
+        return apply_mask_postprocessing(
+            normalize_relevance_map(relevance),
+            gamma=self.config.gradient_mask_gamma,
+            sigma=self.config.gradient_mask_blur,
+        ).detach()
+
+    def _localization_masks(self, target_relevance, ca_mask, src_x0, src_encoded, current_spot):
+        """Build S, S_src and the edit mask M = max(S * A, min(S, S_src)).
+
+        A restricts S at full strength from the first step, which keeps the edit
+        off the background. A can only subtract, so it can also veto parts of
+        the requested edit that the edit tokens do not attend to (a
+        stormtrooper's hands). The floor min(S, S_src) lifts that veto exactly
+        where both instruction masks mark the region. M never exceeds S.
+        """
+        self_mask, self_mask_raw = self._target_instruction_mask(target_relevance, current_spot)
+        source_mask = self._source_instruction_mask(src_x0, src_encoded, current_spot)
+
+        internal = self_mask
+        veto_floor_addition = None
+        if ca_mask is not None:
+            ca_mask = _match_mask_shape(ca_mask, self_mask.shape[-2:])
+            hybrid = (self_mask * ca_mask).clamp(0.0, 1.0)
+            internal = torch.maximum(hybrid, torch.minimum(self_mask, source_mask)).clamp(0.0, 1.0)
+            veto_floor_addition = (internal - hybrid).clamp_min(0.0).detach()
+
+        return LocalizationMasks(
+            self_mask=self_mask,
+            self_mask_raw=self_mask_raw,
+            source_mask=source_mask,
+            ca_mask=ca_mask,
+            internal=internal,
+            final=internal,
+            veto_floor_addition=veto_floor_addition,
+        )
+
+    def _fuse_voxel_cache(self, masks, cache_mask, cache_valid, cache_confidence, cache_blend):
+        """Add voxel-cache support to the internal mask (positive only).
+
+            M = M_internal + blend * C * G * max(M_cache - M_internal, 0)
+            G = max(A, S) * A
+
+        The cache adds edit support only where its cross-view consensus exceeds
+        the current view's mask, scaled by the warmup blend, the per-pixel cache
+        confidence C and the semantic gate G. It never subtracts. Pixels
+        without a valid cache read keep M_internal. The cache inputs are
+        [1, 1, h, w] maps at latent resolution.
+        """
+        mask = masks.internal
+        shape = mask.shape[-2:]
+        cache_mask = _match_mask_shape(cache_mask, shape).to(device=mask.device, dtype=mask.dtype).clamp(0.0, 1.0)
+        valid = _match_mask_shape(cache_valid.to(device=mask.device, dtype=torch.float32), shape, mode="nearest") > 0.5
+        confidence = _match_mask_shape(cache_confidence, shape).to(device=mask.device, dtype=mask.dtype).clamp(0.0, 1.0)
+
+        ca_mask = masks.ca_mask.clamp(0.0, 1.0) if masks.ca_mask is not None else None
+        gate = compute_cache_gate(ca_mask, masks.self_mask.clamp(0.0, 1.0))
+        blend = min(max(float(cache_blend), 0.0), 1.0)
+
+        fused = mask + (blend * confidence) * gate * (cache_mask - mask).clamp_min(0.0)
+        return torch.where(valid, fused, mask).clamp(0.0, 1.0)
+
+    # ------------------------------------------------------------------
+    # Guidance amplification
+    # ------------------------------------------------------------------
+
+    def _guided_target_prediction(self, eps_tgt, latents_noisy, eta, stg_scale, model_input, text_embeddings, t):
+        """Target prediction after amplification: TAG(eps) + s_stg * (eps - eps_weak).
+
+        TAG and STG act in parallel on the same IP2P prediction. eps_weak comes
+        from a UNet pass with self-attention skipped in ``stg_skip_layers``.
+        Returns (prediction, STG term), the STG term being None when STG is off
+        at this step.
+        """
+        guided = apply_tag(eps_tgt, latents_noisy, eta)
+        if stg_scale <= 0:
+            return guided, None
+
+        weak_text, weak_image, weak_uncond = run_unet_with_skipped_attn(
+            self.unet,
+            self.device,
+            self.config.stg_skip_layers,
+            model_input,
+            t,
+            text_embeddings,
+        ).chunk(3)
+        eps_weak = self._ip2p_guidance(weak_text, weak_image, weak_uncond, use_text=True)
+        stg_term = stg_scale * (eps_tgt - eps_weak)
+        return guided + stg_term, stg_term
+
+    # ------------------------------------------------------------------
+    # Upstream DreamCatalyst helpers
+    # ------------------------------------------------------------------
+
     def compute_posterior_mean(self, xt, noise_pred, t, t_prev):
         """
         Computes an estimated posterior mean \mu_\phi(x_t, y; \epsilon_\phi).
@@ -323,7 +493,7 @@ class DC(object):
         c0 = torch.sqrt(alpha_bar_t_prev) * beta_t / (1 - alpha_bar_t)
         c1 = torch.sqrt(alpha_t) * (1 - alpha_bar_t_prev) / (1 - alpha_bar_t)
         mean_func = c0 * pred_x0 + c1 * xt
-        
+
         return mean_func, pred_x0
 
     def encode_image(self, img_tensor: Float[torch.Tensor, "B C H W"]):
@@ -331,7 +501,7 @@ class DC(object):
         x = 2 * x - 1
         x = x.float()
         return self.vae.encode(x).latent_dist.sample() * 0.18215
-    
+
     def encode_src_image(self, img_tensor: Float[torch.Tensor, "B C H W"]):
         x = img_tensor.float()
         return self.vae.encode(x)
@@ -371,20 +541,6 @@ class DC(object):
                 self.tgt_prompt = tgt_prompt
                 self.tgt_text_feature = self.encode_text(tgt_prompt)
 
-    def _get_current_stg_scale(self, current_edit_strength=None, iteration=None) -> float:
-        """Return the bump-scheduled STG scale attenuated by current edit strength."""
-        if iteration is None:
-            iteration = self.iteration
-        return compute_stg_scale(
-            base_scale=self.config.stg_scale,
-            iteration=iteration,
-            max_iteration=self.max_iteration,
-            start_ratio=self.config.stg_schedule_start_ratio,
-            end_ratio=self.config.stg_schedule_end_ratio,
-            bump_peak_ratio=self.config.stg_bump_peak_ratio,
-            current_edit_strength=current_edit_strength,
-        )
-
     def dc_timestep_sampling(self, batch_size):
         self.scheduler.set_timesteps(self.config.num_inference_steps)
         timesteps = reversed(self.scheduler.timesteps)
@@ -402,6 +558,10 @@ class DC(object):
         t_prev = timesteps[idx - 1].cpu()
         return t, t_prev, timestep_noralized
 
+    # ------------------------------------------------------------------
+    # One editing iteration
+    # ------------------------------------------------------------------
+
     def __call__(
         self,
         tgt_x0,
@@ -418,413 +578,149 @@ class DC(object):
         external_grad_mask_confidence=None,
         external_mask_blend=0.0,
     ):
-        device = self.device
-        scheduler = self.scheduler
+        """One editing iteration on one view (steps 1-4 of the module docstring).
 
+        Args:
+            tgt_x0: latent of the current render (the loss's gradient flows here).
+            src_x0: latent of the source image; src_encoded: its IP2P image condition.
+            step: trainer step (logging cadence); current_spot: camera slot of the
+                view, which keys the per-view caches.
+            external_grad_mask, external_grad_mask_valid,
+            external_grad_mask_confidence: the voxel-cache read for this view,
+                [1, 1, h, w] at latent resolution (None without the cache).
+            external_mask_blend: the cache's warmup blend.
+
+        Returns the loss, or with ``return_dict`` a dict with the loss, gradient
+        and masks (mask entries are None when localization is off).
+        """
         self.update_text_features(src_prompt=src_prompt, tgt_prompt=tgt_prompt)
-        tgt_text_embedding, src_text_embedding = (
-            self.tgt_text_feature,
-            self.src_text_feature,
-        )
-        uncond_embedding = self.null_text_feature
-
         batch_size = tgt_x0.shape[0]
         t, t_prev, t_normalized = self.dc_timestep_sampling(batch_size)
-        eta_tag_current = compute_tag_eta(
-            self.config.eta_tag,
-            t_normalized,
-            self.config.adaptive_tag,
-        )
+        # STG follows the iteration count before this step increments it.
+        iteration = self.iteration
+        self.iteration += 1
+        eta_tag_current = compute_tag_eta(self.config.eta_tag, t_normalized)
 
+        # The same noise for both branches: DDS cancels it in eps_tgt - eps_src.
         noise = torch.randn_like(tgt_x0)
+        noisy_tgt = self.scheduler.add_noise(tgt_x0, noise, t)
+        noisy_src = self.scheduler.add_noise(src_x0, noise, t)
 
-        eps = dict()
-        eps_raw = dict()
-        pred_x0s = dict()
-        noisy_latents = dict()
-        base_text_embeddings_by_name = dict()
-        base_latent_model_inputs = dict()
-        target_cross_attention_mask = None
-        target_instruction_relevance = None
-        target_cross_attention_token_indices = None
+        # 1. IP2P predictions. The target pass also records A.
+        ca_token_indices = None
         if self.config.cross_attention_mask_enabled:
-            target_cross_attention_token_indices = get_cross_attention_token_indices(
+            ca_token_indices = get_cross_attention_token_indices(
                 self.tokenizer,
                 self.tgt_prompt,
                 src_prompt=self.src_prompt,
             )
+        tgt_text, tgt_image, tgt_uncond, tgt_model_input, tgt_text_embeddings, ca_mask = self._ip2p_unet(
+            noisy_tgt, self.tgt_text_feature, src_encoded, t, ca_token_indices
+        )
+        src_text, src_image, src_uncond, _, _, _ = self._ip2p_unet(
+            noisy_src, self.src_text_feature, src_encoded, t
+        )
+        eps_tgt_raw = self._ip2p_guidance(tgt_text, tgt_image, tgt_uncond, use_text=True).detach().clone()
+        eps_src = self._ip2p_guidance(src_text, src_image, src_uncond, use_text=False).detach().clone()
 
-        uncond_image_latent = torch.zeros_like(src_encoded)
-
-        # Phase 1: clean CFG predictions only. 
-        for latent, cond_text_embedding, name in zip(
-            [tgt_x0, src_x0], [tgt_text_embedding, src_text_embedding], ["tgt", "src"]
-        ):
-            latents_noisy = scheduler.add_noise(latent, noise, t)
-            noisy_latents[name] = latents_noisy
-
-            base_text_embeddings = torch.cat([cond_text_embedding, uncond_embedding, uncond_embedding], dim=0)
-            base_text_embeddings = torch.cat([base_text_embeddings, base_text_embeddings], dim=1)
-            base_latent_image = torch.cat([src_encoded, src_encoded, uncond_image_latent], dim=0)
-            base_latent_model_input = torch.cat([latents_noisy] * 3, dim=0)
-            base_latent_model_input = torch.cat([base_latent_model_input, base_latent_image], dim=1)
-            base_text_embeddings_by_name[name] = base_text_embeddings
-            base_latent_model_inputs[name] = base_latent_model_input
-
-            timestep_input = torch.cat([t] * 3).to(device)
-
-            if name == "tgt" and self.config.cross_attention_mask_enabled:
-                noise_pred, target_cross_attention_mask = run_unet_with_cross_attention_capture(
-                    self.unet,
-                    self.config.cross_attention_mask_layers,
-                    target_cross_attention_token_indices,
-                    base_latent_model_input,
-                    timestep_input,
-                    base_text_embeddings,
-                    conditioned_batch_size=batch_size,
-                    build_attention_mask_fn=lambda maps: build_cross_attention_relevance_mask(
-                        maps,
-                        gamma=self.config.cross_attention_mask_gamma,
-                        sigma=self.config.cross_attention_mask_blur,
-                        target_shape=latents_noisy.shape[-2:],
-                    ),
+        # 2. Localization, from the clean predictions (TAG/STG would otherwise
+        #    feed their own amplification back into the masks).
+        masks = None
+        if self.config.localization_enabled:
+            target_relevance = (
+                tgt_text.detach().float() - tgt_image.detach().float()
+            ).norm(dim=1, keepdim=True)
+            masks = self._localization_masks(target_relevance, ca_mask, src_x0, src_encoded, current_spot)
+            if external_grad_mask is not None:
+                masks.final = self._fuse_voxel_cache(
+                    masks,
+                    external_grad_mask,
+                    external_grad_mask_valid,
+                    external_grad_mask_confidence,
+                    external_mask_blend,
                 )
-            else:
-                noise_pred = self.unet.forward(
-                    base_latent_model_input,
-                    timestep_input,
-                    encoder_hidden_states=base_text_embeddings,
-                ).sample
 
-            if name == "tgt":
-                noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
-                if self.config.gradient_mask_source == "target_instruction":
-                    target_instruction_relevance = (
-                        noise_pred_text.detach().float() - noise_pred_image.detach().float()
-                    ).norm(dim=1, keepdim=True)
-                noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_image) + \
-                    self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
-            else:
-                noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
-                noise_pred = noise_pred_uncond + self.config.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
-
-            eps_raw[name] = noise_pred.detach().clone()
-
-        iteration_for_stg = self.iteration
-        self.iteration += 1
-        current_cross_attention_mask_weight = compute_ca_mask_weight(
-            t_normalized,
-            self.config.min_step_ratio,
-            self.config.max_step_ratio,
-            self.config.cross_attention_mask_weight_schedule_power,
-            min_weight=self.config.cross_attention_mask_weight_min,
+        # 3. Amplify the target prediction; the source prediction stays as is.
+        edit_strength = compute_edit_strength(eps_tgt_raw, eps_src)
+        stg_scale = compute_stg_scale(
+            base_scale=self.config.stg_scale,
+            iteration=iteration,
+            max_iteration=self.max_iteration,
+            start_ratio=self.config.stg_schedule_start_ratio,
+            end_ratio=self.config.stg_schedule_end_ratio,
+            bump_peak_ratio=self.config.stg_bump_peak_ratio,
+            current_edit_strength=edit_strength,
+        )
+        eps_tgt, stg_term = self._guided_target_prediction(
+            eps_tgt_raw, noisy_tgt, eta_tag_current, stg_scale, tgt_model_input, tgt_text_embeddings, t
         )
 
-        grad_mask = None
-        self_grad_mask = None
-        needs_self_mask = (
-            self.config.source_blend_localization_enabled
-            or self.config.outside_mask_anchor_weight > 0
-            or self.config.cross_attention_mask_enabled
-        )
-
-        source_relevance = None
-        if (
-            (needs_self_mask and self.config.gradient_mask_source == "source_instruction")
-            or (
-                self.config.outside_mask_anchor_weight > 0
-                and self.config.outside_mask_anchor_mask_source == "source"
-            )
-            or self.config.cross_attention_mask_veto_floor > 0
-        ):
-            source_relevance = self._get_source_instruction_relevance(src_x0, src_encoded, current_spot)
-
-        # Source-instruction support, post-processed exactly like the self-mask.
-        # Shared by the "source" preservation mask and the CA veto floor.
-        source_support_mask = None
-        if source_relevance is not None:
-            source_support_mask = apply_mask_postprocessing(
-                normalize_relevance_map(source_relevance),
-                gamma=self.config.gradient_mask_gamma,
-                sigma=self.config.gradient_mask_blur,
-            ).detach()
-
-        self_grad_mask_raw: Optional[torch.Tensor] = None
-        if needs_self_mask:
-            if self.config.gradient_mask_source == "target_instruction":
-                relevance = target_instruction_relevance
-            elif self.config.gradient_mask_source == "source_instruction":
-                relevance = source_relevance
-            else:
-                relevance = (eps_raw["tgt"] - eps_raw["src"]).norm(dim=1, keepdim=True)
-            self_grad_mask, self_grad_mask_raw = self._build_gradient_relevance_mask(
-                relevance, current_spot
-            )
-            grad_mask = self_grad_mask
-
-        if target_cross_attention_mask is not None:
-            target_shape = grad_mask.shape[-2:] if grad_mask is not None else eps_raw["tgt"].shape[-2:]
-            if target_cross_attention_mask.shape[-2:] != target_shape:
-                target_cross_attention_mask = F.interpolate(
-                    target_cross_attention_mask,
-                    size=target_shape,
-                    mode="bilinear",
-                    align_corners=False,
-                )
-            if grad_mask is None:
-                grad_mask = target_cross_attention_mask
-            else:
-                weight = current_cross_attention_mask_weight
-                self_mask = grad_mask
-                grad_mask = self_mask * ((1.0 - weight) + weight * target_cross_attention_mask)
-            grad_mask = grad_mask.clamp(0.0, 1.0)
-
-        # CA veto floor: attention may tighten the mask, but not below
-        # kappa * floor_support. "agreement" only reopens where the self-mask
-        # and the source mask both mark the requested edit (a CA false
-        # negative); regions only one of them marks stay under CA's veto.
-        # Without a CA mask, "agreement" is a no-op (min(S, S_src) <= S) and
-        # "source" reduces to a plain union with the source mask.
-        ca_veto_floor_addition = None
-        if (
-            grad_mask is not None
-            and source_support_mask is not None
-            and self.config.cross_attention_mask_veto_floor > 0
-        ):
-            floor_support = None
-            if self.config.cross_attention_mask_veto_floor_mask == "source":
-                floor_support = source_support_mask
-            elif self_grad_mask is not None:
-                floor_support = torch.minimum(self_grad_mask, source_support_mask)
-            if floor_support is not None:
-                if floor_support.shape[-2:] != grad_mask.shape[-2:]:
-                    floor_support = F.interpolate(
-                        floor_support,
-                        size=grad_mask.shape[-2:],
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                floor_support = floor_support.to(device=grad_mask.device, dtype=grad_mask.dtype)
-                floored = torch.maximum(
-                    grad_mask,
-                    self.config.cross_attention_mask_veto_floor * floor_support,
-                ).clamp(0.0, 1.0)
-                ca_veto_floor_addition = (floored - grad_mask).clamp_min(0.0).detach()
-                grad_mask = floored
-
-        internal_grad_mask = grad_mask.detach().clone() if grad_mask is not None else None
-
-        # EXTERNAL MASK
-        if external_grad_mask is not None:
-            blend = min(max(float(external_mask_blend), 0.0), 1.0)
-            ext = external_grad_mask
-            target_shape = grad_mask.shape[-2:] if grad_mask is not None else ext.shape[-2:]
-            if ext.shape[-2:] != target_shape:
-                ext = F.interpolate(
-                    ext,
-                    size=target_shape,
-                    mode="bilinear",
-                    align_corners=False,
-                )
-            ext = ext.to(device=eps_raw["tgt"].device, dtype=eps_raw["tgt"].dtype).clamp(0.0, 1.0)
-            valid = None
-            if external_grad_mask_valid is not None:
-                valid = external_grad_mask_valid
-                if valid.dim() == 2:
-                    valid = valid.unsqueeze(0).unsqueeze(0)
-                elif valid.dim() == 3:
-                    valid = valid.unsqueeze(0)
-                valid = valid.to(device=eps_raw["tgt"].device, dtype=torch.float32)
-                if valid.shape[-2:] != target_shape:
-                    valid = F.interpolate(valid, size=target_shape, mode="nearest")
-                valid = valid > 0.5
-            confidence = None
-            if external_grad_mask_confidence is not None:
-                confidence = external_grad_mask_confidence
-                if confidence.dim() == 2:
-                    confidence = confidence.unsqueeze(0).unsqueeze(0)
-                elif confidence.dim() == 3:
-                    confidence = confidence.unsqueeze(0)
-                confidence = confidence.to(device=eps_raw["tgt"].device, dtype=eps_raw["tgt"].dtype)
-                if confidence.shape[-2:] != target_shape:
-                    confidence = F.interpolate(
-                        confidence,
-                        size=target_shape,
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                confidence = confidence.clamp(0.0, 1.0)
-            blend_tensor = blend if confidence is None else blend * confidence
-            if grad_mask is None:
-                grad_mask = ext
-            else:
-                # Positive-only fusion: the cache adds agreed-upon edit force
-                # where the 3D consensus exceeds the 2D mask; it never
-                # subtracts. The addition is modulated by the warmup blend and
-                # the per-pixel cache confidence (both folded into
-                # blend_tensor) and by max(M_attn, M_self). Optionally require
-                # additional CA support: agreement alone is not correctness.
-                target_shape = grad_mask.shape[-2:]
-
-                def _to_target(m):
-                    if m is None:
-                        return None
-                    if m.shape[-2:] != target_shape:
-                        m = F.interpolate(
-                            m,
-                            size=target_shape,
-                            mode="bilinear",
-                            align_corners=False,
-                        )
-                    return m.to(device=grad_mask.device, dtype=grad_mask.dtype).clamp(0.0, 1.0)
-
-                gate_signal = compute_gate_signal(
-                    target_ca=_to_target(target_cross_attention_mask),
-                    sm=_to_target(self_grad_mask),
-                    ca_gate_weight=self.config.external_mask_ca_gate_weight,
-                )
-                gate = gate_signal if gate_signal is not None else 1.0
-
-                if torch.is_tensor(blend_tensor):
-                    blend_map = blend_tensor
-                else:
-                    blend_map = torch.full_like(grad_mask, float(blend_tensor))
-
-                diff = ext - grad_mask
-                fused = grad_mask + blend_map * gate * diff.clamp_min(0.0)
-                grad_mask = torch.where(valid, fused, grad_mask) if valid is not None else fused
-            grad_mask = grad_mask.clamp(0.0, 1.0)
-
-        current_edit_strength = compute_edit_strength(eps_raw["tgt"], eps_raw["src"])
-        current_stg_scale = self._get_current_stg_scale(
-            current_edit_strength=current_edit_strength,
-            iteration=iteration_for_stg,
-        )
-
-        stg_perturbation = None
-        # Phase 2: apply guidance novelties from cached eps_raw after the clean current mask exists.
-        for name in ["tgt", "src"]:
-            eps_full = eps_raw[name]
-            latents_noisy = noisy_latents[name]
-            eta_current = eta_tag_current if (name == "tgt" or not self.config.asymmetric_tag) else 1.0
-            stg_active = (
-                name == "tgt"
-                and self.config.stg_enabled
-                and current_stg_scale > 0
-            )
-
-            if stg_active:
-                weak_pred = run_unet_with_skipped_attn(
-                    self.unet,
-                    self.device,
-                    self.config.stg_skip_layers,
-                    base_latent_model_inputs["tgt"],
-                    t,
-                    base_text_embeddings_by_name["tgt"],
-                )
-                weak_text, weak_image, weak_uncond = weak_pred.chunk(3)
-                noise_pred_weak = weak_uncond + self.config.guidance_scale * (weak_text - weak_image) + \
-                    self.config.image_guidance_scale * (weak_image - weak_uncond)
-                # eps_out = TAG(eps_full) + s·(eps_full − eps_weak)
-                # TAG and STG act independently on the raw CFG prediction
-                # ("parallel" composition).
-                tag_out = apply_tag(eps_full, latents_noisy, eta_current)
-                stg_perturbation = current_stg_scale * (eps_full - noise_pred_weak)
-                noise_pred = tag_out + stg_perturbation
-            else:
-                # STG inactive on this branch — TAG only.
-                noise_pred = apply_tag(eps_full, latents_noisy, eta_current)
-
-            _, pred_x0 = self.compute_posterior_mean(latents_noisy, noise_pred, t, t_prev)
-            eps[name] = noise_pred
-            pred_x0s[name] = pred_x0
-
-        eps_tgt_for_grad = eps["tgt"]
-        if self.config.source_blend_localization_enabled and grad_mask is not None:
-            eps_tgt_for_grad = apply_source_blend(eps["tgt"], eps["src"], grad_mask)
-
-        preservation_mask = grad_mask
-        if self.config.outside_mask_anchor_mask_source == "internal":
-            preservation_mask = internal_grad_mask
-        elif self.config.outside_mask_anchor_mask_source == "source" and source_support_mask is not None:
-            preservation_mask = source_support_mask
+        # 4. Gradient: localized DDS delta + preservation + latent-mean anchor.
+        edit_mask = masks.final if masks is not None else None
+        preservation_mask = masks.source_mask if masks is not None else None
+        eps_tgt_for_grad = eps_tgt
+        if self.config.source_blend_localization_enabled and edit_mask is not None:
+            eps_tgt_for_grad = apply_source_blend(eps_tgt, eps_src, edit_mask)
 
         preserve_weight = compute_preserve_weight(
             psi=self.config.psi,
-            grad_mask=preservation_mask,
+            preservation_mask=preservation_mask,
             outside_mask_anchor_weight=self.config.outside_mask_anchor_weight,
-            outside_mask_anchor_edit_strength_adaptive=self.config.outside_mask_anchor_edit_strength_adaptive,
-            edit_strength=current_edit_strength,
+            edit_strength=edit_strength,
         )
-
         w_DDS = self.config.delta + self.config.gamma * (t_normalized ** (1/math.e))
         grad = (
-            w_DDS * (eps_tgt_for_grad - eps["src"])
+            w_DDS * (eps_tgt_for_grad - eps_src)
             + math.exp(t_normalized) * preserve_weight * (tgt_x0 - src_x0)
         )
-
-        grad = apply_latent_mean_anchor(
-            grad,
-            tgt_x0,
-            src_x0,
-            self.config.latent_mean_anchor_weight,
-        )
-
+        grad = apply_latent_mean_anchor(grad, tgt_x0, src_x0, self.config.latent_mean_anchor_weight)
         grad = torch.nan_to_num(grad)
-        
+
         target = (tgt_x0 - grad).detach()
-        loss = 0.5 * F.mse_loss(tgt_x0, target, reduction=reduction) / batch_size 
-        
-        
+        loss = 0.5 * F.mse_loss(tgt_x0, target, reduction=reduction) / batch_size
+
         if self.use_wandb and step % self.config.log_step == 0:
+            _, pred_x0_tgt = self.compute_posterior_mean(noisy_tgt, eps_tgt, t, t_prev)
+            _, pred_x0_src = self.compute_posterior_mean(noisy_src, eps_src, t, t_prev)
             log_dc_debug_to_wandb(
                 step=step,
                 current_spot=current_spot,
                 t=t,
                 t_normalized=t_normalized,
                 eta_tag_current=eta_tag_current,
-                current_stg_scale=current_stg_scale if self.config.stg_enabled else 0.0,
-                current_edit_strength=current_edit_strength,
+                current_stg_scale=stg_scale,
+                current_edit_strength=edit_strength,
                 w_dds=w_DDS,
                 preserve_weight=preserve_weight,
-                eps_tgt=eps["tgt"],
-                eps_src=eps["src"],
+                eps_tgt=eps_tgt,
+                eps_src=eps_src,
                 eps_tgt_for_grad=eps_tgt_for_grad,
                 grad=grad,
-                pred_x0_tgt=self.decode_latent(pred_x0s["tgt"]),
-                pred_x0_src=self.decode_latent(pred_x0s["src"]),
-                grad_mask=grad_mask,
-                self_grad_mask=self_grad_mask,
-                cross_attention_mask=target_cross_attention_mask,
-                cross_attention_mask_weight_current=current_cross_attention_mask_weight,
+                pred_x0_tgt=self.decode_latent(pred_x0_tgt),
+                pred_x0_src=self.decode_latent(pred_x0_src),
                 tensor_to_pil_fn=tensor_to_pil,
                 resize_image_fn=resize_image,
-                internal_grad_mask=internal_grad_mask,
-                preservation_mask=preservation_mask,
-                stg_perturbation=stg_perturbation,
+                masks=masks,
+                stg_perturbation=stg_term,
                 source_blend_enabled=self.config.source_blend_localization_enabled,
-                self_mask_ema_beta=self.config.gradient_mask_ema_beta,
-                ca_veto_floor_addition=ca_veto_floor_addition,
+                self_mask_ema_beta=self.self_mask_ema_beta,
             )
-        
-        if return_dict:
-            dic = {
-                "loss": loss,
-                "grad": grad,
-                "t": t,
-                "grad_mask": grad_mask,
-                "internal_grad_mask": internal_grad_mask,
-                "preservation_mask": preservation_mask,
-                "self_grad_mask": self_grad_mask,
-                "self_grad_mask_raw": self_grad_mask_raw,
-                "cross_attention_mask": target_cross_attention_mask,
-                "cross_attention_mask_weight": current_cross_attention_mask_weight,
-                "edit_strength": current_edit_strength,
-                "stg_scale": current_stg_scale if self.config.stg_enabled else 0.0,
-            }
-            return dic
-        else:
+
+        if not return_dict:
             return loss
+        return {
+            "loss": loss,
+            "grad": grad,
+            "t": t,
+            "grad_mask": edit_mask,
+            "internal_grad_mask": masks.internal if masks is not None else None,
+            "preservation_mask": preservation_mask,
+            "self_grad_mask": masks.self_mask if masks is not None else None,
+            "self_grad_mask_raw": masks.self_mask_raw if masks is not None else None,
+            "cross_attention_mask": masks.ca_mask if masks is not None else None,
+            "edit_strength": edit_strength,
+            "stg_scale": stg_scale,
+        }
 
     def run_sdedit(self, x0, tgt_prompt=None, num_inference_steps=20, skip=7, eta=0):
         scheduler = self.scheduler
@@ -895,10 +791,10 @@ def tensor_to_pil(img):
     if img.ndim == 4:
         img = img[0]
     img = img.cpu().permute(1, 2, 0).detach().numpy()
-    
+
     if img.shape[-1] == 1:
         img = img.squeeze(-1)
-    
+
     img = (img * 255).astype(np.uint8)
     img = Image.fromarray(img)
     return img

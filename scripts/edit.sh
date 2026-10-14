@@ -82,53 +82,33 @@ voxel = module.VOXEL_CACHE_PARAMS
 dc = module.DC_CUSTOM_PARAMS
 enabled = 1 if voxel.get("mask_voxel_cache_enabled") else 0
 ca_enabled = 1 if dc.get("cross_attention_mask_enabled") else 0
+localization = (
+    dc.get("source_blend_localization_enabled")
+    or dc.get("outside_mask_anchor_weight", 0.0) > 0
+    or ca_enabled
+)
+branch = "\u251c\u2500"
+last = "\u2514\u2500"
+arrow = "\u2192"
 
-print(f" Self mask: {dc.get('gradient_mask_source', 'dds')}")
-if dc.get("gradient_mask_ema_beta_auto", False):
-    mode = dc.get("gradient_mask_ema_mode", "legacy_camera")
-    if mode == "per_view":
-        print(f" Self EMA:  per_view, memory={dc['gradient_mask_ema_memory_visits']} updates/view")
-    else:
-        print(f" Self EMA:  legacy_camera, factor={dc['gradient_mask_ema_beta_camera_factor']}")
-else:
-    print(f" Self EMA:  manual beta={dc['gradient_mask_ema_beta']}")
-print(f" Anchor:    {dc.get('outside_mask_anchor_mask_source', 'final')} mask")
-print(f" Cache CA:  {dc.get('external_mask_ca_gate_weight', 0.0)}")
-if (
-    dc.get('gradient_mask_source') == 'source_instruction'
-    or dc.get('outside_mask_anchor_mask_source') == 'source'
-    or dc.get('cross_attention_mask_veto_floor', 0.0) > 0
-):
+print(f" TAG / STG: eta={dc['eta_tag']} (adaptive, target only), stg={dc['stg_scale']}")
+print(f" Localize:  {1 if localization else 0}")
+if localization:
     print(
-        f" Source mask: t_ratio={dc['localization_source_timestep_ratio']}, "
+        f"   {branch} S:          target instruction, "
+        f"per-view EMA memory={dc['gradient_mask_ema_memory_visits']} visits"
+    )
+    print(
+        f"   {branch} S_src:      t_ratio={dc['localization_source_timestep_ratio']}, "
         f"samples={dc['localization_source_num_samples']}, seed={dc['localization_source_seed']}"
     )
-print(f" CA mask:   {ca_enabled}")
-if ca_enabled:
-    branch = "\u251c\u2500"
-    last = "\u2514\u2500"
-    arrow = "\u2192"
-    print(f"   {branch} gamma:      {dc['cross_attention_mask_gamma']}")
-    print(
-        f"   {branch} schedule:   "
-        f"reverse_tag {dc.get('cross_attention_mask_weight_min', 0.0)}{arrow}1 "
-        f"(power={dc['cross_attention_mask_weight_schedule_power']})"
-    )
-    veto_floor = dc.get('cross_attention_mask_veto_floor', 0.0)
-    if veto_floor > 0:
-        print(
-            f"   {last} veto floor: {veto_floor} "
-            f"({dc.get('cross_attention_mask_veto_floor_mask', 'agreement')})"
-        )
-    else:
-        print(f"   {last} veto floor: off")
+    print(f"   {branch} A (CA):     {ca_enabled} (layers={dc['cross_attention_mask_layers']})")
+    print(f"   {branch} M:          max(S*A, min(S, S_src)), source blend={int(dc['source_blend_localization_enabled'])}")
+    print(f"   {last} anchors:    outside S_src w={dc['outside_mask_anchor_weight']}, latent mean={dc['latent_mean_anchor_weight']}")
 print(f" Voxel 3D:  {enabled}")
 if enabled:
-    branch = "\u251c\u2500"
-    last = "\u2514\u2500"
-    arrow = "\u2192"
     print(f"   {branch} res:        {voxel['mask_voxel_cache_resolution']}")
-    factor = voxel.get("mask_voxel_cache_ema_beta_camera_factor", 2.0)
+    factor = voxel["mask_voxel_cache_ema_beta_camera_factor"]
     print(f"   {branch} ema:        auto 1-1/({factor}*Ncam)")
     print(
         f"   {branch} bbox:       observed "
@@ -141,14 +121,11 @@ if enabled:
         f"[{voxel['mask_voxel_cache_min_observations_floor']},"
         f"{voxel['mask_voxel_cache_min_observations_cap']}]"
     )
-    vdecay = voxel.get('mask_voxel_cache_variance_decay', 0.0)
-    var_mode = f"EW(a={vdecay})" if vdecay and vdecay > 0.0 else "Welford"
-    cv_read = "trilin" if voxel.get('mask_voxel_cache_cv_trilinear') else "nearest"
-    var_mode = f"{var_mode}, cv={cv_read}"
     print(
         f"   {branch} trust:      "
         f"obs>={obs}, "
-        f"var<={voxel['mask_voxel_cache_max_variance']} [{var_mode}]"
+        f"var<={voxel['mask_voxel_cache_max_variance']} "
+        f"[EW(a={voxel['mask_voxel_cache_variance_decay']}), trilinear]"
     )
     print(
         f"   {branch} blend:      "
@@ -157,11 +134,8 @@ if enabled:
         f"{voxel['mask_voxel_cache_warmup_end']})"
     )
     print(f"   {branch} ang gate:   on (linear, scene-relative)")
-    mass_t = voxel.get('mask_voxel_cache_mass_threshold', 0.0)
-    if mass_t > 0.0:
-        print(f"   {last} mass gate:  threshold={mass_t}")
-    else:
-        print(f"   {last} mass gate:  off")
+    print(f"   {branch} mass gate:  threshold={voxel['mask_voxel_cache_mass_threshold']}")
+    print(f"   {last} cache gate: max(A, S) * A (positive-only fusion)")
 PY
 }
 

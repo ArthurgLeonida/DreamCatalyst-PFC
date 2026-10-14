@@ -1,41 +1,38 @@
+"""Stateless guidance formulas used by ``DC.__call__``, one per function.
+
+    compute_tag_eta            adaptive TAG strength for the current timestep
+    apply_tag                  tangential amplification of a noise prediction
+    compute_stg_scale          bump-scheduled STG scale, attenuated by (1 - s)
+    compute_edit_strength      scalar edit strength s in [0, 1]
+    apply_source_blend         restrict the DDS delta to a mask
+    compute_preserve_weight    DreamCatalyst psi plus the outside-mask anchor
+    apply_latent_mean_anchor   pull per-channel latent means toward the source
+    compute_cache_gate         semantic gate for voxel-cache additions
+"""
+
 import math
 from typing import Optional
 
 import torch
 
 
-def compute_tag_eta(eta_tag: float, t_normalized: float, adaptive_tag: bool) -> float:
-    """Return the TAG eta for the current timestep."""
-    if not adaptive_tag:
-        return eta_tag
-    return 1.0 + (eta_tag - 1.0) * t_normalized ** (1 / math.e)
+def compute_tag_eta(eta_max: float, t_normalized: float) -> float:
+    """Adaptive TAG strength: eta(t) = 1 + (eta_max - 1) * t^(1/e).
 
-
-def compute_ca_mask_weight(
-    t_normalized: float,
-    min_step_ratio: float,
-    max_step_ratio: float,
-    schedule_power: float,
-    min_weight: float = 0.0,
-) -> float:
-    """Return the Cross-Attention mask weight for the current timestep.
-
-    w_CA(t) = min_weight + (1-min_weight)*progress^(schedule_power · e).
-    Default 0 reproduces the old schedule; 1 applies full CA from the start.
+    Strongest at high noise and relaxing toward the identity (eta = 1) as the
+    timestep anneals. The 1/e exponent is the one in DreamCatalyst's w_DDS, so
+    the two decay together. eta_max = 1 disables TAG.
     """
-    min_t = min(max(float(min_step_ratio), 0.0), 1.0)
-    max_t = min(max(float(max_step_ratio), min_t + 1e-8), 1.0)
-    t = min(max(float(t_normalized), min_t), max_t)
-    progress = (max_t - t) / max(max_t - min_t, 1e-8)
-    exponent = max(float(schedule_power), 1e-8) * math.e
-    scheduled = progress ** exponent
-    if min_weight == 0.0:
-        return scheduled
-    return min_weight + (1.0 - min_weight) * scheduled
+    return 1.0 + (eta_max - 1.0) * t_normalized ** (1 / math.e)
 
 
 def apply_tag(noise_pred: torch.Tensor, latents_noisy: torch.Tensor, eta: float) -> torch.Tensor:
-    """Apply tangential amplification around the noisy latent direction."""
+    """Tangential Amplifying Guidance (TAG).
+
+    Splits the prediction into its component along the noisy latent (radial)
+    and the rest (tangential), and scales only the tangential part by eta.
+    eta = 1 returns the prediction unchanged.
+    """
     if eta == 1.0:
         return noise_pred
 
@@ -43,20 +40,6 @@ def apply_tag(noise_pred: torch.Tensor, latents_noisy: torch.Tensor, eta: float)
     noise_parallel = (noise_pred * v).sum(dim=(1, 2, 3), keepdim=True) * v
     noise_tangential = noise_pred - noise_parallel
     return noise_parallel + eta * noise_tangential
-
-
-def apply_source_blend(
-    eps_tgt: torch.Tensor,
-    eps_src: torch.Tensor,
-    mask: torch.Tensor,
-) -> torch.Tensor:
-    """Localize DDS by falling back to the source branch outside the mask.
-
-    Hard gate ``eps_src + M·(eps_tgt − eps_src)``: inside the mask the target
-    prediction wins, outside it the source prediction wins, so the DDS delta
-    is exactly zero where M = 0.
-    """
-    return eps_src + mask * (eps_tgt - eps_src)
 
 
 def compute_stg_scale(
@@ -67,19 +50,15 @@ def compute_stg_scale(
     start_ratio: float,
     end_ratio: float,
     bump_peak_ratio: float,
-    current_edit_strength: Optional[float],
+    current_edit_strength: float,
 ) -> float:
-    """Return the bump-scheduled STG scale, attenuated by current edit strength.
+    """STG scale for this iteration: a triangular bump times (1 - s).
 
-    The scale follows a triangular bump over training progress: zero outside
-    [start_ratio, end_ratio], rising linearly to `base_scale` at the peak and
-    falling back to zero before the end (the final stretch of training runs
-    without STG so views can converge coherently).
-
-    `current_edit_strength` is the ratio `||eps_tgt − eps_src|| / (||eps_tgt|| + ||eps_src||)`
-    in [0, 1] — high for creative/structural edits, low for identity-preserving
-    edits. The scale is multiplied by `(1 − edit_strength)` so bold edits
-    attenuate STG more.
+    Over training progress p = iteration / max_iteration the scale is zero
+    outside [start_ratio, end_ratio], rises linearly to ``base_scale`` at
+    start + bump_peak_ratio * (end - start), and falls back to zero at
+    end_ratio, so the last stretch of training runs without STG. The result is
+    multiplied by (1 - s): bold edits (high edit strength s) get less STG.
     """
     max_iteration = max(int(max_iteration), 1)
     progress = min(max(iteration / max_iteration, 0.0), 1.0)
@@ -98,38 +77,18 @@ def compute_stg_scale(
             span = max(end_ratio - peak_time, 1e-8)
             scale = float(base_scale) * (end_ratio - progress) / span
 
-    if current_edit_strength is not None:
-        s = min(max(float(current_edit_strength), 0.0), 1.0)
-        scale = scale * (1.0 - s)
-
-    return scale
+    s = min(max(float(current_edit_strength), 0.0), 1.0)
+    return scale * (1.0 - s)
 
 
 def compute_edit_strength(eps_tgt: torch.Tensor, eps_src: torch.Tensor) -> float:
-    """Return edit strength ∈ [0, 1] from the raw target/source noise predictions.
+    """Edit strength s = ||eps_tgt - eps_src|| / (||eps_tgt|| + ||eps_src||) in [0, 1].
 
-        s = ||eps_tgt − eps_src|| / (||eps_tgt|| + ||eps_src||)
-
-    Bounded in [0, 1] by the triangle inequality. Time-invariant: numerator
-    and denominator scale together with the noise-prediction magnitude at the
-    current timestep, so the ratio cancels timestep effects.
-
-    Physically: "how much the target's noise prediction diverges from the
-    source's, relative to their combined magnitude." Low for identity-preserving
-    edits (e.g. face / elf — target mostly agrees with source); high for
-    structural edits (e.g. person → stormtrooper — target pulls the latent to a
-    different rendering).
-
-    Motivation over mask-based coverage: both the self-mask and the
-    cross-attention mask are percentile-normalized in `normalize_relevance_map`,
-    which forces their magnitudes into a narrow band across scenes. Neither raw
-    mean nor the Herfindahl-inverse shape statistic discriminates scene types
-    robustly in the direction the adaptation needs. `eps_tgt − eps_src` is the
-    raw DDS delta before any mask is built — the clean scene-level signal.
-
-    Used by the adaptive STG scale and outside-mask anchor weight as
-    `multiplier = (1 − s)`: identity edits keep STG/anchor near full strength;
-    structural edits attenuate both.
+    Bounded by the triangle inequality. Computed from the raw IP2P predictions
+    (before TAG/STG), so it measures how strongly the target branch disagrees
+    with the source branch, relative to their magnitudes: low for
+    identity-preserving edits (elf), high for structural ones (stormtrooper).
+    Used as (1 - s) to attenuate STG and the outside-mask anchor.
     """
     delta = (eps_tgt - eps_src).detach().float()
     tgt = eps_tgt.detach().float()
@@ -139,32 +98,38 @@ def compute_edit_strength(eps_tgt: torch.Tensor, eps_src: torch.Tensor) -> float
     return float((delta_norm / denom).mean().item())
 
 
+def apply_source_blend(
+    eps_tgt: torch.Tensor,
+    eps_src: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Source-blended localization: eps_src + M * (eps_tgt - eps_src).
+
+    The DDS delta (eps_tgt - eps_src) survives only where the mask is high and
+    is exactly zero where M = 0. It masks the edit force only; the
+    preservation term of the gradient is not masked.
+    """
+    return eps_src + mask * (eps_tgt - eps_src)
+
+
 def compute_preserve_weight(
     *,
     psi: float,
-    grad_mask: Optional[torch.Tensor],
+    preservation_mask: Optional[torch.Tensor],
     outside_mask_anchor_weight: float,
-    outside_mask_anchor_edit_strength_adaptive: bool,
-    edit_strength: Optional[float] = None,
+    edit_strength: float,
 ):
-    """Compute DreamCatalyst preservation weight plus optional outside-mask anchor.
+    """Preservation weight: psi + w_out * (1 - s) * (1 - P).
 
-    `edit_strength` ∈ [0, 1] is the precomputed scalar from `compute_edit_strength`.
-    When the adaptive flag is on, the anchor weight is attenuated linearly by
-    `(1 − edit_strength)`: structural edits (high s) loosen the background
-    anchor so it does not block the edit; identity edits keep it at full
-    strength — no per-scene tuning.
+    psi is DreamCatalyst's global weight. The outside-mask anchor adds w_out
+    where the preservation mask P (the source-instruction mask) says the edit
+    does not belong, attenuated by (1 - s) so structural edits are held less
+    tightly. Returns the scalar psi when there is no mask or w_out = 0.
     """
-    preserve_weight = psi
-
-    if grad_mask is not None and outside_mask_anchor_weight > 0:
-        w_out_effective = outside_mask_anchor_weight
-        if outside_mask_anchor_edit_strength_adaptive and edit_strength is not None:
-            s = min(max(float(edit_strength), 0.0), 1.0)
-            w_out_effective = w_out_effective * (1.0 - s)
-        preserve_weight = preserve_weight + w_out_effective * (1.0 - grad_mask)
-
-    return preserve_weight
+    if preservation_mask is None or outside_mask_anchor_weight <= 0:
+        return psi
+    s = min(max(float(edit_strength), 0.0), 1.0)
+    return psi + outside_mask_anchor_weight * (1.0 - s) * (1.0 - preservation_mask)
 
 
 def apply_latent_mean_anchor(
@@ -173,7 +138,11 @@ def apply_latent_mean_anchor(
     src_x0: torch.Tensor,
     weight: float,
 ) -> torch.Tensor:
-    """Pull per-channel spatial means of edited latent toward source latent."""
+    """Add weight * (mean(tgt) - mean(src)) per channel to the gradient.
+
+    Pulls the per-channel spatial mean of the edited latent toward the
+    source's, countering the brightness/saturation drift of TAG.
+    """
     if weight <= 0:
         return grad
     tgt_mean = tgt_x0.mean(dim=(2, 3), keepdim=True)
@@ -181,21 +150,17 @@ def apply_latent_mean_anchor(
     return grad + weight * (tgt_mean - src_mean).expand_as(grad)
 
 
-def compute_gate_signal(
-    target_ca: Optional[torch.Tensor],
-    sm: Optional[torch.Tensor],
-    ca_gate_weight: float = 0.0,
-) -> Optional[torch.Tensor]:
-    """Legacy max gate, optionally attenuated where CA support is absent.
+def compute_cache_gate(
+    ca_mask: Optional[torch.Tensor],
+    self_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Semantic gate for voxel-cache additions: G = max(A, S) * A.
 
-    Positive additions only: this never subtracts from the internal mask.
-    Missing CA maps count as zero evidence for the optional CA requirement.
+    The cache may only add support where the current view confirms it, and the
+    cross-attention mask A must be part of that confirmation: the self-mask S
+    alone cannot authorize an addition, because the cache is built from S.
+    Without an attention map the gate is zero (no additions).
     """
-    if sm is not None and target_ca is not None:
-        gate = torch.maximum(target_ca, sm).clamp(0.0, 1.0)
-    else:
-        gate = target_ca if target_ca is not None else sm
-    if ca_gate_weight == 0.0 or gate is None:
-        return gate
-    ca = target_ca if target_ca is not None else torch.zeros_like(gate)
-    return gate * ((1.0 - ca_gate_weight) + ca_gate_weight * ca)
+    if ca_mask is None:
+        return torch.zeros_like(self_mask)
+    return torch.maximum(ca_mask, self_mask).clamp(0.0, 1.0) * ca_mask

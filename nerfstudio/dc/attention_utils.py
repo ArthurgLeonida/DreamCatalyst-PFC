@@ -1,17 +1,29 @@
+"""Attention hooks for the two extra UNet passes.
+
+STG: re-run the UNet with the self-attention of selected up-blocks replaced by
+     the identity (``STGIdentityValueAttnProcessor``) to get a "weak"
+     prediction; STG extrapolates away from it.
+CA:  run the target UNet pass while recording the cross-attention maps of the
+     edit tokens (``CrossAttentionCaptureProcessor``) to build the semantic
+     mask A.
+
+Both swap diffusers attention processors inside ``_swapped_processors``, which
+always restores the originals.
+"""
+
 import math
+from contextlib import contextmanager
 from typing import Callable, List, Optional, Tuple
 
 import torch
 
 
 class STGIdentityValueAttnProcessor:
-    """Paper-faithful STG-A processor.
+    """Self-attention with the attention matrix replaced by the identity (STG-A).
 
-    The STG paper describes attention skip by replacing the attention matrix
-    A with the identity I so that SA'(Q, K, V) = IV = V. This processor
-    implements that directly in diffusers' attention path by skipping the
-    query/key attention-score computation while preserving the value and output
-    projections.
+    The STG paper skips attention by setting A = I, so SA(Q, K, V) = V. This
+    processor skips the query/key scores and keeps the value and output
+    projections, which is exactly that.
     """
 
     def __call__(
@@ -42,6 +54,7 @@ class STGIdentityValueAttnProcessor:
         elif getattr(attn, "norm_cross", False):
             encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
 
+        # A = I: the output is the projected values themselves.
         value = attn.to_v(encoder_hidden_states)
         value = attn.head_to_batch_dim(value)
         hidden_states = attn.batch_to_head_dim(value)
@@ -60,7 +73,13 @@ class STGIdentityValueAttnProcessor:
 
 
 class CrossAttentionMapRecorder:
-    """Collect token-conditioned cross-attention maps from selected UNet layers."""
+    """Collect the cross-attention maps of selected text tokens.
+
+    For each recorded layer, averages the attention probabilities over the
+    chosen tokens and the heads, keeping only the first
+    ``conditioned_batch_size`` items (the text-conditioned part of the IP2P
+    batch), and stores one [B, 1, h, w] map.
+    """
 
     def __init__(
         self,
@@ -74,7 +93,12 @@ class CrossAttentionMapRecorder:
         self.maps: List[torch.Tensor] = []
 
     def _infer_spatial_shape(self, query_tokens: int) -> Optional[Tuple[int, int]]:
-        """Infer a non-square spatial shape using the latent aspect ratio."""
+        """Recover (h, w) from the number of query tokens.
+
+        diffusers hands the processor flattened [B, h*w, C] states, so the
+        layer's grid is the divisor pair of ``query_tokens`` whose aspect ratio
+        is closest to the latent's (both orientations, for portrait frames).
+        """
         if self.reference_spatial_shape is None:
             side = int(round(math.sqrt(query_tokens)))
             if side * side != query_tokens:
@@ -88,8 +112,6 @@ class CrossAttentionMapRecorder:
         target_ratio = ref_w / ref_h
         best_shape = None
         best_error = None
-
-        # Iterate over all divisor pairs in BOTH orientations so that portrait latents (ref_h > ref_w) are matchable.
         for divisor in range(1, int(math.sqrt(query_tokens)) + 1):
             if query_tokens % divisor != 0:
                 continue
@@ -99,7 +121,6 @@ class CrossAttentionMapRecorder:
                 if best_error is None or ratio_error < best_error:
                     best_error = ratio_error
                     best_shape = (h, w)
-
         return best_shape
 
     def record(
@@ -108,6 +129,7 @@ class CrossAttentionMapRecorder:
         num_heads: int,
         spatial_shape: Optional[Tuple[int, int]] = None,
     ) -> None:
+        """Store the token-averaged map of one attention call."""
         if not self.token_indices:
             return
 
@@ -137,7 +159,7 @@ class CrossAttentionMapRecorder:
 
 
 class CrossAttentionCaptureProcessor:
-    """Default attention processor plus token-map recording for cross-attention."""
+    """The default attention computation, plus a hand-off of the probabilities to a recorder."""
 
     def __init__(self, recorder: CrossAttentionMapRecorder):
         self.recorder = recorder
@@ -206,48 +228,49 @@ class CrossAttentionCaptureProcessor:
         return hidden_states
 
 
-def run_unet_with_skipped_attn(unet, device, skip_layers, latent_model_input, t, text_embeddings):
-    """Run UNet forward pass with STG-A attention skip in selected up_blocks."""
-    hooks = []
-    original_processors = []
-    stg_processor = STGIdentityValueAttnProcessor()
+def _up_block_attentions(unet, layer_indices: List[int], which: str) -> List[torch.nn.Module]:
+    """Attention modules of the given up-blocks: "attn1" (self) or "attn2" (cross).
 
-    def _zero_attn_branch_output(module, inputs, output):
-        return torch.zeros_like(output)
+    Out-of-range indices and blocks without attention (up_blocks[0] in SD 1.5)
+    are skipped.
+    """
+    modules = []
+    for layer_idx in layer_indices:
+        if layer_idx < 0 or layer_idx >= len(unet.up_blocks):
+            continue
+        for attn_module in getattr(unet.up_blocks[layer_idx], "attentions", []):
+            for transformer_block in attn_module.transformer_blocks:
+                modules.append(getattr(transformer_block, which))
+    return modules
 
+
+@contextmanager
+def _swapped_processors(attention_modules: List[torch.nn.Module], processor):
+    """Temporarily give every module in ``attention_modules`` the same processor."""
+    originals = [(attn, attn.processor) for attn in attention_modules]
     try:
-        for layer_idx in skip_layers:
-            block = unet.up_blocks[layer_idx]
-            if not hasattr(block, "attentions"):
-                continue
-            for attn_module in block.attentions:
-                for transformer_block in attn_module.transformer_blocks:
-                    attn = transformer_block.attn1
-                    if hasattr(attn, "processor"):
-                        original_processors.append((attn, attn.processor))
-                        if hasattr(attn, "set_processor"):
-                            attn.set_processor(stg_processor)
-                        else:
-                            attn.processor = stg_processor
-                    else:
-                        hook = attn.register_forward_hook(_zero_attn_branch_output)
-                        hooks.append(hook)
-
-        with torch.no_grad():
-            output = unet.forward(
-                latent_model_input,
-                torch.cat([t] * 3).to(device),
-                encoder_hidden_states=text_embeddings,
-            )
-        return output.sample
+        for attn, _ in originals:
+            attn.set_processor(processor)
+        yield
     finally:
-        for attn, processor in original_processors:
-            if hasattr(attn, "set_processor"):
-                attn.set_processor(processor)
-            else:
-                attn.processor = processor
-        for hook in hooks:
-            hook.remove()
+        for attn, original in originals:
+            attn.set_processor(original)
+
+
+def run_unet_with_skipped_attn(unet, device, skip_layers, latent_model_input, t, text_embeddings):
+    """STG weak pass: the UNet with self-attention skipped in ``skip_layers``.
+
+    ``latent_model_input`` and ``text_embeddings`` are the 3-way IP2P batch of
+    the regular target pass, so the weak prediction is combined the same way.
+    """
+    modules = _up_block_attentions(unet, skip_layers, "attn1")
+    with _swapped_processors(modules, STGIdentityValueAttnProcessor()), torch.no_grad():
+        output = unet.forward(
+            latent_model_input,
+            torch.cat([t] * 3).to(device),
+            encoder_hidden_states=text_embeddings,
+        )
+    return output.sample
 
 
 def run_unet_with_cross_attention_capture(
@@ -260,13 +283,15 @@ def run_unet_with_cross_attention_capture(
     conditioned_batch_size,
     build_attention_mask_fn: Callable[[List[torch.Tensor]], Optional[torch.Tensor]],
 ):
-    """Run the UNet once while recording target-token cross-attention maps."""
+    """One regular UNet pass that also records the edit tokens' cross-attention.
+
+    Returns (noise prediction, mask), where the mask is
+    ``build_attention_mask_fn`` applied to the recorded maps, or None when
+    there are no tokens to record. The prediction is identical to a plain
+    forward pass: the capture processor computes attention the default way.
+    """
     if not token_indices:
-        output = unet.forward(
-            latent_model_input,
-            t,
-            encoder_hidden_states=text_embeddings,
-        )
+        output = unet.forward(latent_model_input, t, encoder_hidden_states=text_embeddings)
         return output.sample, None
 
     recorder = CrossAttentionMapRecorder(
@@ -274,36 +299,7 @@ def run_unet_with_cross_attention_capture(
         conditioned_batch_size=conditioned_batch_size,
         reference_spatial_shape=latent_model_input.shape[-2:],
     )
-    capture_processor = CrossAttentionCaptureProcessor(recorder)
-    original_processors = []
-
-    try:
-        for layer_idx in cross_attention_layers:
-            if layer_idx < 0 or layer_idx >= len(unet.up_blocks):
-                continue
-            block = unet.up_blocks[layer_idx]
-            if not hasattr(block, "attentions"):
-                continue
-            for attn_module in block.attentions:
-                for transformer_block in attn_module.transformer_blocks:
-                    attn = transformer_block.attn2
-                    if hasattr(attn, "processor"):
-                        original_processors.append((attn, attn.processor))
-                        if hasattr(attn, "set_processor"):
-                            attn.set_processor(capture_processor)
-                        else:
-                            attn.processor = capture_processor
-
-        output = unet.forward(
-            latent_model_input,
-            t,
-            encoder_hidden_states=text_embeddings,
-        )
-        attention_mask = build_attention_mask_fn(recorder.maps)
-        return output.sample, attention_mask
-    finally:
-        for attn, processor in original_processors:
-            if hasattr(attn, "set_processor"):
-                attn.set_processor(processor)
-            else:
-                attn.processor = processor
+    modules = _up_block_attentions(unet, cross_attention_layers, "attn2")
+    with _swapped_processors(modules, CrossAttentionCaptureProcessor(recorder)):
+        output = unet.forward(latent_model_input, t, encoder_hidden_states=text_embeddings)
+    return output.sample, build_attention_mask_fn(recorder.maps)

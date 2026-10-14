@@ -1,5 +1,21 @@
+"""Step-3 editing pipeline: render one view, compute the DC loss, update the NeRF.
+
+Upstream DreamCatalyst structure (get_current_rendering, get_train_loss_dict,
+log_images, visualize_grad, get_outputs_for_camera_ray_bundle), plus the
+optional 3D voxel cache of Part 2, which shares the edit mask across views.
+With the cache enabled, every step:
+
+  1. backprojects the latent-resolution pixels of the view to 3D with the
+     rendered depth,
+  2. reads the cache at those points (DC's external mask),
+  3. runs DC,
+  4. writes this view's raw edit mask into the cache.
+
+The cache is built once ``mask_voxel_cache_bbox_observe_steps`` steps have
+observed the scene's surface points, on their bounding box.
+"""
+
 from collections import defaultdict
-import math
 from dataclasses import dataclass, field
 from typing import Optional, Type, Union
 
@@ -40,56 +56,27 @@ class DCPipelineConfig(VanillaPipelineConfig):
     change_view_step: int = 1
     log_step: int = 10
 
+    # 3D voxel cache (Part 2). Values come from method_config.VOXEL_CACHE_PARAMS;
+    # see the comments there and docs/VoxelCacheExplained.md.
     mask_voxel_cache_enabled: bool = VOXEL_CACHE_PARAMS["mask_voxel_cache_enabled"]
-    mask_voxel_cache_scale_normalize_quantile: float = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_scale_normalize_quantile", 0.95
-    )
     mask_voxel_cache_resolution: int = VOXEL_CACHE_PARAMS["mask_voxel_cache_resolution"]
-    mask_voxel_cache_ema_beta_camera_factor: float = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_ema_beta_camera_factor", 2.0
-    )
+    mask_voxel_cache_ema_beta_camera_factor: float = VOXEL_CACHE_PARAMS["mask_voxel_cache_ema_beta_camera_factor"]
     mask_voxel_cache_warmup_start: int = VOXEL_CACHE_PARAMS["mask_voxel_cache_warmup_start"]
     mask_voxel_cache_warmup_end: int = VOXEL_CACHE_PARAMS["mask_voxel_cache_warmup_end"]
     mask_voxel_cache_max_blend: float = VOXEL_CACHE_PARAMS["mask_voxel_cache_max_blend"]
-    mask_voxel_cache_accumulation_threshold: float = VOXEL_CACHE_PARAMS[
-        "mask_voxel_cache_accumulation_threshold"
-    ]
-    mask_voxel_cache_observation_fraction: float = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_observation_fraction", 0.05
-    )
-    mask_voxel_cache_min_observations_floor: int = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_min_observations_floor", 2
-    )
-    mask_voxel_cache_min_observations_cap: int = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_min_observations_cap", 8
-    )
-    mask_voxel_cache_max_variance: float = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_max_variance", 0.0
-    )
-    mask_voxel_cache_variance_decay: float = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_variance_decay", 0.0
-    )
-    mask_voxel_cache_cv_trilinear: bool = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_cv_trilinear", False
-    )
-    mask_voxel_cache_mass_threshold: float = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_mass_threshold", 0.0
-    )
-    mask_voxel_cache_angular_freeze_patience: int = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_angular_freeze_patience", 100
-    )
-    mask_voxel_cache_angular_freeze_warmup: int = VOXEL_CACHE_PARAMS.get(
-        "mask_voxel_cache_angular_freeze_warmup", 50
-    )
-    mask_voxel_cache_bbox_observe_steps: int = VOXEL_CACHE_PARAMS[
-        "mask_voxel_cache_bbox_observe_steps"
-    ]
-    mask_voxel_cache_bbox_observe_quantile: float = VOXEL_CACHE_PARAMS[
-        "mask_voxel_cache_bbox_observe_quantile"
-    ]
-    mask_voxel_cache_bbox_inflation: float = VOXEL_CACHE_PARAMS[
-        "mask_voxel_cache_bbox_inflation"
-    ]
+    mask_voxel_cache_accumulation_threshold: float = VOXEL_CACHE_PARAMS["mask_voxel_cache_accumulation_threshold"]
+    mask_voxel_cache_observation_fraction: float = VOXEL_CACHE_PARAMS["mask_voxel_cache_observation_fraction"]
+    mask_voxel_cache_min_observations_floor: int = VOXEL_CACHE_PARAMS["mask_voxel_cache_min_observations_floor"]
+    mask_voxel_cache_min_observations_cap: int = VOXEL_CACHE_PARAMS["mask_voxel_cache_min_observations_cap"]
+    mask_voxel_cache_max_variance: float = VOXEL_CACHE_PARAMS["mask_voxel_cache_max_variance"]
+    mask_voxel_cache_variance_decay: float = VOXEL_CACHE_PARAMS["mask_voxel_cache_variance_decay"]
+    mask_voxel_cache_mass_threshold: float = VOXEL_CACHE_PARAMS["mask_voxel_cache_mass_threshold"]
+    mask_voxel_cache_scale_normalize_quantile: float = VOXEL_CACHE_PARAMS["mask_voxel_cache_scale_normalize_quantile"]
+    mask_voxel_cache_bbox_observe_steps: int = VOXEL_CACHE_PARAMS["mask_voxel_cache_bbox_observe_steps"]
+    mask_voxel_cache_bbox_observe_quantile: float = VOXEL_CACHE_PARAMS["mask_voxel_cache_bbox_observe_quantile"]
+    mask_voxel_cache_bbox_inflation: float = VOXEL_CACHE_PARAMS["mask_voxel_cache_bbox_inflation"]
+    mask_voxel_cache_angular_freeze_patience: int = VOXEL_CACHE_PARAMS["mask_voxel_cache_angular_freeze_patience"]
+    mask_voxel_cache_angular_freeze_warmup: int = VOXEL_CACHE_PARAMS["mask_voxel_cache_angular_freeze_warmup"]
 
 
 class DCPipeline(ModifiedVanillaPipeline):
@@ -113,45 +100,37 @@ class DCPipeline(ModifiedVanillaPipeline):
         )
         self.config.dc.device = self.dc_device
         self.use_wandb = kwargs.get("wandb_enabled", False)
-        
+
         self.dc = DC(self.config.dc, use_wandb=self.use_wandb)
-        if getattr(self.config.dc, "gradient_mask_ema_beta_auto", False):
-            n_cameras = max(
-                1,
-                len(self.datamanager.train_dataparser_outputs.image_filenames),
-            )
-            factor = max(
-                float(self.config.dc.gradient_mask_ema_beta_camera_factor), 1e-6
-            )
-            if self.config.dc.gradient_mask_ema_mode == "per_view":
-                memory = self.config.dc.gradient_mask_ema_memory_visits
-                auto_beta = math.exp(-1.0 / memory)
-                ema_description = f"per_view, e-folding memory={memory} camera updates"
-            else:
-                auto_beta = 1.0 - 1.0 / (factor * float(n_cameras))
-                auto_beta = min(max(auto_beta, 0.0), 0.9999)
-                ema_description = f"legacy_camera, N_cam={n_cameras}, factor={factor}"
-            self.config.dc.gradient_mask_ema_beta = auto_beta
-            self.dc.config.gradient_mask_ema_beta = auto_beta
+        if self.config.dc.localization_enabled:
             print(
-                f"[self-mask] auto EMA beta = {auto_beta:.6f} "
-                f"({ema_description})"
+                f"[self-mask] per-view EMA beta = {self.dc.self_mask_ema_beta:.6f} "
+                f"(memory = {self.config.dc.gradient_mask_ema_memory_visits} visits of each view)"
             )
+        if self.config.mask_voxel_cache_enabled and not self.config.dc.cross_attention_mask_enabled:
+            raise ValueError(
+                "mask_voxel_cache_enabled requires cross_attention_mask_enabled: "
+                "cache additions are gated by the cross-attention mask"
+            )
+
         # Caching source's x0 and IP2P image-conditioning latent per view.
         self.src_x0s = dict()
         self.src_encodeds = dict()
         self.current_spot = None
 
+        # Voxel cache, built lazily once the bounding box has been observed.
         self.mask_voxel_cache: Optional[MaskVoxelCache] = None
         self.mask_voxel_cache_start_step: Optional[int] = None
-        self.mask_voxel_cache_effective_ema_beta: Optional[float] = None
-        self.mask_voxel_cache_effective_min_observations: Optional[int] = None
-
         self._observed_pts_min: Optional[torch.Tensor] = None
         self._observed_pts_max: Optional[torch.Tensor] = None
         self._observed_pts_count: int = 0
 
     def get_current_rendering(self, step):
+        """Render the current training view (a new random one every change_view_step).
+
+        Also returns the rendered depth and accumulation when the voxel cache
+        needs them to backproject pixels (else None).
+        """
         if getattr(self, "current_spot", None) is None or step % self.config.change_view_step == 0:
             self.current_spot = np.random.randint(len(self.datamanager.train_dataparser_outputs.image_filenames))
         current_spot = self.current_spot
@@ -162,7 +141,7 @@ class DCPipeline(ModifiedVanillaPipeline):
 
         depth_world = None
         accumulation_world = None
-        if self._voxel_cache_active():
+        if self.config.mask_voxel_cache_enabled:
             depth_t = camera_outputs.get("depth", None)
             if depth_t is not None:
                 depth_world = depth_t.detach().clone()  # [H, W, 1]
@@ -176,141 +155,121 @@ class DCPipeline(ModifiedVanillaPipeline):
 
         return rendered_image, current_spot, depth_world, accumulation_world
 
-    def _voxel_cache_active(self) -> bool:
-        """Whether the voxel cache is built, queried and updated this run."""
-        return bool(self.config.mask_voxel_cache_enabled)
+    # ------------------------------------------------------------------
+    # 3D voxel cache (Part 2)
+    # ------------------------------------------------------------------
 
-    def _scale_normalize_cache_mask(self, ext, valid):
-        """Contrast-stretch the queried voxel-cache mask to [0,1] over its
-        observed voxels before it is fused with the sharp 2D mask in DC.
+    def _num_train_views(self) -> int:
+        return max(1, len(self.datamanager.train_dataparser_outputs.image_filenames))
 
-        The cache value is a multi-view MEAN (compressed toward mid-range, with
-        a 0.5 fallback for under-observed voxels), while the 2D hybrid mask is a
-        sharp [0,1] indicator. DC's positive-only fusion differences the two
-        (``max(ext - grad_mask, 0)``); because the compressed cache sits below
-        the 2D peaks across the edit region, the support term would barely fire
-        where it should — a scale artifact, not real 3D disagreement. Rescaling
-        the cache's active range (its ``[1-q, q]`` percentiles over observed
-        voxels) to [0,1] makes the comparison like-for-like.
+    def _cache_edit_step(self, step: int) -> int:
+        """Zero-based step of the edit run.
 
-        Selection uses the observed/in-bounds mask (not confidence) so the low
-        end of the range captures background voxels; invalid/fallback pixels
-        carry zero confidence downstream, so their post-stretch value never
-        reaches the gradient.
+        The trainer step resumes from the reconstruction checkpoint (e.g.
+        30000), but the cache starts empty with the edit, so its warmup and
+        freeze schedules count from the first edit step.
         """
-        if valid is None:
-            return ext
-        sel = valid.reshape(-1).bool()
-        if int(sel.sum().item()) < 16:
-            return ext  # too few observed voxels to estimate a stable range
-        vals = ext.reshape(-1)[sel].float()
-        q = min(max(float(self.config.mask_voxel_cache_scale_normalize_quantile), 0.5), 0.999)
-        lo = torch.quantile(vals, 1.0 - q).to(ext.dtype)
-        hi = torch.quantile(vals, q).to(ext.dtype)
-        span = (hi - lo).clamp_min(1e-4)
-        return ((ext - lo) / span).clamp(0.0, 1.0)
+        if self.mask_voxel_cache_start_step is None:
+            self.mask_voxel_cache_start_step = int(step)
+        return max(0, int(step) - self.mask_voxel_cache_start_step)
 
-    def _ensure_voxel_cache(self):
-        """Lazy-initialize the voxel cache from the observed bounding box.
+    def _cache_warmup_blend(self, edit_step: int) -> float:
+        """Fusion strength: a linear ramp from 0 to max_blend over [warmup_start, warmup_end].
 
-        The bbox comes from the backprojected world points accumulated by
-        `_observe_points` during the first `bbox_observe_steps` iterations
-        (quantile-clipped against far-depth outliers, then inflated). By
-        construction it contains exactly the surface points the cache will
-        index — camera-position AABBs or dataparser scene boxes can sit in a
-        different frame and leave most backprojected points out of bounds.
-        The chosen bbox is printed once at init so it can be eyeballed
-        against the camera positions and depth statistics in WandB.
+        The cache only starts to act once it has accumulated multi-view evidence.
         """
-        if self.mask_voxel_cache is not None:
-            return
-        if not self._voxel_cache_active():
-            return
-        if self._observed_pts_min is None or self._observed_pts_max is None:
-            return
+        start = self.config.mask_voxel_cache_warmup_start
+        end = self.config.mask_voxel_cache_warmup_end
+        if end <= start:
+            return float(self.config.mask_voxel_cache_max_blend)
+        progress = max(0, edit_step - start) / max(1, end - start)
+        progress = min(max(progress, 0.0), 1.0)
+        return float(progress * self.config.mask_voxel_cache_max_blend)
 
-        inflation = float(self.config.mask_voxel_cache_bbox_inflation)
-        bbox_min = self._observed_pts_min.clone()
-        bbox_max = self._observed_pts_max.clone()
-
-        center = 0.5 * (bbox_min + bbox_max)
-        half_extent = 0.5 * (bbox_max - bbox_min) * (1.0 + inflation)
-        bbox_min = center - half_extent
-        bbox_max = center + half_extent
-
-        ema_beta = self._effective_voxel_cache_ema_beta()
-        self.mask_voxel_cache_effective_ema_beta = ema_beta
-
-        print(
-            f"[voxel cache] observed bbox, inflation={inflation:.2f}, "
-            f"resolution={self.config.mask_voxel_cache_resolution}, "
-            f"ema_beta={ema_beta:.6f}"
-        )
-        print(f"[voxel cache] bbox_min = {bbox_min.tolist()}")
-        print(f"[voxel cache] bbox_max = {bbox_max.tolist()}")
-        print(f"[voxel cache] extent   = {(bbox_max - bbox_min).tolist()}")
-        n_views = len(self.datamanager.train_dataparser_outputs.image_filenames)
-
-        self.mask_voxel_cache = MaskVoxelCache(
-            bbox_min=bbox_min,
-            bbox_max=bbox_max,
-            resolution=self.config.mask_voxel_cache_resolution,
-            ema_beta=ema_beta,
-            num_views=n_views,
-            variance_decay=float(self.config.mask_voxel_cache_variance_decay),
-            cv_trilinear=bool(self.config.mask_voxel_cache_cv_trilinear),
-            device=self.device,
-        )
-
-    def _effective_voxel_cache_ema_beta(self) -> float:
-        """Camera-count-aware voxel-cache EMA beta: 1 − 1/(factor · N_cam)."""
-        n_cameras = max(
-            1,
-            len(self.datamanager.train_dataparser_outputs.image_filenames),
-        )
+    def _cache_ema_beta(self) -> float:
+        """Decay of the grid mean, from the camera count: 1 - 1 / (factor * N_cam)."""
         factor = max(float(self.config.mask_voxel_cache_ema_beta_camera_factor), 1e-6)
-        beta = 1.0 - 1.0 / (factor * float(n_cameras))
+        beta = 1.0 - 1.0 / (factor * float(self._num_train_views()))
         return min(max(beta, 0.0), 0.9999)
 
-    def _effective_voxel_cache_min_observations(self) -> int:
-        """Camera-count-aware trust threshold: clamp(ceil(fraction · N_cam), floor, cap)."""
-        n_cameras = max(
-            1,
-            len(self.datamanager.train_dataparser_outputs.image_filenames),
-        )
+    def _cache_min_observations(self) -> int:
+        """Count gate: clamp(ceil(fraction * N_cam), floor, cap) unique views."""
         fraction = min(max(float(self.config.mask_voxel_cache_observation_fraction), 0.0), 1.0)
         floor = max(int(self.config.mask_voxel_cache_min_observations_floor), 1)
         cap = max(int(self.config.mask_voxel_cache_min_observations_cap), floor)
-        threshold = int(np.ceil(float(n_cameras) * fraction))
+        threshold = int(np.ceil(float(self._num_train_views()) * fraction))
         return min(max(threshold, floor), cap)
 
-    def _observe_points(self, points_world: torch.Tensor, valid: torch.Tensor) -> None:
-        """Accumulate robust per-axis bounds of valid backprojected world points.
+    def _backproject_view(self, current_spot, depth_world, accumulation_world, mask_shape):
+        """World points seen by each latent-resolution pixel of the current view.
 
-        Called during the bbox-observation window (while the cache hasn't been
-        built yet). Once enough iterations have been observed,
-        `_ensure_voxel_cache()` picks up these accumulated bounds.
+        Rays are generated directly at the latent resolution (the centers of the
+        coarse pixels) and followed to the rendered depth: x = o + D * d. A
+        point is valid only if its ray hits a surface: accumulation above the
+        threshold, finite and positive depth.
 
-        Per-iteration robustification:
-          - With `bbox_observe_quantile = 0` we take the literal per-axis
-            min/max for each iteration (sensitive to far-depth outliers).
-          - With `bbox_observe_quantile = q ∈ (0, 0.5)` we take the (q, 1-q)
-            quantile per iteration, which clips long-tail outliers from
-            low-confidence rays while preserving the legitimate surface
-            extent. Across iterations we accumulate the cross-iteration
-            min(of-low-quantile) and max(of-high-quantile), giving a bbox
-            that tightly fits the union of well-supported surface regions.
+        Returns (points [N, 3], directions [N, 3], valid [N], accumulation [1, 1, h, w]).
         """
-        valid = valid.reshape(-1).to(self.device)
-        pts = points_world.reshape(-1, 3).to(self.device).float()
-        pts = pts[valid]
-        # Drop any non-finite rows (NaN/inf depths produce inf points).
+        mask_h, mask_w = mask_shape
+        H_cam, W_cam = int(depth_world.shape[0]), int(depth_world.shape[1])
+        current_index = self.datamanager.image_batch["image_idx"][current_spot]
+        current_camera = self.datamanager.train_dataparser_outputs.cameras[
+            current_index:current_index + 1
+        ].to(self.device)
+        # Latent pixel centers in camera pixels; nerfstudio coords are (y, x).
+        yy = (torch.arange(mask_h, device=self.device, dtype=torch.float32) + 0.5) * (H_cam / mask_h)
+        xx = (torch.arange(mask_w, device=self.device, dtype=torch.float32) + 0.5) * (W_cam / mask_w)
+        grid_y, grid_x = torch.meshgrid(yy, xx, indexing="ij")
+        coords = torch.stack([grid_y, grid_x], dim=-1)  # [mask_h, mask_w, 2]
+        rays = current_camera.generate_rays(camera_indices=0, coords=coords, keep_shape=True)
+        origins = rays.origins.detach()  # [mask_h, mask_w, 3]
+        directions = rays.directions.detach()  # [mask_h, mask_w, 3]
+        del current_camera, rays
+
+        depth = depth_world.to(self.dc_device)
+        if depth.dim() == 2:
+            depth = depth.unsqueeze(-1)
+        depth = depth.permute(2, 0, 1).unsqueeze(0).float()  # [1, 1, H, W]
+        if accumulation_world is None:
+            accumulation = torch.ones_like(depth)
+        else:
+            accumulation = accumulation_world.to(self.dc_device)
+            if accumulation.dim() == 2:
+                accumulation = accumulation.unsqueeze(-1)
+            accumulation = accumulation.permute(2, 0, 1).unsqueeze(0).float()
+        depth = F.interpolate(depth, size=(mask_h, mask_w), mode="bilinear", align_corners=False)
+        accumulation = F.interpolate(accumulation, size=(mask_h, mask_w), mode="bilinear", align_corners=False)
+
+        origins = origins.permute(2, 0, 1).unsqueeze(0).to(self.dc_device).float()
+        directions = directions.permute(2, 0, 1).unsqueeze(0).to(self.dc_device).float()
+        points = origins + depth * directions  # [1, 3, mask_h, mask_w]
+        valid = (
+            (accumulation > float(self.config.mask_voxel_cache_accumulation_threshold))
+            & torch.isfinite(depth)
+            & (depth > 0.0)
+        ).reshape(-1)
+        return (
+            points.permute(0, 2, 3, 1).reshape(-1, 3),
+            directions.permute(0, 2, 3, 1).reshape(-1, 3),
+            valid,
+            accumulation,
+        )
+
+    def _observe_bbox(self, points: torch.Tensor, valid: torch.Tensor) -> None:
+        """Grow the observed bounding box with this view's valid surface points.
+
+        Per view, the (q, 1 - q) quantiles of each axis clip far-depth outliers
+        from low-confidence rays (q = 0 takes the plain min/max). The box is
+        the union of those per-view ranges.
+        """
+        pts = points.reshape(-1, 3).to(self.device).float()
+        pts = pts[valid.reshape(-1).to(self.device)]
+        # Drop non-finite rows (infinite depths give infinite points).
         pts = pts[torch.isfinite(pts).all(dim=-1)]
         if pts.numel() == 0:
             return
 
-        q = float(self.config.mask_voxel_cache_bbox_observe_quantile)
-        q = min(max(q, 0.0), 0.49)
+        q = min(max(float(self.config.mask_voxel_cache_bbox_observe_quantile), 0.0), 0.49)
         if q <= 0.0:
             cur_min = pts.min(dim=0).values
             cur_max = pts.max(dim=0).values
@@ -325,42 +284,138 @@ class DCPipeline(ModifiedVanillaPipeline):
             self._observed_pts_max = torch.maximum(self._observed_pts_max, cur_max)
         self._observed_pts_count += 1
 
-    def _voxel_cache_edit_step(self, step: int) -> int:
-        """Return a zero-based edit-local step.
+    def _build_voxel_cache(self) -> None:
+        """Create the cache on the observed box, inflated by mask_voxel_cache_bbox_inflation.
 
-        Nerfstudio's trainer step can resume from the reconstruction checkpoint
-        step (for example 30000), but the voxel cache starts empty at the
-        beginning of the edit run. Warmup must therefore use edit-local time,
-        not the global trainer step.
+        The observed box contains exactly the surface points the cache will
+        index; boxes from camera positions or the dataparser can sit in another
+        frame and leave most points out. The box is printed once so it can be
+        checked against the camera positions.
         """
-        if self.mask_voxel_cache_start_step is None:
-            self.mask_voxel_cache_start_step = int(step)
-        return max(0, int(step) - self.mask_voxel_cache_start_step)
+        if self._observed_pts_min is None or self._observed_pts_max is None:
+            return
 
-    def _voxel_cache_warmup_blend(self, edit_step: int) -> float:
-        """Linear ramp from 0 → max_blend over [warmup_start, warmup_end].
+        inflation = float(self.config.mask_voxel_cache_bbox_inflation)
+        center = 0.5 * (self._observed_pts_min + self._observed_pts_max)
+        half_extent = 0.5 * (self._observed_pts_max - self._observed_pts_min) * (1.0 + inflation)
+        bbox_min = center - half_extent
+        bbox_max = center + half_extent
+        ema_beta = self._cache_ema_beta()
 
-        The cache starts empty, so its influence on the final mask ramps in
-        only after it has accumulated multi-view evidence.
+        print(
+            f"[voxel cache] observed bbox, inflation={inflation:.2f}, "
+            f"resolution={self.config.mask_voxel_cache_resolution}, "
+            f"ema_beta={ema_beta:.6f}"
+        )
+        print(f"[voxel cache] bbox_min = {bbox_min.tolist()}")
+        print(f"[voxel cache] bbox_max = {bbox_max.tolist()}")
+        print(f"[voxel cache] extent   = {(bbox_max - bbox_min).tolist()}")
+
+        self.mask_voxel_cache = MaskVoxelCache(
+            bbox_min=bbox_min,
+            bbox_max=bbox_max,
+            resolution=self.config.mask_voxel_cache_resolution,
+            ema_beta=ema_beta,
+            num_views=self._num_train_views(),
+            variance_decay=float(self.config.mask_voxel_cache_variance_decay),
+            device=self.device,
+        )
+
+    def _scale_normalize_cache_mask(self, cache_mask, valid):
+        """Stretch the cache read's [1 - q, q] quantile range over valid pixels to [0, 1].
+
+        The cache value is a multi-view mean, compressed toward mid-range, while
+        the 2D mask is a sharp near-indicator. Without the stretch the cache
+        reads below the 2D mask over the whole edit region and the
+        positive-only fusion never fires there. Invalid pixels carry zero
+        confidence downstream, so their stretched value never reaches the
+        gradient.
         """
-        s = self.config.mask_voxel_cache_warmup_start
-        e = self.config.mask_voxel_cache_warmup_end
-        if e <= s:
-            return float(self.config.mask_voxel_cache_max_blend)
-        progress = max(0, edit_step - s) / max(1, e - s)
-        progress = min(max(progress, 0.0), 1.0)
-        return float(progress * self.config.mask_voxel_cache_max_blend)
+        sel = valid.reshape(-1).bool()
+        if int(sel.sum().item()) < 16:
+            return cache_mask  # too few observed pixels for a stable range
+        vals = cache_mask.reshape(-1)[sel].float()
+        q = min(max(float(self.config.mask_voxel_cache_scale_normalize_quantile), 0.5), 0.999)
+        lo = torch.quantile(vals, 1.0 - q).to(cache_mask.dtype)
+        hi = torch.quantile(vals, q).to(cache_mask.dtype)
+        span = (hi - lo).clamp_min(1e-4)
+        return ((cache_mask - lo) / span).clamp(0.0, 1.0)
+
+    def _query_voxel_cache(self, points, valid, x0):
+        """Read the cache for this view at the latent resolution of ``x0``.
+
+        Returns a dict with the scale-matched cache mask, its validity and
+        confidence (what DC fuses), plus the per-pixel view counts and variance
+        and the count-gate threshold (for logging).
+        """
+        mask_h, mask_w = x0.shape[-2:]
+        min_observations = self._cache_min_observations()
+        values, cache_valid, confidence, counts, variance = self.mask_voxel_cache.query(
+            points,
+            in_bounds=valid,
+            min_observations=min_observations,
+            max_variance=self.config.mask_voxel_cache_max_variance,
+            mass_threshold=float(self.config.mask_voxel_cache_mass_threshold),
+        )
+        cache_valid = cache_valid.view(1, 1, mask_h, mask_w).to(device=x0.device)
+        cache_mask = values.view(1, 1, mask_h, mask_w).to(device=x0.device, dtype=x0.dtype)
+        return {
+            "mask": self._scale_normalize_cache_mask(cache_mask, cache_valid),
+            "valid": cache_valid,
+            "confidence": confidence.view(1, 1, mask_h, mask_w).to(device=x0.device, dtype=x0.dtype),
+            "count": counts.view(1, 1, mask_h, mask_w),
+            "variance": variance.view(1, 1, mask_h, mask_w),
+            "min_observations": min_observations,
+        }
+
+    def _update_voxel_cache(self, dic, points, valid, directions, view_id, step, edit_step, return_written):
+        """Write this view's raw edit mask into the cache, then try the angular freeze.
+
+        The cache input is S's raw magnitude, not the final mask: the final
+        mask already contains the cache and the attention restriction, which
+        would feed back into the observations.
+        Returns (per-voxel values written or None, cache input) for logging.
+        """
+        cache_input = dic["self_grad_mask_raw"].detach().to(self.device).reshape(-1)
+        written = self.mask_voxel_cache.update(
+            points,
+            cache_input,
+            in_bounds=valid,
+            view_id=view_id,
+            ray_directions=directions,
+            return_per_voxel_mean=return_written,
+        )
+
+        if not self.mask_voxel_cache.angular_denominator_is_frozen:
+            min_views = self._cache_min_observations()
+            frozen_value = self.mask_voxel_cache.try_auto_freeze_angular_denominator(
+                edit_step=edit_step,
+                min_views=min_views,
+                patience=int(self.config.mask_voxel_cache_angular_freeze_patience),
+                warmup_steps=int(self.config.mask_voxel_cache_angular_freeze_warmup),
+            )
+            if frozen_value is not None:
+                print(
+                    f"[voxel-cache] auto-froze angular denominator at "
+                    f"edit_step={edit_step} (global={step}): "
+                    f"value={frozen_value:.5f} captured at peak "
+                    f"edit_step={self.mask_voxel_cache.angular_peak_step} (min_views={min_views})"
+                )
+        return written, cache_input
+
+    # ------------------------------------------------------------------
+    # Training step
+    # ------------------------------------------------------------------
 
     def get_train_loss_dict(self, step: int):
         loss_dict = dict()
+        log_this_step = step % self.config.log_step == 0
 
         rendered_image, current_spot, depth_world, accumulation_world = (
             self.get_current_rendering(step)
         )
-        # Use the train-camera slot as the unique-view id. The datamanager's
-        # `image_idx` can refer to original dataset indices after train/eval
-        # splitting, which may be non-contiguous; `current_spot` is guaranteed
-        # to be in [0, num_train_views).
+        # The train-camera slot is the unique view id: image_idx can refer to
+        # non-contiguous dataset indices after the train/eval split.
         current_view_id = int(current_spot)
         # get original image from dataloader
         original_image = self.datamanager.original_image_batch["image"][current_spot].to(self.device)
@@ -394,164 +449,34 @@ class DCPipeline(ModifiedVanillaPipeline):
         del original_image_512
         clean_gpu()
 
-        # ----------------------------------------------------------------
-        # 3D voxel-cache query: produce an external mask consistent across
-        # views by reading the EMA-aggregated 3D mask field at the world
-        # points each pixel of the current view sees. The math:
-        #     r(t) = o + t · d         (NeRF Eq. 1 ray parameterization)
-        # with `t = depth_world` from the differentiable renderer, gives
-        # the world-space surface points per pixel. We then look up the
-        # voxel grid at those points → external mask in image space.
-        # The lookup operates at the latent (DDS-mask) resolution.
-        # ----------------------------------------------------------------
-        external_grad_mask = None
-        external_grad_mask_valid = None
-        external_grad_mask_confidence = None
-        external_mask_blend = 0.0
-        mask_world_points = None
-        mask_world_points_valid = None
-        mask_ray_directions = None
-        voxel_cache_query_count = None
-        voxel_cache_query_variance = None
-        voxel_cache_edit_step = None
-        if (
-            self._voxel_cache_active()
-            and depth_world is not None
-        ):
-            voxel_cache_edit_step = self._voxel_cache_edit_step(step)
-            mask_h, mask_w = x0.shape[-2:]
-            H_cam, W_cam = int(depth_world.shape[0]), int(depth_world.shape[1])
-
-            # Generate rays directly at mask (latent) resolution. Each latent
-            # pixel center maps to a sub-pixel position halfway through its
-            # (H_cam/mask_h) × (W_cam/mask_w) image footprint. This replaces
-            # the previous "render at full resolution, interpolate down"
-            # path — bilinear-interpolating unit ray directions then
-            # renormalizing produces vectors that don't correspond to any
-            # actual ray at the resampled position. Nerfstudio convention:
-            # coords[..., 0] is y, coords[..., 1] is x.
-            current_index = self.datamanager.image_batch["image_idx"][current_spot]
-            current_camera = self.datamanager.train_dataparser_outputs.cameras[
-                current_index:current_index + 1
-            ].to(self.device)
-            yy = (
-                torch.arange(mask_h, device=self.device, dtype=torch.float32) + 0.5
-            ) * (H_cam / mask_h)
-            xx = (
-                torch.arange(mask_w, device=self.device, dtype=torch.float32) + 0.5
-            ) * (W_cam / mask_w)
-            grid_y, grid_x = torch.meshgrid(yy, xx, indexing="ij")
-            coords = torch.stack([grid_y, grid_x], dim=-1)  # [mask_h, mask_w, 2]
-            rays_lr = current_camera.generate_rays(
-                camera_indices=0, coords=coords, keep_shape=True
-            )
-            o = rays_lr.origins.detach()      # [mask_h, mask_w, 3]
-            dr = rays_lr.directions.detach()  # [mask_h, mask_w, 3]
-            del current_camera, rays_lr
-
-            d = depth_world.to(self.dc_device)
-            if d.dim() == 2:
-                d = d.unsqueeze(-1)  # [H, W, 1]
-            d = d.permute(2, 0, 1).unsqueeze(0).float()  # [1, 1, H, W]
-            if accumulation_world is None:
-                acc = torch.ones_like(d)
-            else:
-                acc = accumulation_world.to(self.dc_device)
-                if acc.dim() == 2:
-                    acc = acc.unsqueeze(-1)
-                acc = acc.permute(2, 0, 1).unsqueeze(0).float()  # [1, 1, H, W]
-            d = F.interpolate(d, size=(mask_h, mask_w), mode="bilinear", align_corners=False)
-            acc = F.interpolate(acc, size=(mask_h, mask_w), mode="bilinear", align_corners=False)
-
-            # Reshape rays to [1, 3, mask_h, mask_w] for arithmetic with d, then
-            # backproject. World points where each ray reaches `depth_world`.
-            o = o.permute(2, 0, 1).unsqueeze(0).to(self.dc_device).float()
-            dr = dr.permute(2, 0, 1).unsqueeze(0).to(self.dc_device).float()
-            world_points = o + d * dr  # [1, 3, mask_h, mask_w]
-            mask_world_points = world_points.permute(0, 2, 3, 1).reshape(-1, 3)  # [N, 3]
-            mask_ray_directions = dr.permute(0, 2, 3, 1).reshape(-1, 3)  # [N, 3]
-            mask_world_points_valid = (
-                (acc > float(self.config.mask_voxel_cache_accumulation_threshold))
-                & torch.isfinite(d)
-                & (d > 0.0)
-            ).reshape(-1)
+        # 3D voxel cache: read it for this view before DC, write this view after.
+        view_points = None
+        cache_query = None
+        cache_blend = 0.0
+        edit_step = None
+        if self.config.mask_voxel_cache_enabled and depth_world is not None:
+            edit_step = self._cache_edit_step(step)
+            view_points = self._backproject_view(current_spot, depth_world, accumulation_world, x0.shape[-2:])
+            points, _, valid, accumulation = view_points
 
             if self.mask_voxel_cache is None:
-                self._observe_points(mask_world_points, mask_world_points_valid)
-                if (
-                    self._observed_pts_count
-                    >= int(self.config.mask_voxel_cache_bbox_observe_steps)
-                ):
-                    self._ensure_voxel_cache()
-                if self.use_wandb and step % self.config.log_step == 0:
+                self._observe_bbox(points, valid)
+                if self._observed_pts_count >= int(self.config.mask_voxel_cache_bbox_observe_steps):
+                    self._build_voxel_cache()
+                if self.use_wandb and log_this_step:
                     import wandb
                     wandb.log(
-                        {
-                            "dc_debug/voxel_cache_observing_count": int(self._observed_pts_count),
-                        },
+                        {"dc_debug/voxel_cache_observing_count": int(self._observed_pts_count)},
                         step=step,
                         commit=False,
                     )
 
             if self.mask_voxel_cache is not None:
-                min_observations = self._effective_voxel_cache_min_observations()
-                self.mask_voxel_cache_effective_min_observations = min_observations
-                (
-                    queried,
-                    cache_valid,
-                    cache_confidence,
-                    cache_count,
-                    cache_variance,
-                ) = self.mask_voxel_cache.query(
-                    mask_world_points,
-                    in_bounds=mask_world_points_valid,
-                    return_valid=True,
-                    return_stats=True,
-                    min_observations=min_observations,
-                    max_variance=self.config.mask_voxel_cache_max_variance,
-                    mass_threshold=float(self.config.mask_voxel_cache_mass_threshold),
-                )
-                external_grad_mask = queried.view(1, 1, mask_h, mask_w).to(
-                    device=x0.device, dtype=x0.dtype
-                )
-                external_grad_mask_valid = cache_valid.view(1, 1, mask_h, mask_w).to(
-                    device=x0.device
-                )
-                external_grad_mask_confidence = cache_confidence.view(1, 1, mask_h, mask_w).to(
-                    device=x0.device, dtype=x0.dtype
-                )
-                external_grad_mask = self._scale_normalize_cache_mask(
-                    external_grad_mask, external_grad_mask_valid
-                )
-                voxel_cache_query_count = cache_count.view(1, 1, mask_h, mask_w)
-                voxel_cache_query_variance = cache_variance.view(1, 1, mask_h, mask_w)
-                external_mask_blend = self._voxel_cache_warmup_blend(voxel_cache_edit_step)
+                cache_query = self._query_voxel_cache(points, valid, x0)
+                cache_blend = self._cache_warmup_blend(edit_step)
 
-            if self.use_wandb and step % self.config.log_step == 0:
-                import wandb
-                with torch.no_grad():
-                    pts = mask_world_points
-                    pts_min = pts.min(dim=0).values
-                    pts_max = pts.max(dim=0).values
-                    acc_pass = mask_world_points_valid.float().mean()
-                    mean_acc = acc.float().mean() if acc is not None else torch.tensor(1.0)
-                    payload = {
-                        "dc_debug/voxel_pts_min_x": float(pts_min[0]),
-                        "dc_debug/voxel_pts_min_y": float(pts_min[1]),
-                        "dc_debug/voxel_pts_min_z": float(pts_min[2]),
-                        "dc_debug/voxel_pts_max_x": float(pts_max[0]),
-                        "dc_debug/voxel_pts_max_y": float(pts_max[1]),
-                        "dc_debug/voxel_pts_max_z": float(pts_max[2]),
-                        "dc_debug/voxel_acc_filter_pass_frac": float(acc_pass),
-                        "dc_debug/voxel_mean_accumulation": float(mean_acc),
-                    }
-                    if self.mask_voxel_cache is not None:
-                        bbox_lo = self.mask_voxel_cache.bbox_min
-                        bbox_hi = self.mask_voxel_cache.bbox_max
-                        norm = (pts - bbox_lo) / (bbox_hi - bbox_lo).clamp_min(1e-8)
-                        pure_in_bbox = ((norm >= 0.0) & (norm < 1.0)).all(dim=-1).float().mean()
-                        payload["dc_debug/voxel_pure_in_bbox_frac"] = float(pure_in_bbox)
-                    wandb.log(payload, step=step, commit=False)
+            if self.use_wandb and log_this_step:
+                self._log_backprojection(step, points, valid, accumulation)
 
         dic = self.dc(
             tgt_x0=x0,
@@ -560,153 +485,39 @@ class DCPipeline(ModifiedVanillaPipeline):
             return_dict=True,
             step=step,
             current_spot=current_spot,
-            external_grad_mask=external_grad_mask,
-            external_grad_mask_valid=external_grad_mask_valid,
-            external_grad_mask_confidence=external_grad_mask_confidence,
-            external_mask_blend=external_mask_blend,
+            external_grad_mask=cache_query["mask"] if cache_query is not None else None,
+            external_grad_mask_valid=cache_query["valid"] if cache_query is not None else None,
+            external_grad_mask_confidence=cache_query["confidence"] if cache_query is not None else None,
+            external_mask_blend=cache_blend,
         )
 
-        if (
-            self._voxel_cache_active()
-            and self.mask_voxel_cache is not None
-            and mask_world_points is not None
-            and dic.get("internal_grad_mask", None) is not None
-        ):
-            # Cache input is the raw self-mask (edit magnitude, per-frame
-            # quantile-normalized in dc.py) — not the percentile-normalized
-            # internal mask, whose CA-mask schedule leaks into observations.
-            cache_mask_input = dic.get("self_grad_mask_raw")
-            if cache_mask_input is None:
-                cache_mask_input = dic["internal_grad_mask"]
-            new_mask = cache_mask_input.detach().to(self.device).reshape(-1)
-            log_this_step = (
-                self.use_wandb and step % self.config.log_step == 0
-            )
-            per_voxel_mean_snapshot = self.mask_voxel_cache.update(
-                mask_world_points,
-                new_mask,
-                in_bounds=mask_world_points_valid,
+        if cache_query is not None and dic["self_grad_mask_raw"] is not None:
+            points, directions, valid, _ = view_points
+            written, cache_input = self._update_voxel_cache(
+                dic,
+                points,
+                valid,
+                directions,
                 view_id=current_view_id,
-                return_per_voxel_mean=log_this_step,
-                ray_directions=mask_ray_directions,
+                step=step,
+                edit_step=edit_step,
+                return_written=self.use_wandb and log_this_step,
             )
-            if not self.mask_voxel_cache.angular_denominator_is_frozen:
-                edit_step_for_freeze = (
-                    voxel_cache_edit_step
-                    if voxel_cache_edit_step is not None
-                    else self._voxel_cache_edit_step(step)
-                )
-                freeze_min_views = (
-                    self.mask_voxel_cache_effective_min_observations
-                    if self.mask_voxel_cache_effective_min_observations is not None
-                    else self._effective_voxel_cache_min_observations()
-                )
-                frozen_value = (
-                    self.mask_voxel_cache.try_auto_freeze_angular_denominator(
-                        edit_step=edit_step_for_freeze,
-                        min_views=freeze_min_views,
-                        patience=int(
-                            self.config.mask_voxel_cache_angular_freeze_patience
-                        ),
-                        warmup_steps=int(
-                            self.config.mask_voxel_cache_angular_freeze_warmup
-                        ),
-                    )
-                )
-                if frozen_value is not None:
-                    peak_step = self.mask_voxel_cache.angular_peak_step
-                    print(
-                        f"[voxel-cache] auto-froze angular denominator at "
-                        f"edit_step={edit_step_for_freeze} (global={step}): "
-                        f"value={frozen_value:.5f} captured at peak "
-                        f"edit_step={peak_step} (min_views={freeze_min_views})"
-                    )
-            if log_this_step:
-                import wandb
-                valid_ratio = (
-                    float(external_grad_mask_valid.float().mean().item())
-                    if external_grad_mask_valid is not None
-                    else 0.0
-                )
-                payload = {
-                    "dc_debug/voxel_cache_occupancy": float(self.mask_voxel_cache.occupancy),
-                    "dc_debug/voxel_cache_blend": float(external_mask_blend),
-                    "dc_debug/voxel_cache_valid_ratio": valid_ratio,
-                    "dc_debug/voxel_cache_edit_step": float(voxel_cache_edit_step or 0),
-                    "dc_debug/voxel_cache_ema_beta": float(
-                        self.mask_voxel_cache_effective_ema_beta
-                        if self.mask_voxel_cache_effective_ema_beta is not None
-                        else self.mask_voxel_cache.ema_beta
-                    ),
-                    "dc_debug/voxel_cache_mean_observation_count": float(
-                        self.mask_voxel_cache.mean_observation_count
-                    ),
-                    "dc_debug/voxel_cache_mean_geom_observation_count": float(
-                        self.mask_voxel_cache.mean_geom_observation_count
-                    ),
-                    "dc_debug/voxel_cache_mean_observed_variance": float(
-                        self.mask_voxel_cache.mean_observed_variance
-                    ),
-                    "dc_debug/voxel_cache_mean_angular_factor": float(
-                        self.mask_voxel_cache.mean_angular_factor
-                    ),
-                    "dc_debug/voxel_cache_mean_angular_factor_trusted": float(
-                        self.mask_voxel_cache.mean_angular_factor_at(
-                            min_views=min_observations
-                        )
-                    ),
-                    "dc_debug/voxel_cache_angular_denominator_frozen": float(
-                        self.mask_voxel_cache.frozen_angular_denominator
-                        if self.mask_voxel_cache.frozen_angular_denominator is not None
-                        else 0.0
-                    ),
-                    "dc_debug/voxel_cache_angular_peak_value": float(
-                        self.mask_voxel_cache.angular_peak_value
-                    ),
-                    "dc_debug/voxel_cache_angular_peak_step": float(
-                        self.mask_voxel_cache.angular_peak_step
-                    ),
-                    "dc_debug/voxel_cache_min_observations": float(
-                        self.mask_voxel_cache_effective_min_observations
-                        if self.mask_voxel_cache_effective_min_observations is not None
-                        else self._effective_voxel_cache_min_observations()
-                    ),
-                }
-                if (
-                    per_voxel_mean_snapshot is not None
-                    and per_voxel_mean_snapshot.numel() > 0
-                ):
-                    snap = per_voxel_mean_snapshot.detach().float().cpu()
-                    payload["dc_debug/voxel_cache_update_hist"] = wandb.Histogram(
-                        snap.numpy(), num_bins=50
-                    )
-                    payload["dc_debug/voxel_cache_update_mean"] = float(
-                        snap.mean().item()
-                    )
-                src_2d = new_mask.detach().float().cpu()
-                if src_2d.numel() > 0:
-                    payload["dc_debug/voxel_cache_input_mask_hist"] = wandb.Histogram(
-                        src_2d.numpy(), num_bins=50
-                    )
-                    payload["dc_debug/voxel_cache_input_mask_mean"] = float(
-                        src_2d.mean().item()
-                    )
-                wandb.log(payload, step=step, commit=False)
+            if self.use_wandb and log_this_step:
+                self._log_voxel_cache_state(step, edit_step, cache_blend, cache_query, written, cache_input)
+
         grad = dic["grad"].cpu()
-        grad_mask = dic.get("grad_mask", None)
-        self_grad_mask = dic.get("self_grad_mask", None)
-        cross_attention_mask = dic.get("cross_attention_mask", None)
         loss = dic["loss"] * self.config.dc_loss_mult
         loss = loss.to(self.device)
         loss_dict["dc_loss"] = loss
-        
+
         vis_grad = self.visualize_grad(grad, w, h)
-        
+
         min_size = 128
         original_image_resized = TF.resize(original_image[0], min_size)
         vis_grad_resized = TF.resize(vis_grad, min_size)
         rendered_image_resized = TF.resize(rendered_image[0], min_size)
-        
+
         if self.use_wandb:
             import wandb
             wandb.log({
@@ -714,202 +525,168 @@ class DCPipeline(ModifiedVanillaPipeline):
                 "original_image": wandb.Image(original_image_resized.permute(1, 2, 0).detach().cpu().numpy()),
                 "rendered_image": wandb.Image(rendered_image_resized.permute(1, 2, 0).detach().cpu().numpy()),
             }, step=step, commit=False) if step % self.config.log_step == 0 else None
-            
+
             wandb.log({
                 "dc_loss": loss.item(),
             }, step=step, commit=False)
 
-        # Save self-derived relevance mask visualization for debugging
-        if grad_mask is not None and step % self.config.log_step == 0:
-            grad_mask_vis = F.interpolate(grad_mask.cpu(), size=(h, w), mode="bilinear", align_corners=False)
-            grad_mask_img = Image.fromarray((grad_mask_vis[0, 0].clamp(0, 1).numpy() * 255).astype(np.uint8))
-            grad_mask_img.save(self.base_dir / f"logging/{step}_gradient_mask.png")
-
-        if self_grad_mask is not None and step % self.config.log_step == 0:
-            self_grad_mask_vis = F.interpolate(self_grad_mask.cpu(), size=(h, w), mode="bilinear", align_corners=False)
-            self_grad_mask_img = Image.fromarray((self_grad_mask_vis[0, 0].clamp(0, 1).numpy() * 255).astype(np.uint8))
-            self_grad_mask_img.save(self.base_dir / f"logging/{step}_self_mask.png")
-
-        if cross_attention_mask is not None and step % self.config.log_step == 0:
-            cross_attention_mask_vis = F.interpolate(cross_attention_mask.cpu(), size=(h, w), mode="bilinear", align_corners=False)
-            cross_attention_mask_img = Image.fromarray((cross_attention_mask_vis[0, 0].clamp(0, 1).numpy() * 255).astype(np.uint8))
-            cross_attention_mask_img.save(self.base_dir / f"logging/{step}_cross_attention_mask.png")
-
-        if external_grad_mask is not None and step % self.config.log_step == 0:
-            voxel_mask_vis = F.interpolate(external_grad_mask.detach().cpu(), size=(h, w), mode="bilinear", align_corners=False)
-            voxel_mask_img = Image.fromarray((voxel_mask_vis[0, 0].clamp(0, 1).numpy() * 255).astype(np.uint8))
-            voxel_mask_img.save(self.base_dir / f"logging/{step}_voxel_cache_mask.png")
-            if self.use_wandb:
-                import wandb
-                voxel_mask_stats = external_grad_mask.detach().float().clamp(0.0, 1.0)
-                wandb.log(
-                    {
-                        "dc_debug/voxel_cache_mask": wandb.Image(
-                            TF.resize(voxel_mask_img, min_size),
-                            caption=f"step={step} | queried voxel-cache mask",
-                        ),
-                        "dc_debug/voxel_cache_mask_mean": float(voxel_mask_stats.mean().item()),
-                        "dc_debug/voxel_cache_mask_max": float(voxel_mask_stats.max().item()),
-                        "dc_debug/voxel_cache_mask_coverage_0.5": float(
-                            (voxel_mask_stats > 0.5).float().mean().item()
-                        ),
-                    },
-                    step=step,
-                    commit=False,
-                )
-
-        if external_grad_mask_confidence is not None and step % self.config.log_step == 0:
-            voxel_conf_vis = F.interpolate(
-                external_grad_mask_confidence.detach().float().cpu(),
-                size=(h, w),
-                mode="bilinear",
-                align_corners=False,
-            )
-            voxel_conf_img = Image.fromarray((voxel_conf_vis[0, 0].clamp(0, 1).numpy() * 255).astype(np.uint8))
-            voxel_conf_img.save(self.base_dir / f"logging/{step}_voxel_cache_confidence.png")
-            if self.use_wandb:
-                import wandb
-                conf = external_grad_mask_confidence.detach().float().clamp(0.0, 1.0)
-                payload = {
-                    "dc_debug/voxel_cache_confidence": wandb.Image(
-                        TF.resize(voxel_conf_img, min_size),
-                        caption=f"step={step} | confidence from count + variance",
-                    ),
-                    "dc_debug/voxel_cache_confidence_mean": float(conf.mean().item()),
-                    "dc_debug/voxel_cache_confidence_coverage_0.5": float(
-                        (conf > 0.5).float().mean().item()
-                    ),
-                }
-                if voxel_cache_query_count is not None:
-                    payload["dc_debug/voxel_cache_query_count_mean"] = float(
-                        voxel_cache_query_count.detach().float().mean().item()
-                    )
-                    n_views = max(
-                        1,
-                        len(self.datamanager.train_dataparser_outputs.image_filenames),
-                    )
-                    query_count = voxel_cache_query_count.detach().float()
-                    payload["dc_debug/voxel_cache_query_view_frac_mean"] = float(
-                        (query_count / float(n_views)).mean().item()
-                    )
-                    payload["dc_debug/voxel_cache_query_count_max"] = float(
-                        query_count.max().item()
-                    )
-                if voxel_cache_query_variance is not None:
-                    payload["dc_debug/voxel_cache_query_variance_mean"] = float(
-                        voxel_cache_query_variance.detach().float().mean().item()
-                    )
-                    max_var_gate = float(
-                        getattr(self.config, "mask_voxel_cache_max_variance", 0.0)
-                    )
-                    var_scale = max_var_gate if max_var_gate > 1e-8 else 1.0
-                    voxel_var_vis = F.interpolate(
-                        (voxel_cache_query_variance.detach().float().cpu() / var_scale).clamp(0.0, 1.0),
-                        size=(h, w),
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                    voxel_var_img = Image.fromarray(
-                        (voxel_var_vis[0, 0].numpy() * 255).astype(np.uint8)
-                    )
-                    voxel_var_img.save(self.base_dir / f"logging/{step}_voxel_cache_variance.png")
-                    payload["dc_debug/voxel_cache_variance_map"] = wandb.Image(
-                        TF.resize(voxel_var_img, min_size),
-                        caption=f"step={step} | cross-view variance / max_variance (bright = views disagree; >= gate is damped)",
-                    )
-                if external_grad_mask is not None:
-                    trusted = (
-                        external_grad_mask.detach().float().clamp(0.0, 1.0)
-                        * external_grad_mask_confidence.detach().float().clamp(0.0, 1.0)
-                    )
-                    trusted_vis = F.interpolate(
-                        trusted.cpu(),
-                        size=(h, w),
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                    trusted_img = Image.fromarray(
-                        (trusted_vis[0, 0].clamp(0, 1).numpy() * 255).astype(np.uint8)
-                    )
-                    trusted_img.save(self.base_dir / f"logging/{step}_voxel_cache_trusted_mask.png")
-                    payload["dc_debug/voxel_cache_trusted_mask"] = wandb.Image(
-                        TF.resize(trusted_img, min_size),
-                        caption=f"step={step} | voxel mask times confidence",
-                    )
-                    payload["dc_debug/voxel_cache_trusted_mask_mean"] = float(trusted.mean().item())
-                    payload["dc_debug/voxel_cache_trusted_mask_coverage_0.5"] = float(
-                        (trusted > 0.5).float().mean().item()
-                    )
-                    internal_mask = dic.get("internal_grad_mask", None)
-                    if internal_mask is not None:
-                        internal_mask = internal_mask.detach().float().clamp(0.0, 1.0)
-                        cache_mask = external_grad_mask.detach().float().clamp(0.0, 1.0)
-                        cache_conf = external_grad_mask_confidence.detach().float().clamp(0.0, 1.0)
-                        if cache_mask.shape[-2:] != internal_mask.shape[-2:]:
-                            cache_mask = F.interpolate(
-                                cache_mask,
-                                size=internal_mask.shape[-2:],
-                                mode="bilinear",
-                                align_corners=False,
-                            )
-                        if cache_conf.shape[-2:] != internal_mask.shape[-2:]:
-                            cache_conf = F.interpolate(
-                                cache_conf,
-                                size=internal_mask.shape[-2:],
-                                mode="bilinear",
-                                align_corners=False,
-                            )
-                        negative_correction = (internal_mask - cache_mask).clamp_min(0.0) * cache_conf
-                        negative_correction_vis = F.interpolate(
-                            negative_correction.cpu(),
-                            size=(h, w),
-                            mode="bilinear",
-                            align_corners=False,
-                        )
-                        negative_correction_img = Image.fromarray(
-                            (negative_correction_vis[0, 0].clamp(0, 1).numpy() * 255).astype(np.uint8)
-                        )
-                        negative_correction_img.save(
-                            self.base_dir / f"logging/{step}_voxel_cache_negative_correction.png"
-                        )
-                        payload["dc_debug/voxel_cache_negative_correction"] = wandb.Image(
-                            TF.resize(negative_correction_img, min_size),
-                            caption=f"step={step} | max(0, internal - cache) times confidence",
-                        )
-                        payload["dc_debug/voxel_cache_negative_correction_mean"] = float(
-                            negative_correction.mean().item()
-                        )
-                        payload["dc_debug/voxel_cache_negative_correction_coverage_0.05"] = float(
-                            (negative_correction > 0.05).float().mean().item()
-                        )
-                wandb.log(payload, step=step, commit=False)
-
-        if external_grad_mask_valid is not None and step % self.config.log_step == 0:
-            voxel_valid_vis = F.interpolate(
-                external_grad_mask_valid.detach().float().cpu(),
-                size=(h, w),
-                mode="nearest",
-            )
-            voxel_valid_img = Image.fromarray((voxel_valid_vis[0, 0].clamp(0, 1).numpy() * 255).astype(np.uint8))
-            voxel_valid_img.save(self.base_dir / f"logging/{step}_voxel_cache_valid.png")
-            if self.use_wandb:
-                import wandb
-                wandb.log(
-                    {
-                        "dc_debug/voxel_cache_valid_mask": wandb.Image(
-                            TF.resize(voxel_valid_img, min_size),
-                            caption=f"step={step} | voxel-cache observed/in-bounds mask",
-                        ),
-                    },
-                    step=step,
-                    commit=False,
-                )
-
         # logging
-        if step % self.config.log_step == 0:
+        if log_this_step:
+            self._save_dc_masks(step, (h, w), dic)
+            if cache_query is not None:
+                self._log_voxel_cache_read(step, (h, w), cache_query)
             self.log_images(rendered_image, original_image, grad, step)
 
         return None, loss_dict, dict()
+
+    # ------------------------------------------------------------------
+    # Logging
+    # ------------------------------------------------------------------
+
+    def _save_mask_png(self, mask, size, name, step, mode="bilinear"):
+        """Save a [1, 1, h, w] map in [0, 1] as logging/{step}_{name}.png at ``size``.
+
+        Returns the PIL image, so the caller can also send it to WandB.
+        """
+        mask = mask.detach().float().cpu()
+        if mode == "nearest":
+            vis = F.interpolate(mask, size=size, mode="nearest")
+        else:
+            vis = F.interpolate(mask, size=size, mode="bilinear", align_corners=False)
+        image = Image.fromarray((vis[0, 0].clamp(0, 1).numpy() * 255).astype(np.uint8))
+        image.save(self.base_dir / f"logging/{step}_{name}.png")
+        return image
+
+    def _save_dc_masks(self, step, size, dic):
+        """Save the final edit mask, the self-mask S and the attention mask A as PNGs."""
+        for key, name in (
+            ("grad_mask", "gradient_mask"),
+            ("self_grad_mask", "self_mask"),
+            ("cross_attention_mask", "cross_attention_mask"),
+        ):
+            if dic.get(key) is not None:
+                self._save_mask_png(dic[key], size, name, step)
+
+    def _log_backprojection(self, step, points, valid, accumulation):
+        """WandB: extent of the backprojected points, valid-ray share, share inside the cache box."""
+        import wandb
+
+        with torch.no_grad():
+            pts_min = points.min(dim=0).values
+            pts_max = points.max(dim=0).values
+            payload = {
+                "dc_debug/voxel_pts_min_x": float(pts_min[0]),
+                "dc_debug/voxel_pts_min_y": float(pts_min[1]),
+                "dc_debug/voxel_pts_min_z": float(pts_min[2]),
+                "dc_debug/voxel_pts_max_x": float(pts_max[0]),
+                "dc_debug/voxel_pts_max_y": float(pts_max[1]),
+                "dc_debug/voxel_pts_max_z": float(pts_max[2]),
+                "dc_debug/voxel_acc_filter_pass_frac": float(valid.float().mean()),
+                "dc_debug/voxel_mean_accumulation": float(accumulation.float().mean()),
+            }
+            if self.mask_voxel_cache is not None:
+                bbox_lo = self.mask_voxel_cache.bbox_min
+                bbox_hi = self.mask_voxel_cache.bbox_max
+                norm = (points - bbox_lo) / (bbox_hi - bbox_lo).clamp_min(1e-8)
+                inside = ((norm >= 0.0) & (norm < 1.0)).all(dim=-1).float().mean()
+                payload["dc_debug/voxel_pure_in_bbox_frac"] = float(inside)
+        wandb.log(payload, step=step, commit=False)
+
+    def _log_voxel_cache_state(self, step, edit_step, blend, cache_query, written, cache_input):
+        """WandB: cache statistics after this step's update (counts, variance, angular freeze)."""
+        import wandb
+
+        cache = self.mask_voxel_cache
+        min_observations = cache_query["min_observations"]
+        frozen = cache.frozen_angular_denominator
+        payload = {
+            "dc_debug/voxel_cache_occupancy": float(cache.occupancy),
+            "dc_debug/voxel_cache_blend": float(blend),
+            "dc_debug/voxel_cache_valid_ratio": float(cache_query["valid"].float().mean().item()),
+            "dc_debug/voxel_cache_edit_step": float(edit_step or 0),
+            "dc_debug/voxel_cache_ema_beta": float(cache.ema_beta),
+            "dc_debug/voxel_cache_mean_observation_count": float(cache.mean_observation_count),
+            "dc_debug/voxel_cache_mean_observed_variance": float(cache.mean_observed_variance),
+            "dc_debug/voxel_cache_mean_angular_factor": float(cache.mean_angular_factor),
+            "dc_debug/voxel_cache_mean_angular_factor_trusted": float(
+                cache.mean_angular_factor_at(min_views=min_observations)
+            ),
+            "dc_debug/voxel_cache_angular_denominator_frozen": float(frozen if frozen is not None else 0.0),
+            "dc_debug/voxel_cache_angular_peak_value": float(cache.angular_peak_value),
+            "dc_debug/voxel_cache_angular_peak_step": float(cache.angular_peak_step),
+            "dc_debug/voxel_cache_min_observations": float(min_observations),
+        }
+        if written is not None and written.numel() > 0:
+            written = written.detach().float().cpu()
+            payload["dc_debug/voxel_cache_update_hist"] = wandb.Histogram(written.numpy(), num_bins=50)
+            payload["dc_debug/voxel_cache_update_mean"] = float(written.mean().item())
+        cache_input = cache_input.detach().float().cpu()
+        if cache_input.numel() > 0:
+            payload["dc_debug/voxel_cache_input_mask_hist"] = wandb.Histogram(cache_input.numpy(), num_bins=50)
+            payload["dc_debug/voxel_cache_input_mask_mean"] = float(cache_input.mean().item())
+        wandb.log(payload, step=step, commit=False)
+
+    def _log_voxel_cache_read(self, step, size, cache_query):
+        """Save (PNG) and log (WandB) the cache read for this view.
+
+        value, confidence, the variance map (variance / max_variance: bright
+        means the views disagree), value * confidence, and the validity mask.
+        """
+        cache_mask = cache_query["mask"].detach().float().clamp(0.0, 1.0)
+        confidence = cache_query["confidence"].detach().float().clamp(0.0, 1.0)
+        variance = cache_query["variance"].detach().float()
+        trusted = cache_mask * confidence
+        max_variance = float(self.config.mask_voxel_cache_max_variance)
+        variance_scale = max_variance if max_variance > 1e-8 else 1.0
+
+        mask_img = self._save_mask_png(cache_mask, size, "voxel_cache_mask", step)
+        confidence_img = self._save_mask_png(confidence, size, "voxel_cache_confidence", step)
+        variance_img = self._save_mask_png((variance / variance_scale).clamp(0.0, 1.0), size, "voxel_cache_variance", step)
+        trusted_img = self._save_mask_png(trusted, size, "voxel_cache_trusted_mask", step)
+        valid_img = self._save_mask_png(cache_query["valid"], size, "voxel_cache_valid", step, mode="nearest")
+        if not self.use_wandb:
+            return
+
+        import wandb
+
+        min_size = 128
+        count = cache_query["count"].detach().float()
+        wandb.log(
+            {
+                "dc_debug/voxel_cache_mask": wandb.Image(
+                    TF.resize(mask_img, min_size), caption=f"step={step} | queried voxel-cache mask"
+                ),
+                "dc_debug/voxel_cache_mask_mean": float(cache_mask.mean().item()),
+                "dc_debug/voxel_cache_mask_max": float(cache_mask.max().item()),
+                "dc_debug/voxel_cache_mask_coverage_0.5": float((cache_mask > 0.5).float().mean().item()),
+                "dc_debug/voxel_cache_confidence": wandb.Image(
+                    TF.resize(confidence_img, min_size),
+                    caption=f"step={step} | confidence: count x variance x angular x mass",
+                ),
+                "dc_debug/voxel_cache_confidence_mean": float(confidence.mean().item()),
+                "dc_debug/voxel_cache_confidence_coverage_0.5": float((confidence > 0.5).float().mean().item()),
+                "dc_debug/voxel_cache_query_count_mean": float(count.mean().item()),
+                "dc_debug/voxel_cache_query_view_frac_mean": float(
+                    (count / float(self._num_train_views())).mean().item()
+                ),
+                "dc_debug/voxel_cache_query_count_max": float(count.max().item()),
+                "dc_debug/voxel_cache_query_variance_mean": float(variance.mean().item()),
+                "dc_debug/voxel_cache_variance_map": wandb.Image(
+                    TF.resize(variance_img, min_size),
+                    caption=f"step={step} | cross-view variance / max_variance (bright = views disagree; >= gate is damped)",
+                ),
+                "dc_debug/voxel_cache_trusted_mask": wandb.Image(
+                    TF.resize(trusted_img, min_size), caption=f"step={step} | voxel mask times confidence"
+                ),
+                "dc_debug/voxel_cache_trusted_mask_mean": float(trusted.mean().item()),
+                "dc_debug/voxel_cache_trusted_mask_coverage_0.5": float((trusted > 0.5).float().mean().item()),
+                "dc_debug/voxel_cache_valid_mask": wandb.Image(
+                    TF.resize(valid_img, min_size), caption=f"step={step} | voxel-cache observed/in-bounds mask"
+                ),
+            },
+            step=step,
+            commit=False,
+        )
 
     @torch.no_grad()
     def log_images(self, rendered_image, original_image, grad, step):
@@ -917,12 +694,12 @@ class DCPipeline(ModifiedVanillaPipeline):
         orig_img = tensor_to_pil(original_image)
 
         w, h = edit_img.size
-        
+
         vis_grad = grad if isinstance(grad, Image.Image) else self.visualize_grad(grad, w, h)
-        
+
         img = merge_images([orig_img, edit_img, vis_grad])
         img.save(self.base_dir / f"logging/{step}.png")
-        
+
     def visualize_grad(self, grad, w, h):
         vis_grad = grad.norm(dim=1).clone().detach().cpu()
         vis_grad = vis_grad / vis_grad.max()
@@ -930,7 +707,7 @@ class DCPipeline(ModifiedVanillaPipeline):
         vis_grad = cmap(vis_grad)[..., :3]
         vis_grad = Image.fromarray((vis_grad * 255).astype(np.uint8))
         vis_grad = vis_grad.resize((w, h), resample=Image.Resampling.NEAREST)
-        
+
         return vis_grad
 
     # to enable backprop.

@@ -1,140 +1,92 @@
-# Central DreamCatalyst method parameters — the single source of truth for
-# which knobs are active in a run. Scene selection happens in scripts/edit.sh.
-#
-# DC_CUSTOM_PARAMS → DCConfig. The Part-1 "standard" universal 2D config:
-#   source-blend localization + hybrid self/CA mask + adaptive asymmetric TAG
-#   + STG bump schedule + outside-mask and latent-mean anchors.
-#
-# VOXEL_CACHE_PARAMS → DCPipelineConfig. The Part-2 3D voxel cache: lifts the
-# raw self-mask (per-frame p95-normalized edit magnitude) into a voxel grid for
-# cross-view-consistent localization. Positive-only fusion, observed-weighted
-# trilinear readback, decayed cross-view variance, and a confidence gate
-# (count + variance + angular diversity + mass) with scale matching and a
-# warmup-ramped blend. Full walkthrough: docs/VoxelCacheExplained.md.
-#
-# The agreement gate max_variance is held at ONE GLOBAL VALUE (0.02) for every
-# scene and every edit: all 24 Part-2 runs in VoxelSTG3_Experiments.csv carry
-# the identical MB02_maxVar02 suffix. Nothing here is tuned per scene.
-# It is nevertheless the most scene-sensitive quantity in the method (the gap
-# between wanted-edit and over-edit variance is narrow), so holding it fixed is
-# a stated limitation, not a tuning step. If you do need to change it, read it
-# off the variance map (dc_debug/voxel_cache_variance_map): above the
-# wanted-edit variance and below the over-edit variance.
-#
-# ---------------------------------------------------------------------------
-# The three evaluated configurations
-# ---------------------------------------------------------------------------
-# As committed, this file is the Part-2 "voxel cache" configuration. The other
-# two are obtained by editing only the values listed below:
-#
-# 1. Part-1 "standard" (universal 2D config, cache off):
-#      stg_scale=3.5, mask_voxel_cache_enabled=False
-#
-# 2. "dc baseline" (upstream DreamCatalyst: raw DDS + IP2P + FreeU + psi/delta/gamma):
-#      source_blend_localization_enabled=False,
-#      outside_mask_anchor_weight=0.0,
-#      outside_mask_anchor_edit_strength_adaptive=False,
-#      cross_attention_mask_enabled=False,
-#      latent_mean_anchor_weight=0.0,
-#      eta_tag=1.0, adaptive_tag=False, asymmetric_tag=False,
-#      stg_enabled=False, stg_scale=0.0,
-#      gradient_mask_ema_beta=0.99, gradient_mask_ema_beta_auto=False,
-#      mask_voxel_cache_enabled=False
-#    (with all localization flags off no relevance mask is built, so the
-#    remaining mask-shaping values — blur/gamma/quantile — are inert)
-#
-# Opt-in localization ablations (2026-09): all new defaults preserve the
-# existing configurations. Rationale, exact deltas, and experiment order:
-# docs/LocalizationAblations.md. These are hypotheses, not evaluated results.
+"""Method configuration: the single source of truth for every editing run.
+
+DC_CUSTOM_PARAMS   -> DCConfig (nerfstudio/dc/dc.py): guidance, localization, preservation.
+VOXEL_CACHE_PARAMS -> DCPipelineConfig (dc_pipeline.py): the 3D voxel cache (Part 2).
+
+As committed, this is the final 3D configuration. The other two evaluated
+configurations change only the values below:
+
+  2D (Part 1, no voxel cache):
+      mask_voxel_cache_enabled=False
+
+  DreamCatalyst baseline (upstream: DDS + IP2P + FreeU + psi):
+      source_blend_localization_enabled=False, outside_mask_anchor_weight=0.0,
+      cross_attention_mask_enabled=False, latent_mean_anchor_weight=0.0,
+      eta_tag=1.0, stg_scale=0.0, mask_voxel_cache_enabled=False
+      (with every localization switch off no mask is built, so the remaining
+      mask settings are inert)
+
+Nothing is tuned per scene. In particular mask_voxel_cache_max_variance is one
+global value for every scene and edit. That is a stated limitation: it is the
+most scene-sensitive setting, read off dc_debug/voxel_cache_variance_map.
+
+Symbols: S = target-instruction mask, S_src = source-instruction mask,
+A = cross-attention mask, M = edit mask, s = edit strength in [0, 1].
+"""
 
 DC_CUSTOM_PARAMS = dict(
     # ---------------------------------------------------------------------
-    # 1. Localization branch
+    # Guidance amplification (target branch only)
     # ---------------------------------------------------------------------
-    psi=0.075,
-    source_blend_localization_enabled=True,
+    eta_tag=1.2,                      # adaptive TAG ceiling; 1.0 = off
+    stg_scale=3.0,                    # STG peak scale, times (1 - s); 0.0 = off
+    stg_skip_layers=[2],              # up-blocks whose self-attention STG skips
+    stg_schedule_start_ratio=0.0,     # STG bump over training progress: zero
+    stg_schedule_end_ratio=0.8,       # outside [start, end], peak at
+    stg_bump_peak_ratio=0.5,          # start + ratio * (end - start)
 
-    outside_mask_anchor_weight=0.15,
-    outside_mask_anchor_edit_strength_adaptive=True,
-    outside_mask_anchor_mask_source="final",  # final | internal (pre-cache) | source (fixed)
-    external_mask_ca_gate_weight=0.0,  # 1 requires CA support for cache additions
+    # ---------------------------------------------------------------------
+    # Localization: where the edit may act, M = max(S * A, min(S, S_src))
+    # ---------------------------------------------------------------------
+    source_blend_localization_enabled=True,  # restrict the DDS delta to M
+    gradient_mask_gamma=1.2,                 # S and S_src: sharpening exponent
+    gradient_mask_blur=0.5,                  # S and S_src: Gaussian sigma (latent px)
+    gradient_mask_raw_norm_quantile=0.95,    # voxel-cache input: S over this per-frame quantile
+    gradient_mask_ema_memory_visits=5.0,     # S: per-view EMA memory, in visits of that view
+    localization_source_timestep_ratio=0.5,  # S_src: noise level (fraction of training steps)
+    localization_source_num_samples=4,       # S_src: noise draws averaged per view
+    localization_source_seed=42,             # S_src: private RNG seed (training RNG untouched)
 
-    gradient_mask_blur=0.5,
-    gradient_mask_gamma=1.2,
-    gradient_mask_ema_beta=0.0,
-    gradient_mask_ema_beta_auto=True,
-    gradient_mask_ema_beta_camera_factor=2.0,
-    gradient_mask_ema_mode="legacy_camera",  # per_view fixes the EMA update clock
-    gradient_mask_ema_memory_visits=2.0,  # per_view e-folding time; requires beta_auto
-    gradient_mask_source="dds",  # dds | target_instruction | source_instruction
-    localization_source_timestep_ratio=0.5,  # fraction of training noise timesteps
-    localization_source_num_samples=4,  # source-only masks: average magnitudes before normalization
-    localization_source_seed=42,  # private per-view RNG; does not consume training RNG
-    gradient_mask_raw_norm_quantile=0.95,
-
-    cross_attention_mask_enabled=True,
-    cross_attention_mask_layers=[1, 2],
-    cross_attention_mask_blur=0.5,
+    cross_attention_mask_enabled=True,       # A: attention of the edit tokens, full strength
+    cross_attention_mask_layers=[1, 2],      # A: up-blocks read (16x16 and 32x32)
     cross_attention_mask_gamma=1.2,
-    cross_attention_mask_weight_schedule_power=0.75,
-    cross_attention_mask_weight_min=0.0,  # early CA floor; 1 = full CA throughout
-    cross_attention_mask_veto_floor=0.0,  # >0: CA cannot veto below kappa * floor mask; 0 = off
-    cross_attention_mask_veto_floor_mask="agreement",  # agreement = min(self, source) | source
-
-    latent_mean_anchor_weight=0.005,
+    cross_attention_mask_blur=0.5,
 
     # ---------------------------------------------------------------------
-    # 2. TAG branch — ON (adaptive + asymmetric; eta_tag>1 amplifies tangential)
+    # Preservation: what stays like the source
     # ---------------------------------------------------------------------
-    eta_tag=1.2,
-    adaptive_tag=True,
-    asymmetric_tag=True,
-
-    # ---------------------------------------------------------------------
-    # 3. STG branch
-    # ---------------------------------------------------------------------
-    stg_enabled=True,
-    stg_scale=3.0,  # 3.5 reproduces the cache-off Part-1 results
-    stg_skip_layers=[2],
-    stg_schedule_start_ratio=0,
-    stg_schedule_end_ratio=0.8,
-    stg_bump_peak_ratio=0.5,
+    psi=0.075,                               # DreamCatalyst preservation weight (upstream)
+    outside_mask_anchor_weight=0.25,         # extra weight outside S_src, times (1 - s)
+    latent_mean_anchor_weight=0.005,         # per-channel latent-mean anchor
 )
 
 
-# ---------------------------------------------------------------------
-# 4. 3D voxel-cache localization
-# ---------------------------------------------------------------------
 VOXEL_CACHE_PARAMS = dict(
     mask_voxel_cache_enabled=True,
-    mask_voxel_cache_resolution=64,
 
-    mask_voxel_cache_ema_beta_camera_factor=2.0,
+    # Grid and backprojection
+    mask_voxel_cache_resolution=64,              # voxels per axis
+    mask_voxel_cache_accumulation_threshold=0.50,  # a ray must hit a surface to count
+    mask_voxel_cache_bbox_observe_steps=50,      # steps observing points before building the grid
+    mask_voxel_cache_bbox_observe_quantile=0.05, # per-view outlier clip of the observed box
+    mask_voxel_cache_bbox_inflation=0.2,         # box margin for geometry the edit grows
 
-    mask_voxel_cache_warmup_start=500,
-    mask_voxel_cache_warmup_end=1200,
-    mask_voxel_cache_max_blend=0.2,
-    mask_voxel_cache_accumulation_threshold=0.30,
+    # Statistics
+    mask_voxel_cache_ema_beta_camera_factor=0.5, # grid-mean decay 1 - 1 / (factor * N_cam)
+    mask_voxel_cache_variance_decay=0.2,         # weight of the newest view in the cross-view variance
 
-    mask_voxel_cache_observation_fraction=0.10,
-    mask_voxel_cache_min_observations_floor=5,
+    # Confidence gates (each in [0, 1], multiplied)
+    mask_voxel_cache_observation_fraction=0.10,  # count gate: ceil(fraction * N_cam) views,
+    mask_voxel_cache_min_observations_floor=5,   #   clamped to [floor, cap]
     mask_voxel_cache_min_observations_cap=12,
-    mask_voxel_cache_max_variance=0.02,
-    mask_voxel_cache_variance_decay=0.2,
-    # Agreement gate reads cross-view variance at the nearest voxel (False,
-    # all reported results) or with an eligibility-weighted trilinear read (True).
-    # Same scale either way (a weighted average of the same grid), but True
-    # opens the gate ~half a voxel past each agreed/contested boundary.
-    mask_voxel_cache_cv_trilinear=False,
+    mask_voxel_cache_max_variance=0.02,          # variance gate: 1 - variance / max_variance (global)
+    mask_voxel_cache_angular_freeze_warmup=50,   # angular gate: track the scene mean after this many
+    mask_voxel_cache_angular_freeze_patience=100,  #   steps, freeze it 100 steps after its peak
+    mask_voxel_cache_mass_threshold=0.18,        # mass gate: min(1, cached value / threshold)
 
-    mask_voxel_cache_bbox_observe_steps=50,
-    mask_voxel_cache_bbox_observe_quantile=0.05,
-    mask_voxel_cache_bbox_inflation=0.2,
-
-    mask_voxel_cache_angular_freeze_patience=100,
-    mask_voxel_cache_angular_freeze_warmup=50,
-
-    mask_voxel_cache_mass_threshold=0.18,
-
-    mask_voxel_cache_scale_normalize_quantile=0.95,
+    # Fusion: M += blend * confidence * G * max(cache - M, 0), positive only
+    mask_voxel_cache_scale_normalize_quantile=0.95,  # stretch the cache read to [0, 1] first
+    mask_voxel_cache_warmup_start=500,           # blend ramps 0 -> max_blend over
+    mask_voxel_cache_warmup_end=1200,            #   [start, end] edit steps
+    mask_voxel_cache_max_blend=0.2,
 )

@@ -1,5 +1,26 @@
 # Localization controls and experiment plan
 
+> **Historical record (2026-10-13).** The screening below selected the final
+> configuration, which is now hardcoded; the knobs it names were removed from
+> the code. What each became:
+>
+> | Knob in this file | Final behavior in `nerfstudio/dc/dc.py` |
+> |---|---|
+> | `gradient_mask_source` | always the target-instruction contrast (S) |
+> | `gradient_mask_ema_mode`, `_beta`, `_beta_auto`, `_beta_camera_factor` | always per view: `beta = exp(-1 / gradient_mask_ema_memory_visits)` |
+> | `outside_mask_anchor_mask_source` | always the source-instruction mask (S_src) |
+> | `outside_mask_anchor_edit_strength_adaptive` | always attenuated by (1 - s) |
+> | `cross_attention_mask_weight_min`, `_weight_schedule_power` | full-strength attention from the first step (no schedule) |
+> | `cross_attention_mask_veto_floor`, `_veto_floor_mask` | always `M = max(S * A, min(S, S_src))` |
+> | `external_mask_ca_gate_weight` | always 1: cache gate `max(A, S) * A` |
+> | `adaptive_tag`, `asymmetric_tag` | always adaptive, target branch only |
+> | `stg_enabled` | removed: `stg_scale = 0.0` disables STG |
+> | `mask_voxel_cache_cv_trilinear` | always the trilinear variance read |
+>
+> The configuration instructions below refer to the code at the time of each
+> stage. The current knobs and the deltas for the 2D and DreamCatalyst-baseline
+> configurations are in the header of `nerfstudio/dc/method_config.py`.
+
 These opt-in controls address hypotheses raised by the clown arm overedit and
 the stormtrooper's need for stronger STG. A/B screening was reported on
 2026-09-21 and the C results on 2026-09-22. The evidence and revised next steps

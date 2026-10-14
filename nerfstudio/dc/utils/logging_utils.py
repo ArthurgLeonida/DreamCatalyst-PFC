@@ -1,3 +1,5 @@
+"""WandB debug payload of one DC iteration (keys under dc_debug/)."""
+
 from typing import Optional
 
 import torch
@@ -18,6 +20,7 @@ def make_wandb_image(image_tensor, tensor_to_pil_fn, resize_image_fn, caption: s
 
 
 def summarize_mask(mask: torch.Tensor):
+    """Mean, max and fraction of pixels above 0.5 of a mask."""
     mask = mask.detach().float()
     return {
         "mean": mask.mean().item(),
@@ -39,7 +42,7 @@ def log_dc_debug_to_wandb(
     t_normalized: float,
     eta_tag_current: float,
     current_stg_scale: float,
-    current_edit_strength: Optional[float],
+    current_edit_strength: float,
     w_dds: float,
     preserve_weight,
     eps_tgt: torch.Tensor,
@@ -48,141 +51,88 @@ def log_dc_debug_to_wandb(
     grad: torch.Tensor,
     pred_x0_tgt: torch.Tensor,
     pred_x0_src: torch.Tensor,
-    grad_mask: Optional[torch.Tensor],
-    self_grad_mask: Optional[torch.Tensor],
-    cross_attention_mask: Optional[torch.Tensor],
-    cross_attention_mask_weight_current: Optional[float],
     tensor_to_pil_fn,
     resize_image_fn,
-    internal_grad_mask: Optional[torch.Tensor] = None,
-    preservation_mask: Optional[torch.Tensor] = None,
+    masks=None,
     stg_perturbation: Optional[torch.Tensor] = None,
     source_blend_enabled: bool = False,
     self_mask_ema_beta: Optional[float] = None,
-    ca_veto_floor_addition: Optional[torch.Tensor] = None,
 ):
-    """Log the most useful DC debugging images and scalars to WandB."""
+    """Log the scalars, predictions and masks of one DC iteration.
+
+    ``masks`` is the iteration's ``dc.dc.LocalizationMasks`` (None when
+    localization is off, as in the DreamCatalyst baseline).
+    """
     import wandb
 
     caption = (
         f"step={step} | spot={current_spot} | "
         f"t={t.item()} | t_norm={t_normalized:.3f}"
     )
-    raw_eps_delta = batch_l2_norm_mean(eps_tgt - eps_src)
-    effective_eps_delta = batch_l2_norm_mean(eps_tgt_for_grad - eps_src)
-    grad_norm = batch_l2_norm_mean(grad)
+
+    def add_image(name, image):
+        payload[f"dc_debug/{name}"] = make_wandb_image(image, tensor_to_pil_fn, resize_image_fn, caption)
+
+    def add_mask(name, mask):
+        add_image(name, mask)
+        for key, value in summarize_mask(mask).items():
+            payload[f"dc_debug/{name}_{key}"] = value
+
     preserve_weight_mean = (
         preserve_weight.mean().item()
         if isinstance(preserve_weight, torch.Tensor)
         else float(preserve_weight)
     )
-
-    log_payload = {
-        "dc_debug/tgt_pred_x0": make_wandb_image(
-            pred_x0_tgt,
-            tensor_to_pil_fn,
-            resize_image_fn,
-            caption,
-        ),
-        "dc_debug/src_pred_x0": make_wandb_image(
-            pred_x0_src,
-            tensor_to_pil_fn,
-            resize_image_fn,
-            caption,
-        ),
+    payload = {
         "dc_debug/current_spot": int(current_spot),
         "dc_debug/timestep": float(t.item()),
         "dc_debug/timestep_normalized": float(t_normalized),
         "dc_debug/eta_tag_current": float(eta_tag_current),
         "dc_debug/stg_scale_current": float(current_stg_scale),
+        "dc_debug/edit_strength": float(current_edit_strength),
         "dc_debug/w_dds": float(w_dds),
         "dc_debug/preserve_weight_mean": preserve_weight_mean,
-        "dc_debug/raw_eps_delta_norm": raw_eps_delta,
-        "dc_debug/effective_eps_delta_norm": effective_eps_delta,
-        "dc_debug/grad_norm": grad_norm,
+        # Delta norms before and after source blending, and of the final gradient.
+        "dc_debug/raw_eps_delta_norm": batch_l2_norm_mean(eps_tgt - eps_src),
+        "dc_debug/effective_eps_delta_norm": batch_l2_norm_mean(eps_tgt_for_grad - eps_src),
+        "dc_debug/grad_norm": batch_l2_norm_mean(grad),
     }
-    if current_edit_strength is not None:
-        log_payload["dc_debug/edit_strength"] = float(current_edit_strength)
     if self_mask_ema_beta is not None:
-        log_payload["dc_debug/self_mask_ema_beta"] = float(self_mask_ema_beta)
+        payload["dc_debug/self_mask_ema_beta"] = float(self_mask_ema_beta)
+    add_image("tgt_pred_x0", pred_x0_tgt)
+    add_image("src_pred_x0", pred_x0_src)
 
-    # STG already passes through source blending. Compare its effective
-    # contribution to the TAG-only DDS delta, using the SAME mask on both.
+    # STG's effective contribution against the TAG-only DDS delta, both through
+    # the same source-blend mask. Zero while STG is off.
+    edit_mask = masks.final if masks is not None else None
     stg_delta = stg_perturbation if stg_perturbation is not None else torch.zeros_like(eps_tgt)
     base_delta = eps_tgt - eps_src - stg_delta
-    if source_blend_enabled and grad_mask is not None:
-        stg_effective = grad_mask * stg_delta
-        base_effective = grad_mask * base_delta
-    else:
-        stg_effective, base_effective = stg_delta, base_delta
-    stg_norm = batch_l2_norm_mean(stg_effective)
-    base_norm = batch_l2_norm_mean(base_effective)
-    log_payload["dc_debug/stg_effective_delta_norm"] = stg_norm
-    log_payload["dc_debug/tag_only_effective_delta_norm"] = base_norm
-    log_payload["dc_debug/stg_to_tag_only_dds_ratio"] = stg_norm / max(base_norm, 1e-8)
+    if source_blend_enabled and edit_mask is not None:
+        stg_delta = edit_mask * stg_delta
+        base_delta = edit_mask * base_delta
+    stg_norm = batch_l2_norm_mean(stg_delta)
+    base_norm = batch_l2_norm_mean(base_delta)
+    payload["dc_debug/stg_effective_delta_norm"] = stg_norm
+    payload["dc_debug/tag_only_effective_delta_norm"] = base_norm
+    payload["dc_debug/stg_to_tag_only_dds_ratio"] = stg_norm / max(base_norm, 1e-8)
 
-    for name, mask in (("internal_mask", internal_grad_mask), ("preservation_mask", preservation_mask)):
-        if mask is not None:
-            log_payload[f"dc_debug/{name}"] = make_wandb_image(
-                mask, tensor_to_pil_fn, resize_image_fn, caption,
+    if masks is not None:
+        add_mask("self_mask", masks.self_mask)
+        add_mask("preservation_mask", masks.source_mask)
+        if masks.ca_mask is not None:
+            add_mask("cross_attention_mask", masks.ca_mask)
+        add_mask("internal_mask", masks.internal)
+        add_mask("final_mask", masks.final)
+        if masks.veto_floor_addition is not None:
+            # Support the floor min(S, S_src) restored over S * A: should light up
+            # body parts the edit tokens miss (hands), not a halo of background.
+            payload["dc_debug/ca_veto_floor_addition_mean"] = (
+                masks.veto_floor_addition.float().mean().item()
             )
-            for key, value in summarize_mask(mask).items():
-                log_payload[f"dc_debug/{name}_{key}"] = value
-    if internal_grad_mask is not None and grad_mask is not None:
-        addition = (grad_mask - internal_grad_mask).clamp_min(0.0)
-        log_payload["dc_debug/cache_addition_mean"] = addition.detach().float().mean().item()
-        log_payload["dc_debug/cache_addition"] = make_wandb_image(
-            addition, tensor_to_pil_fn, resize_image_fn, caption,
-        )
-    if ca_veto_floor_addition is not None:
-        # Support the CA veto floor gave back: where the floored internal mask
-        # exceeds the plain self/CA hybrid. Should light up the hands, not the
-        # background; a broad halo here means the floor reopens too much.
-        log_payload["dc_debug/ca_veto_floor_addition_mean"] = (
-            ca_veto_floor_addition.detach().float().mean().item()
-        )
-        log_payload["dc_debug/ca_veto_floor_addition"] = make_wandb_image(
-            ca_veto_floor_addition, tensor_to_pil_fn, resize_image_fn, caption,
-        )
-    if cross_attention_mask_weight_current is not None:
-        log_payload["dc_debug/cross_attention_mask_weight_current"] = float(
-            cross_attention_mask_weight_current
-        )
+            add_image("ca_veto_floor_addition", masks.veto_floor_addition)
+        # What the voxel cache added on top of the internal mask (zero without it).
+        cache_addition = (masks.final - masks.internal).clamp_min(0.0)
+        payload["dc_debug/cache_addition_mean"] = cache_addition.detach().float().mean().item()
+        add_image("cache_addition", cache_addition)
 
-    if self_grad_mask is not None:
-        self_mask_stats = summarize_mask(self_grad_mask)
-        log_payload["dc_debug/self_mask"] = make_wandb_image(
-            self_grad_mask,
-            tensor_to_pil_fn,
-            resize_image_fn,
-            caption,
-        )
-        log_payload["dc_debug/self_mask_mean"] = self_mask_stats["mean"]
-        log_payload["dc_debug/self_mask_max"] = self_mask_stats["max"]
-        log_payload["dc_debug/self_mask_coverage_0.5"] = self_mask_stats["coverage_0.5"]
-
-    if cross_attention_mask is not None:
-        cross_mask_stats = summarize_mask(cross_attention_mask)
-        log_payload["dc_debug/cross_attention_mask"] = make_wandb_image(
-            cross_attention_mask,
-            tensor_to_pil_fn,
-            resize_image_fn,
-            caption,
-        )
-        log_payload["dc_debug/cross_attention_mask_mean"] = cross_mask_stats["mean"]
-        log_payload["dc_debug/cross_attention_mask_max"] = cross_mask_stats["max"]
-        log_payload["dc_debug/cross_attention_mask_coverage_0.5"] = cross_mask_stats["coverage_0.5"]
-
-    if grad_mask is not None:
-        grad_mask_stats = summarize_mask(grad_mask)
-        log_payload["dc_debug/final_mask"] = make_wandb_image(
-            grad_mask,
-            tensor_to_pil_fn,
-            resize_image_fn,
-            caption,
-        )
-        log_payload["dc_debug/final_mask_mean"] = grad_mask_stats["mean"]
-        log_payload["dc_debug/final_mask_max"] = grad_mask_stats["max"]
-        log_payload["dc_debug/final_mask_coverage_0.5"] = grad_mask_stats["coverage_0.5"]
-
-    wandb.log(log_payload, step=step, commit=False)
+    wandb.log(payload, step=step, commit=False)

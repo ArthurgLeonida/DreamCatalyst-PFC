@@ -1,3 +1,16 @@
+"""Mask shaping and edit-token selection for the localization masks.
+
+    normalize_relevance_map              p5-p95 rank normalization to [0, 1]
+    apply_mask_postprocessing            gamma sharpening, then Gaussian blur
+    derive_cross_attention_keywords      edit words: target prompt minus source and stopwords
+    get_cross_attention_token_indices    their token positions in the target prompt
+    build_cross_attention_relevance_mask recorded attention maps -> mask A
+
+``scripts/evaluate.py`` imports ``DEFAULT_CROSS_ATTENTION_STOPWORDS`` and
+``derive_cross_attention_keywords`` to build its evaluation region phrase, so
+keep those two names stable.
+"""
+
 import re
 from typing import List, Optional
 
