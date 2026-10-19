@@ -12,6 +12,11 @@ subtractive fusion branch, active contested-region suppression, a peak-held
 variance latch — were removed from the code and are no longer documented here.
 This file describes only what the current configuration does.)
 
+What the cache does to the final results (9 edits, 3 runs each, 2026-10-18): it
+is metric-neutral in aggregate, every mean moving less than the run-to-run
+spread, and its visible effect is a decision made consistent across views (the
+Batman gloves). See the README's "Results at a glance".
+
 ---
 
 ## Table of contents
@@ -258,13 +263,27 @@ Camera-count-aware:
 β = 1 − 1 / (c · N_cameras)
 ```
 
-with `c ≈ 2` (the knob `mask_voxel_cache_ema_beta_camera_factor`). For
-`N_cameras = 65`, `β ≈ 0.9923`; for `N_cameras = 365`, `β ≈ 0.9986`.
+with `c = 0.5` (the knob `mask_voxel_cache_ema_beta_camera_factor`; the thesis
+runs used `c = 2`). For `N_cameras = 65`, `β ≈ 0.969`; for `N_cameras = 315`,
+`β ≈ 0.9937`; for `N_cameras = 365`, `β ≈ 0.9945`.
 
 **Why scale with N_cameras?** A voxel observed by every camera should sit near
-the *average* across cameras, so each observation should contribute about
-`1/N_cameras`. Setting `1−β = 1/(c·N_cameras)` makes each observation contribute
-roughly that amount — the right magnitude for a sample-mean estimator.
+the *average* across cameras, so each observation should contribute an amount
+tied to the number of cameras rather than a fixed constant. Setting
+`1−β = 1/(c·N_cameras)` gives the EMA a memory of about `c·N_cameras` updates.
+
+**Why `c = 0.5` and not 2.** The first observation of a voxel is copied, not
+blended (below), so after `n` updates it still holds weight `β^(n−1)` and
+dominates the value until about `1/(1−β) = c·N_cameras` updates have arrived.
+With `c = 2` that window is twice the camera count; for a voxel seen by 40% of
+315 cameras, its 630 updates take about 1600 iterations, which outlasts the
+warmup ramp, so the value other views read back during the ramp would be mostly
+the first observer's. For a voxel seen by 40% of 315 cameras (one camera per iteration,
+grid built at step 50), the effective sample size `1/Σwⱼ²` of the average is
+about 9 when the fusion starts (step 500) and about 160 when it reaches full
+strength (step 1200) with `c = 0.5`, against about 2 and 4 with `c = 2`
+(`docs/theoretical_optimal_config3d.md` §4.3). The copy itself is kept; the
+shorter memory only bounds how long it dominates.
 
 ### Within-batch averaging
 
@@ -283,19 +302,20 @@ EMA against the fallback):
 m(q) ← 0.72,   observed(q) ← True
 ```
 
-View 2 (five pixels, avg 0.60), `β = 0.99`:
+View 2 (five pixels, avg 0.60), `β = 0.97` (`N_cameras ≈ 65`, `c = 0.5`):
 
 ```
-m(q) ← 0.99 · 0.72 + 0.01 · 0.60 = 0.7188
+m(q) ← 0.97 · 0.72 + 0.03 · 0.60 = 0.7164
 ```
 
 View 3 (`m_new = 0.65`):
 
 ```
-m(q) ← 0.99 · 0.7188 + 0.01 · 0.65 = 0.7181
+m(q) ← 0.97 · 0.7164 + 0.03 · 0.65 = 0.7144
 ```
 
-The running average drifts slowly toward the cross-view mean.
+The running average drifts slowly toward the cross-view mean; the first view's
+0.72 still carries `0.97² ≈ 0.94` of the weight after two more views.
 
 ---
 
@@ -431,9 +451,11 @@ views were. A voxel could read `m(q) = 0.5` because all views agreed on 0.5
 (trustworthy) or because half said 0.0 and half said 1.0 (contested). We need a
 measure of cross-view agreement: **variance**.
 
-### Solution: Welford's online variance
+### Starting point: Welford's online variance
 
-For each voxel, maintain a running mean and a running sum of squared deviations
+The estimator the code runs is the exponentially weighted one at the end of
+this section; the equal-weight version comes first because it is easier to
+follow. For each voxel, maintain a running mean and a running sum of squared deviations
 (`M2`). When a new per-view sample `x` arrives at a voxel already observed by
 `n − 1` distinct views:
 
@@ -470,7 +492,7 @@ Mean 0.80, variance 0.010 (std ≈ 0.10 between views). Contrast a contested vox
 whose two views split hard (0.2 then 0.9): after just those two views it reads
 `μ = 0.55, M2 = 0.245, σ² = 0.245` — far higher variance from far less agreement.
 
-### Decayed (exponentially-weighted) variance
+### Solution: decayed (exponentially weighted) variance
 
 > **Knob: `mask_voxel_cache_variance_decay`** = the EW weight `α` below, in
 > `(0, 1)`; the adopted config uses `0.2`. This is the estimator the code runs:
@@ -480,7 +502,7 @@ whose two views split hard (0.2 then 0.9): after just those two views it reads
 Cumulative Welford weights every distinct view equally over the *entire* run. But
 the edit is **non-stationary**: the scene changes as training proceeds. A voxel
 first observed by camera A at edit-step 500 (immature edit) and by camera B at
-edit-step 30000 (mature edit) records the A↔B difference as cross-view
+edit-step 2500 (mature edit) records the A↔B difference as cross-view
 "variance" — when it's really cross-*time* drift. The symptom is
 `mean_observed_variance` climbing monotonically over a run (observed on elf:
 0.0175 → 0.033 across 33k steps), slowly walking the average voxel up to the
@@ -498,8 +520,9 @@ The fix is an exponentially-weighted variance (Finch 2009). With new-view weight
 Because views first-observe a voxel in training-time order, `α` down-weights the
 stale early-edit samples, so `σ²` tracks the *current* cross-view disagreement
 (effective memory ≈ `1/α` views; `α = 0.2` ≈ last 5). Caveat: the EW estimator
-is biased low by ≈ `(1 − α)`, so re-read `query_variance_mean` and re-tune
-`max_variance` after changing it. Note the per-(view, voxel) statistics update
+is biased low. For a stationary input its expectation settles at
+`2(1 − α)/(2 − α)` times the true variance (≈ 0.89 at `α = 0.2`), so re-read
+`query_variance_mean` and re-tune `max_variance` after changing `α`. Note the per-(view, voxel) statistics update
 only on each view's **first** observation of a voxel, so for static geometry the
 estimate is effectively frozen after roughly one pass over the cameras — the EW
 weighting reweights among first-observation samples in arrival order.
@@ -588,7 +611,7 @@ histogram becomes bimodal and foreground/background separate cleanly.
 
 **Why a quantile, not the max.** Dividing by the frame's single brightest pixel
 is fragile: one outlier pixel (a specular highlight, a denoising artifact) at
-`||ε_tgt − ε_src|| = 1.4` in one frame versus a hottest pixel of `0.9` in another
+`R = 1.4` in one frame versus a hottest pixel of `0.9` in another
 makes the *same* 3D point with true relevance `0.5` read `0.5/1.4 ≈ 0.36` in the
 first frame and `0.5/0.9 ≈ 0.56` in the second. That `Δ ≈ 0.20` is **spurious
 cross-view variance manufactured by the divisor** — contributing variance on the
@@ -601,7 +624,7 @@ gate, or the gate is tuned against the normalizer rather than the edit.
 
 ### Numerical example
 
-A frame's raw `||ε_tgt − ε_src||` ranges from 0.05 to 1.4.
+A frame's raw `R` ranges from 0.05 to 1.4.
 
 - **Percentile normalization** maps the distribution to ≈ uniform in `[0, 1]`,
   so background (bottom 80% of pixels) lands anywhere in `0.0–0.8` and picks up a
@@ -893,8 +916,8 @@ is active whenever the cache is enabled; this is the quick status map.
 | Mechanism | § | Notes |
 |---|---|---|
 | Voxel grid + depth backprojection + observed bbox | 2, 3 | core; required |
-| Observed-weighted trilinear read | 4 | core; delivers the rendered MV-consistency gain |
-| EMA aggregation (camera-count-auto β) | 5 | core |
+| Observed-weighted trilinear read | 4 | core; removes grid-step quantization from the read (the thesis-era elf MV-cos gain came with it) |
+| EMA aggregation (camera-count-auto β) | 5 | core; `c = 0.5` (thesis runs: 2) |
 | Positive-only fusion with the 2D mask | 6 | core; cache adds edit force, never subtracts |
 | Scale-matching the cache value | 7 | core; makes `M_3D` comparable to the sharp 2D mask |
 | Cross-view variance (exponentially weighted) | 8 | `variance_decay = 0.2`; recency-weighted |
@@ -906,9 +929,10 @@ is active whenever the cache is enabled; this is the quick status map.
 | Mass gate (`C_mass`, linear) | 14 | core; damps low-edit-force voxels |
 
 > **`max_variance` is a single global value, not scene-tuned.** Every scene and
-> every edit uses `0.02`: all 24 Part-2 runs in `VoxelSTG3_Experiments.csv`
-> carry the identical `MB02_maxVar02` suffix. Nothing in either part is tuned
-> per scene. Earlier versions of this file and of `method_config.py` said the
+> every edit uses `0.02`: all 24 thesis Part-2 runs in `VoxelSTG3_Experiments.csv`
+> carry the identical `MB02_maxVar02` suffix, and the final IEEE 3D runs
+> (`docs/experiments/3D_IEEE.csv`) use the committed 0.02. Nothing in either
+> part is tuned per scene. Earlier versions of this file and of `method_config.py` said the
 > threshold "is scene-tuned"; that described what the diagnostic *would* let
 > you do, not what was done, and it is corrected here.
 >

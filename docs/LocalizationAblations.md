@@ -20,6 +20,15 @@
 > The configuration instructions below refer to the code at the time of each
 > stage. The current knobs and the deltas for the 2D and DreamCatalyst-baseline
 > configurations are in the header of `nerfstudio/dc/method_config.py`.
+>
+> **Outcome (2026-10-18).** The plan's remaining stages (D cache gate/brake
+> ablations, E multi-seed confirmation) were superseded by the final evaluation
+> of the hardcoded configuration: DreamCatalyst, 2D and 3D on 9 edits over 6
+> scenes, 3 seeds each (`docs/experiments/*_IEEE.csv`). The final config adopted
+> the target-instruction mask with a per-view EMA (memory 5 visits), full-strength
+> attention with the agreement floor, the source-mask brake, the attention-gated
+> cache (λ = 1), STG 3.0 and an outside-mask anchor of 0.25. Results: README,
+> "Results at a glance".
 
 These opt-in controls address hypotheses raised by the clown arm overedit and
 the stormtrooper's need for stronger STG. A/B screening was reported on

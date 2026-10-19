@@ -4,7 +4,8 @@ Collect every metrics.json under an outputs root into one CSV.
 
 One row per run, one column per metric. Column naming mirrors
 ``flatten_wandb_metrics`` in scripts/evaluate.py, which is also what produced
-the WandB exports in docs/ExtendingDreamCatalystPFC/*.csv:
+the WandB exports in docs/experiments/*_IEEE.csv (final runs) and
+docs/ExtendingDreamCatalystPFC/*.csv (thesis-era runs):
 
     eval/<Metric>          mean (or the scalar, for non-mean/std metrics)
     eval/<Metric>_std      std, when the metric records one
