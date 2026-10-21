@@ -17,6 +17,9 @@ the paper. One ``DC.__call__`` is one editing iteration on one view:
   4. Gradient = w_DDS * M * (eps_tgt - eps_src)                (localized DDS)
               + e^t * (psi + w_out (1 - s)(1 - S_src)) * (z - z_src)  (preservation)
               + latent-mean anchor.
+     The optional outside_mask_anchor_edit_release (off in every evaluated
+     config) replaces S_src in the preservation term by max(S_src, M before the
+     voxel cache).
 
 Every extension can be switched off in method_config.py, which reproduces
 upstream DreamCatalyst (the "dc baseline" values listed there).
@@ -133,6 +136,11 @@ class DCConfig:
     # ------------------------------------------------------------------
     # Extra preservation outside S_src, attenuated by (1 - s). 0.0 disables it.
     outside_mask_anchor_weight: float = 0.25
+    # Optional, off in every evaluated config: weight that anchor with
+    # max(S_src, M_internal) instead of S_src, so it is released at least as much
+    # as the pre-cache edit mask drives the edit. It then no longer holds against
+    # drift that the attention mask confirms. Needs the attention mask.
+    outside_mask_anchor_edit_release: bool = False
     # Per-channel latent-mean anchor. 0.0 disables it.
     latent_mean_anchor_weight: float = 0.005
 
@@ -150,6 +158,13 @@ class DCConfig:
             raise ValueError("localization_source_num_samples must be at least 1")
         if self.localization_source_seed < 0:
             raise ValueError("localization_source_seed must be nonnegative")
+        if (
+            self.outside_mask_anchor_edit_release
+            and self.outside_mask_anchor_weight > 0
+            and not self.cross_attention_mask_enabled
+        ):
+            # Without A, M_internal = S and the render alone could release the anchor.
+            raise ValueError("outside_mask_anchor_edit_release needs cross_attention_mask_enabled")
 
     @property
     def localization_enabled(self) -> bool:
@@ -167,10 +182,11 @@ class LocalizationMasks:
 
     self_mask: torch.Tensor  # S: target-instruction mask (per-view EMA, gamma, blur)
     self_mask_raw: torch.Tensor  # S's magnitude over its 95th percentile: voxel-cache input
-    source_mask: torch.Tensor  # S_src: source-instruction mask, also the preservation mask
+    source_mask: torch.Tensor  # S_src: source-instruction mask
     ca_mask: Optional[torch.Tensor]  # A: cross-attention mask (None when disabled)
     internal: torch.Tensor  # max(S * A, min(S, S_src)): the edit mask before the cache
     final: torch.Tensor  # edit mask M after voxel-cache fusion (= internal without it)
+    preservation: torch.Tensor  # P of the anchor: S_src, or max(S_src, internal) with the edit release
     veto_floor_addition: Optional[torch.Tensor]  # support min(S, S_src) restored over S * A
 
 
@@ -400,6 +416,11 @@ class DC(object):
         the requested edit that the edit tokens do not attend to (a
         stormtrooper's hands). The floor min(S, S_src) lifts that veto exactly
         where both instruction masks mark the region. M never exceeds S.
+
+        The anchor's mask P is S_src. With the optional edit release it is
+        max(S_src, internal), which equals max(S_src, S * A): it departs from
+        S_src only where attention confirms more edit than S_src marks, and
+        it is taken before the cache, so the cache never releases the anchor.
         """
         self_mask, self_mask_raw = self._target_instruction_mask(target_relevance, current_spot)
         source_mask = self._source_instruction_mask(src_x0, src_encoded, current_spot)
@@ -412,6 +433,10 @@ class DC(object):
             internal = torch.maximum(hybrid, torch.minimum(self_mask, source_mask)).clamp(0.0, 1.0)
             veto_floor_addition = (internal - hybrid).clamp_min(0.0).detach()
 
+        preservation = source_mask
+        if self.config.outside_mask_anchor_edit_release:
+            preservation = torch.maximum(source_mask, internal)
+
         return LocalizationMasks(
             self_mask=self_mask,
             self_mask_raw=self_mask_raw,
@@ -419,6 +444,7 @@ class DC(object):
             ca_mask=ca_mask,
             internal=internal,
             final=internal,
+            preservation=preservation,
             veto_floor_addition=veto_floor_addition,
         )
 
@@ -657,7 +683,7 @@ class DC(object):
 
         # 4. Gradient: localized DDS delta + preservation + latent-mean anchor.
         edit_mask = masks.final if masks is not None else None
-        preservation_mask = masks.source_mask if masks is not None else None
+        preservation_mask = masks.preservation if masks is not None else None
         eps_tgt_for_grad = eps_tgt
         if self.config.source_blend_localization_enabled and edit_mask is not None:
             eps_tgt_for_grad = apply_source_blend(eps_tgt, eps_src, edit_mask)

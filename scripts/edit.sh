@@ -104,7 +104,8 @@ if localization:
     )
     print(f"   {branch} A (CA):     {ca_enabled} (layers={dc['cross_attention_mask_layers']})")
     print(f"   {branch} M:          max(S*A, min(S, S_src)), source blend={int(dc['source_blend_localization_enabled'])}")
-    print(f"   {last} anchors:    outside S_src w={dc['outside_mask_anchor_weight']}, latent mean={dc['latent_mean_anchor_weight']}")
+    anchor_mask = "max(S_src, M_internal)" if dc.get("outside_mask_anchor_edit_release", False) else "S_src"
+    print(f"   {last} anchors:    outside {anchor_mask} w={dc['outside_mask_anchor_weight']}, latent mean={dc['latent_mean_anchor_weight']}")
 print(f" Voxel 3D:  {enabled}")
 if enabled:
     print(f"   {branch} res:        {voxel['mask_voxel_cache_resolution']}")

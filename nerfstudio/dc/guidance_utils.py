@@ -122,7 +122,8 @@ def compute_preserve_weight(
     """Preservation weight: psi + w_out * (1 - s) * (1 - P).
 
     psi is DreamCatalyst's global weight. The outside-mask anchor adds w_out
-    where the preservation mask P (the source-instruction mask) says the edit
+    where the preservation mask P (the source-instruction mask, or
+    max(S_src, M_internal) with the optional edit release) says the edit
     does not belong, attenuated by (1 - s) so structural edits are held less
     tightly. Returns the scalar psi when there is no mask or w_out = 0.
     """
