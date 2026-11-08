@@ -16,7 +16,10 @@ configurations change only the values below:
       (with every localization switch off no mask is built, so the remaining
       mask settings are inert)
 
-One optional variant is implemented but was not evaluated (off in all three):
+One optional variant is implemented (off in all three). It was used only after
+the main evaluation, for three additional edits (sunglasses, Spider-Man, skull
+bear) and one Batman re-run, and never compared with the fixed anchor on the
+same edit:
 
   Edit-release anchor:
       outside_mask_anchor_edit_release=True (requires cross_attention_mask_enabled)
@@ -68,7 +71,7 @@ DC_CUSTOM_PARAMS = dict(
     # ---------------------------------------------------------------------
     psi=0.075,                               # DreamCatalyst preservation weight (upstream)
     outside_mask_anchor_weight=0.25,         # extra weight outside S_src, times (1 - s)
-    outside_mask_anchor_edit_release=False,  # optional, not evaluated: anchor mask max(S_src, M_internal)
+    outside_mask_anchor_edit_release=False,  # optional (see header): anchor mask max(S_src, M_internal)
     latent_mean_anchor_weight=0.005,         # per-channel latent-mean anchor
 )
 

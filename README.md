@@ -4,6 +4,8 @@
 
 Text-driven 3D scene editing built on top of **DreamCatalyst** (DDS-based score distillation with InstructPix2Pix). This is the undergraduate final project (PFC) of **Arthur Gislon Leonida** at **UFSC**, also presented as the final project for the **Computer Vision** course (Prof. **Aldo von Wangenheim**). The work focuses on **NeRF-based** reconstructions; the 3D Gaussian Splatting path is supported for completeness but is not the primary target.
 
+> **Paper:** A. G. Leonida, L. O. Seman and S. F. Stefenon, *"Adaptive Guidance and Spatial Localization for Text-Driven Editing of Neural Radiance Fields"*, submitted to IEEE Access (under review).
+
 > Base method — Kim et al. *"DreamCatalyst: Fast and High-Quality 3D Editing via Controlling Editability and Identity Preservation"*. ICLR 2025. [arXiv:2407.11394](https://arxiv.org/abs/2407.11394)
 
 The work is organized as **two independent contributions** sharing one repository:
@@ -40,7 +42,7 @@ Headline: **better preservation at unchanged whole-image editability.** SSIM, LP
 
 The cache is **metric-neutral in aggregate**: every mean changes by less than the typical run-to-run spread (SSIM 0.860 and `EditMaskVariance_3D` 0.018 with and without it, CLIP-dir 0.160 → 0.159). Of the 99 per-edit comparisons (11 metrics × 9 edits), 19 exceed the run spread, 11 in favour of the cache (six on stormtrooper) and 8 against (three on clown). Its visible effect is qualitative and cross-view: on the Batman edit without the cache the hands are gloved in one view and bare in another; with the cache they are gloved in both (one run).
 
-The undergraduate monograph reports an earlier configuration (8 edits on 5 scenes) that this code no longer reproduces; the numbers above are those of the final configuration.
+The undergraduate monograph reports an earlier configuration (8 edits on 5 scenes) that this code no longer reproduces; the numbers above are those of the final configuration. Three further edits (sunglasses, Spider-Man, skull bear) were run later with the optional edit-release anchor (see [Preservation](#preservation-what-stays-like-the-source)); they are not part of these means.
 
 ## Pipeline
 
@@ -159,6 +161,7 @@ One iteration edits one view, in this order:
 | DreamCatalyst term | `e^t · ψ · (x₀ − x₀_src)` (upstream). | `psi=0.075` |
 | Outside-mask anchor (aligned with RoMaP) | `ψ_eff = ψ + w_out · (1 − s) · (1 − S_src)`. Weighted by the fixed source-side mask, so neither accidental drift nor the voxel cache can relax the restoring force. | `outside_mask_anchor_weight=0.25` |
 | Latent-mean anchor (aligned with Piva, Stable Score Distillation) | Adds `λ · (mean(x₀) − mean(x₀_src))` per latent channel, against the slow brightness and saturation drift that TAG causes. | `latent_mean_anchor_weight=0.005` |
+| Edit-release anchor (optional, off by default) | Weights the outside-mask anchor by `1 − max(S_src, S·A)` instead of `1 − S_src`, so shapes the edit adds (a helmet) stop fighting the anchor. The anchor is then no longer fixed per view: drift that attention confirms can relax it. Requires the cross-attention mask. | `outside_mask_anchor_edit_release=False` |
 
 ### 3D voxel cache (Part 2)
 
@@ -181,6 +184,8 @@ The code reproduces exactly three configurations; nothing is tuned per scene.
 | 3D (Part 2) | as committed |
 | 2D (Part 1) | `mask_voxel_cache_enabled=False` |
 | DreamCatalyst baseline | `source_blend_localization_enabled=False`, `outside_mask_anchor_weight=0.0`, `cross_attention_mask_enabled=False`, `latent_mean_anchor_weight=0.0`, `eta_tag=1.0`, `stg_scale=0.0`, `mask_voxel_cache_enabled=False` |
+
+The optional edit-release anchor (`outside_mask_anchor_edit_release=True`) is off in all three and can be switched on in the 2D or 3D configuration.
 
 Mechanisms tried and removed during development (Perp-Neg, a scheduled cross-attention weight, a self-mask built from the DDS delta, a camera-count EMA, contested-region suppression, a peak-held variance latch, among others) are no longer in the code. The screening that selected the final masks is recorded in [`docs/LocalizationAblations.md`](docs/LocalizationAblations.md).
 
@@ -346,8 +351,10 @@ Please cite the original sources if you use these scenes.
   url       = {https://arxiv.org/abs/2406.08953},
 }
 
-@article{ssd2025,
+@article{zhu2025ssd,
   title     = {Stable Score Distillation},
+  author    = {Haiming Zhu and others},
+  journal   = {arXiv preprint arXiv:2507.09168},
   year      = {2025},
   url       = {https://arxiv.org/abs/2507.09168},
 }
@@ -376,7 +383,7 @@ Please cite the original sources if you use these scenes.
 
 @inproceedings{miao2025uds,
   title     = {Rethinking Score Distilling Sampling for 3D Editing and Generation},
-  author    = {Miao and collaborators},
+  author    = {Xingyu Miao and Haoran Duan and Yang Long and Jungong Han},
   booktitle = {ICML},
   year      = {2025},
   url       = {https://arxiv.org/abs/2505.01888},
