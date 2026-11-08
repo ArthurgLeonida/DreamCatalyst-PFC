@@ -1,5 +1,7 @@
 # 3D editing with DreamCatalyst
 
+> **Note:** this is the upstream DreamCatalyst README, kept for reference (the example image it links is not included in this repository). For this project's setup, scripts and method, see the [root README](../README.md).
+
 <div align="center">
     <img src="../assets/examples_nerf.png" alt="dreamcatalyst_nerf_examples"/>
 </div>

@@ -118,7 +118,10 @@ def log_dc_debug_to_wandb(
 
     if masks is not None:
         add_mask("self_mask", masks.self_mask)
-        add_mask("preservation_mask", masks.source_mask)
+        add_mask("preservation_mask", masks.preservation)
+        if masks.preservation is not masks.source_mask:
+            # Edit-release anchor: P = max(S_src, M_internal), so log S_src too.
+            add_mask("source_mask", masks.source_mask)
         if masks.ca_mask is not None:
             add_mask("cross_attention_mask", masks.ca_mask)
         add_mask("internal_mask", masks.internal)
